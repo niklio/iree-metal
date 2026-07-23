@@ -608,14 +608,47 @@ struct SpecializeAttnMatmulPass
       rewriter.setInsertionPoint(g);
       FailureOr<linalg::LinalgOp> named =
           linalg::specializeGenericOp(rewriter, g);
-      if (succeeded(named)) {
-        (*named)->setAttr("lowering_config", cfg);
-        ++nspec;
+      if (failed(named))
+        continue;
+      // specializeGenericOp may drop unit batch dims (4D generic -> matmul), so the
+      // copied lowering_config can be wider than the raised op's loop count. Trim the
+      // leading columns of each tiling level so getTileSizes(op, level) maps correctly
+      // (otherwise the batch "1" lands on M -> coop unrolls to vector<1x1> = scalar).
+      if (auto lc = dyn_cast<IREE::Codegen::LoweringConfigAttr>(cfg)) {
+        unsigned nloops = (*named).getNumLoops();
+        TileSizesListType tiles = lc.getTileSizeVals();
+        TileSizesListType trimmed;
+        bool changed = false;
+        for (const SmallVector<int64_t> &lvl : tiles) {
+          SmallVector<int64_t> nl(lvl.begin(), lvl.end());
+          while (nl.size() > nloops) {
+            nl.erase(nl.begin());
+            changed = true;
+          }
+          trimmed.push_back(nl);
+        }
+        if (changed)
+          cfg = IREE::Codegen::LoweringConfigAttr::get((*named)->getContext(),
+                                                       trimmed);
       }
+      (*named)->setAttr("lowering_config", cfg);
+      ++nspec;
     }
-    if (std::getenv("IREE_METAL_COOP_ATTN_DECOMP"))
+    if (std::getenv("IREE_METAL_COOP_ATTN_DECOMP")) {
       llvm::errs() << "[specialize-attn] targets=" << targets.size()
                    << " specialized=" << nspec << "\n";
+      getOperation()->walk([&](linalg::LinalgOp m) {
+        if (isa<linalg::MatmulOp, linalg::BatchMatmulOp,
+                linalg::MatmulTransposeBOp, linalg::BatchMatmulTransposeBOp>(
+                m.getOperation())) {
+          llvm::errs() << "[specialize-attn] raised: " << m->getName()
+                       << " nloops=" << m.getNumLoops() << " L3=[";
+          for (int64_t v : getTileSizes(m, 3))
+            llvm::errs() << v << " ";
+          llvm::errs() << "]\n";
+        }
+      });
+    }
   }
 };
 
