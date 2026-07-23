@@ -240,8 +240,16 @@ static void addMemRefLoweringPasses(OpPassManager &modulePassManager) {
   // SPIR-V because we don't use upstream memref descriptors.
   modulePassManager.addPass(createFlattenMemRefSubspanPass());
 
-  FunctionLikeNest(modulePassManager)
-      .addPass(createSPIRVEraseStorageBufferStaticShapePass)
+  FunctionLikeNest funcNest(modulePassManager);
+  // Coop-attention WIP: flattening the per-workgroup O/scratch views emits 1-D
+  // subviews of the storage buffer that feed gpu.subgroup_mma_load/store. Fold
+  // them into the mma ops here (absorbing the base offset into the access
+  // indices) so nothing strided survives to ConvertToSPIRV. Gated to keep the
+  // default (deployed) pipeline byte-for-byte unchanged.
+  if (getenv("IREE_METAL_COOP_ATTENTION_WIP")) {
+    funcNest.addPass(memref::createFoldMemRefAliasOpsPass);
+  }
+  funcNest.addPass(createSPIRVEraseStorageBufferStaticShapePass)
       .addPass(createCSEPass);
 }
 

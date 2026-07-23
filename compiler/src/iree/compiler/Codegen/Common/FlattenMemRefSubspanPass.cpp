@@ -318,26 +318,58 @@ struct FlattenBindingSubspan final
 };
 
 /// Flatten `memref` operands and results of `memref.reinterpret_cast` op.
-// TODO(ravishankarm): For now just handle the case where the result is 0D
-// memref, and offset is 0. This is how void pointers are modeled. Generalize if
-// necessary.
+///
+/// The 0-D / zero-offset case models void pointers and is handled by simply
+/// re-pointing the source to its flattened form. The general case (a rank-N
+/// strided view carved out of an already-flattened 1-D source, e.g. a
+/// per-workgroup tile of a storage buffer feeding gpu.subgroup_mma_load/store)
+/// is flattened to a 1-D reinterpret_cast of the flat source that *preserves
+/// the base offset*. Consumers (mma load/store, transfer read/write, load/store)
+/// linearize their own indices from the ORIGINAL multi-dim strides while
+/// dropping the offset, so carrying the offset on the 1-D result reproduces the
+/// original address: base + offset + linearize(indices).
 struct FlattenReinterpretCast : OpConversionPattern<memref::ReinterpretCastOp> {
   using Base::Base;
 
   LogicalResult
   matchAndRewrite(memref::ReinterpretCastOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (op.getResultRank() != 0) {
+    if (!isRankZeroOrOneMemRef(adaptor.getSource().getType())) {
       return rewriter.notifyMatchFailure(
-          op, "unhandled op with non-zero rank memref return type");
+          op, "expected converted source memref of rank <= 1");
     }
 
-    if (!isZeroInteger(op.getConstifiedMixedOffset())) {
-      return rewriter.notifyMatchFailure(op, "unhandled non-zero offset");
+    // Narrow fast-path: 0-D void-pointer modeling with zero offset just
+    // re-points the source to its flattened form.
+    if (op.getResultRank() == 0 &&
+        isZeroInteger(op.getConstifiedMixedOffset())) {
+      rewriter.modifyOpInPlace(op,
+                               [&] { op->setOperand(0, adaptor.getSource()); });
+      return success();
     }
 
-    rewriter.modifyOpInPlace(op,
-                             [&] { op->setOperand(0, adaptor.getSource()); });
+    Type neededResultType =
+        getTypeConverter()->convertType(op.getResult().getType());
+    if (!neededResultType || !isRankZeroOrOneMemRef(neededResultType)) {
+      return failure();
+    }
+
+    // Collapse the rank-N strided view into a 1-D *subview* of the flat source
+    // at the (already-linear) base offset. A subview -- unlike a
+    // reinterpret_cast -- is folded into its load/store consumers (including
+    // gpu.subgroup_mma_load/store) by FoldMemRefAliasOps, so the offset is
+    // absorbed into the access indices and nothing strided survives to the
+    // SPIR-V conversion.
+    Value size = createTotalElementCountValue(op.getType(), op.getSizes(),
+                                              op.getLoc(), rewriter);
+    Value offset = getValueOrCreateConstantIndexOp(
+        rewriter, op.getLoc(), op.getConstifiedMixedOffset());
+    Value stride = arith::ConstantIndexOp::create(rewriter, op.getLoc(), 1);
+    Value newSubView = memref::SubViewOp::create(
+        rewriter, op.getLoc(), adaptor.getSource(), ValueRange({offset}),
+        ValueRange({size}), ValueRange({stride}));
+    rewriter.replaceOpWithNewOp<memref::CastOp>(op, neededResultType,
+                                                newSubView);
     return success();
   }
 };
@@ -745,6 +777,33 @@ struct RemoveDynamicCastOp final : OpRewritePattern<memref::CastOp> {
       rewriter.replaceOp(castOp, castOp.getSource());
       return success();
     }
+    // Same-rank/same-shape cast that only relaxes the layout offset from static
+    // to dynamic (e.g. the offset-widening cast the coop attention path inserts
+    // before gpu.subgroup_mma_load/store). The source is strictly more precise,
+    // so drop the cast; keeping the static-offset source lets subspan
+    // flattening lower the mma load/store without stranding an unresolved
+    // materialization on the widened dynamic offset.
+    if (srcType.getRank() == dstType.getRank() &&
+        srcType.getShape() == dstType.getShape() &&
+        srcType.getMemorySpace() == dstType.getMemorySpace()) {
+      int64_t srcOffset, dstOffset;
+      SmallVector<int64_t> srcStrides, dstStrides;
+      if (succeeded(srcType.getStridesAndOffset(srcStrides, srcOffset)) &&
+          succeeded(dstType.getStridesAndOffset(dstStrides, dstOffset)) &&
+          srcStrides == dstStrides &&
+          // (a) source is strictly more precise -- static offset widened to
+          // dynamic; or (b) a pure layout-spelling no-op -- identical static
+          // offset (e.g. `strided<[1], offset: 0>` vs the implicit identity
+          // layout) that would otherwise block folding the subview into its
+          // load/store consumers.
+          ((!ShapedType::isDynamic(srcOffset) &&
+            ShapedType::isDynamic(dstOffset)) ||
+           (!ShapedType::isDynamic(srcOffset) &&
+            !ShapedType::isDynamic(dstOffset) && srcOffset == dstOffset))) {
+        rewriter.replaceOp(castOp, castOp.getSource());
+        return success();
+      }
+    }
     return failure();
   }
 };
@@ -840,7 +899,8 @@ struct FlattenMemRefSubspanPass final
     });
     target.addDynamicallyLegalOp<memref::ReinterpretCastOp>(
         [](memref::ReinterpretCastOp castOp) {
-          return isRankZeroOrOneMemRef(castOp.getSource().getType());
+          return isRankZeroOrOneMemRef(castOp.getSource().getType()) &&
+                 isRankZeroOrOneMemRef(castOp.getType());
         });
     target.addDynamicallyLegalOp<gpu::SubgroupMmaLoadMatrixOp>(
         [](gpu::SubgroupMmaLoadMatrixOp loadOp) {
@@ -879,6 +939,19 @@ struct FlattenMemRefSubspanPass final
     target.addDynamicallyLegalOp<memref::DeallocOp>([](memref::DeallocOp op) {
       return isRankZeroOrOneMemRef(op.getMemref().getType());
     });
+
+    // Pre-fold redundant shape/offset-widening memref.casts (e.g. the
+    // offset-widening cast the coop attention path inserts before
+    // gpu.subgroup_mma_load/store) so they don't strand an unresolved
+    // materialization during the flattening conversion below.
+    {
+      RewritePatternSet preFoldPatterns(context);
+      preFoldPatterns.add<RemoveDynamicCastOp>(context);
+      if (failed(applyPatternsGreedily(getOperation(),
+                                       std::move(preFoldPatterns)))) {
+        return signalPassFailure();
+      }
+    }
 
     // Use partial conversion here so that we can ignore allocations created
     // by promotion and their load/store ops.
