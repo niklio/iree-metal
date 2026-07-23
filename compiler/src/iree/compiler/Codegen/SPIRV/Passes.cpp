@@ -938,8 +938,15 @@ void addSPIRVVectorDistributeAttentionPassPipeline(
     // whole sequence (tile-to-coop -> GV -> vectorize-to-coop -> MMA) runs on memrefs,
     // matching the FFN coop pipeline. convertVectorToMMAOps requires memref
     // transfer_reads. Gated IREE_METAL_COOP_ATTN_BUFFERIZE.
-    if (getenv("IREE_METAL_COOP_ATTN_BUFFERIZE"))
+    if (getenv("IREE_METAL_COOP_ATTN_BUFFERIZE")) {
+      // De-alias the online-softmax scratch writes to the flash-loop iter_args so
+      // the MULTI-iteration flash (seq > K2 tile) one-shot-bufferizes; without this
+      // comprehensive bufferize errors "yield operand not equivalent to iter bbArg".
+      funcPassManager.addPass(std::make_unique<DeAliasFlashScratchPass>());
+      funcPassManager.addPass(createConfigTrackingCanonicalizerPass());
+      funcPassManager.addPass(createCSEPass());
       addBufferizePasses(funcPassManager, gpuAllocateWorkgroupMemoryFn);
+    }
     funcPassManager.addPass(createSPIRVTileToCooperativeOpsPass());
     // iree-metal (attention coop-port P1): SPIRVVectorizeToCooperativeOps UNROLLS an
     // existing vector.contract to the native coop size — it does not vectorize linalg.
