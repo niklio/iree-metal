@@ -973,6 +973,14 @@ void addSPIRVVectorDistributeAttentionPassPipeline(
     funcPassManager.addPass(createSPIRVVectorToGPUSubgroupMMAPass());
     funcPassManager.addPass(createCanonicalizerPass());
     funcPassManager.addPass(createCSEPass());
+    // iree-metal (attention coop-port P1, multi-iteration): the coop subgroup_mma_store
+    // into the wide (head_dim) flash O accumulator leaves an unrealized_conversion_cast
+    // (flat scratch <-> strided 16x16 view) that ConvertToSPIRV can't legalize. Resolve
+    // the memref alias/strided-metadata so the store lowers cleanly.
+    funcPassManager.addPass(memref::createExpandStridedMetadataPass());
+    funcPassManager.addPass(memref::createFoldMemRefAliasOpsPass());
+    funcPassManager.addPass(createCanonicalizerPass());
+    funcPassManager.addPass(createCSEPass());
   }
 
   // Vectorize the decomposed matmul+softmax generics. The decomposed ops have no
