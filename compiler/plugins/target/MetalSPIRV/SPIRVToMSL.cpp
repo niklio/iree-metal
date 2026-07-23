@@ -144,6 +144,86 @@ tryEmitMatmul2dMSL(StringRef reviseName, StringRef origName, size_t numBuffers,
   // A,B,C buffers and no push constants (no dynamic dims / fused operands yet).
   if (numBuffers != 3 || hasPushConstant)
     return std::nullopt;
+
+  // batch_matmul: "..._batch_matmul_<B>x<M>x<N>x<K>_bf16xbf16xf32" (f32 output;
+  // attention score/value matmuls keep the accumulator in f32 for softmax). Each
+  // workgroup computes one 64x64 tile of one batch (IREE tiles [1,64,64], grid
+  // (N/64, M/64, B), wg.z = batch), mapping 1:1 onto matmul2d<simdgroups<4>>.
+  // NOTE: batched attention matmuls in the backward often carry a FUSED elementwise
+  // epilogue (scale / mask) in the same dispatch. Substituting the whole kernel drops
+  // that epilogue -> nan on real models (bert GNORM=nan), even though the bare matmul
+  // is numerically exact in isolation. So the batched path is behind its OWN opt-in
+  // flag (separate from the validated pure-2D IREE_METAL_MSL4_MATMUL2D) until an
+  // epilogue-safety guard (detect non-coop-matmul ops in the module -> fall back) lands.
+  if (size_t bmk = origName.find("_batch_matmul_");
+      bmk != StringRef::npos && std::getenv("IREE_METAL_MSL4_BMM")) {
+    StringRef brest = origName.substr(bmk + 14);
+    if (!brest.contains("bf16xbf16xf32"))
+      return std::nullopt;
+    StringRef bdimsStr = brest.split('_').first;
+    SmallVector<StringRef, 4> bd;
+    bdimsStr.split(bd, 'x');
+    if (bd.size() != 4)
+      return std::nullopt;
+    long long B = 0, M = 0, N = 0, K = 0;
+    if (bd[0].getAsInteger(10, B) || bd[1].getAsInteger(10, M) ||
+        bd[2].getAsInteger(10, N) || bd[3].getAsInteger(10, K))
+      return std::nullopt;
+    if (M % 64 || N % 64 || K % 8)
+      return std::nullopt;
+    if (std::getenv("IREE_METAL_MSL4_MATMUL2D_LOG"))
+      llvm::errs() << "[matmul2d] SUBSTITUTED " << origName << " (batch B=" << B
+                   << " M=" << M << " N=" << N << " K=" << K << ")\n";
+    std::string s;
+    llvm::raw_string_ostream os(s);
+    os << "#include <metal_stdlib>\n"
+          "#include <metal_tensor>\n"
+          "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n"
+          "using namespace metal;\n"
+          "using namespace mpp::tensor_ops;\n"
+          "struct spvDescriptorSetBuffer0 {\n"
+          "  device bfloat* A [[id(0)]];\n"
+          "  device bfloat* B [[id(1)]];\n"
+          "  device float* C [[id(2)]];\n"  // f32 accumulator output
+          "};\n"
+          "kernel void "
+       << reviseName
+       << "(constant spvDescriptorSetBuffer0& s [[buffer(0)]], "
+          "uint3 wg [[threadgroup_position_in_grid]], "
+          "uint3 lid [[thread_position_in_threadgroup]]) {\n"
+          "  uint b = wg.z;\n"
+          "  device bfloat* Ab = s.A + b*"
+       << (M * K)
+       << ";\n"
+          "  device bfloat* Bb = s.B + b*"
+       << (K * N)
+       << ";\n"
+          "  device float* Cb = s.C + b*"
+       << (M * N)
+       << ";\n"
+          "  tensor<device bfloat, dextents<int32_t,2>, tensor_inline> A(Ab, "
+          "dextents<int32_t,2>("
+       << K << ", " << M
+       << "));\n"
+          "  tensor<device bfloat, dextents<int32_t,2>, tensor_inline> B(Bb, "
+          "dextents<int32_t,2>("
+       << N << ", " << K
+       << "));\n"
+          "  tensor<device float, dextents<int32_t,2>, tensor_inline> C(Cb, "
+          "dextents<int32_t,2>("
+       << N << ", " << M
+       << "));\n"
+          "  constexpr auto d = matmul2d_descriptor(64, 64, "
+          "static_cast<int>(dynamic_extent), false, false, false);\n"
+          "  matmul2d<d, execution_simdgroups<4>> op;\n"
+          "  auto mA = A.slice(0, wg.y*64);\n"
+          "  auto mB = B.slice(wg.x*64, 0);\n"
+          "  auto mC = C.slice(wg.x*64, wg.y*64);\n"
+          "  op.run(mA, mB, mC);\n"
+          "}\n";
+    return os.str();
+  }
+
   // Parse "..._matmul_<M>x<N>x<K>_bf16xbf16xf32" out of the original entry name.
   size_t mk = origName.find("_matmul_");
   if (mk == StringRef::npos)
