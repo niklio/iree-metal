@@ -53,6 +53,29 @@ iree-compile /tmp/attn_op.mlir --iree-hal-target-backends=metal-spirv --iree-met
 `COOP_ATTN_M` (1/16 scalar, 32 hangs), `COOP_ATTN_DECOMP` (0 coop), `COOP_ATTN_THREAD` (scf.forall
 legalization failure), `COOP_ATTN_K2/SMEM/COOPSMEM`. All present-but-non-functional scaffolding.
 
+## P1 RESULT (2026-07-23): coop MATMULS achieved; full flash blocked on Metal coop-elementwise limit
+**Milestone reached:** the decomposed attention qk/pv matmuls now emit cooperative matrices —
+seed `iree_linalg_ext.attention` → `CooperativeMatrixMulAdd=2`, `simdgroup_multiply=16` in MSL. The
+unlock was `addBufferizePasses` BEFORE the whole coop sequence (specialize → bufferize → tile-to-coop
+→ GV → vectorize-to-coop → MMA), matching FFN (`convertVectorToMMAOps` needs memref transfer_reads).
+This did NOT segfault — refuting the code's bufferize-first concern. Committed (all gated
+`IREE_METAL_COOP_ATTENTION_WIP`+`_DECOMP`+`_BUFFERIZE`, inert by default).
+
+**But the full fused-flash attention does not COMPILE to MSL** — a fundamental Metal limit. The
+online-softmax between the two coop matmuls (max/exp/`P/sum`/norm-rescale, and the scale) is
+elementwise ON the coop scores/`P` (because `P` feeds the pv coop matmul, so `P` and everything
+computing it are coop). **Metal `simdgroup_matrix` has NO elementwise ops** (no `*`, no scalar
+multiply — verified: `simdgroup_matrix * scalar/matrix` = "invalid operands") → every softmax op
+becomes `spvCoopMat*spvCoopMat/scalar`, which Metal rejects. Confirmed unavoidable across: scale-on-Q,
+scale-on-scores, scale-in-exp2, NOSCALE+pre-scaled-Q, and the `BARRIER`/`VBARRIER` passes.
+
+**THE REAL REMAINING CORE (softmax de-coop):** insert store/load boundaries so the qk coop scores go
+coop → memref → **vector**, run the softmax on vectors, then coop-load `P` for the pv matmul. i.e. the
+attention must NOT be a single fully-fused coop region; the softmax must be a non-coop island between
+two coop matmuls. The existing `QkScoreBarrierPass`/`VectorContractBarrierPass` don't achieve this.
+This is the substantial core of coop-flash-on-Metal. (FFN matmuls coop fine because they have no
+elementwise-on-coop; attention's softmax-between-matmuls is the hard part.)
+
 ## P1 IMPLEMENTATION STATUS (2026-07-23): 5 fixes landed; blocked at the bufferization stage
 Committed, gated `IREE_METAL_COOP_ATTN_DECOMP` (all in SPIRV/Passes.cpp): (1) `SpecializeAttnMatmulPass`
 raises the decomposed qk/pv generics to named `linalg.matmul` (+ copies the coop lowering_config);
