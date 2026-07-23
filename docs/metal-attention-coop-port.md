@@ -53,7 +53,23 @@ iree-compile /tmp/attn_op.mlir --iree-hal-target-backends=metal-spirv --iree-met
 `COOP_ATTN_M` (1/16 scalar, 32 hangs), `COOP_ATTN_DECOMP` (0 coop), `COOP_ATTN_THREAD` (scf.forall
 legalization failure), `COOP_ATTN_K2/SMEM/COOPSMEM`. All present-but-non-functional scaffolding.
 
-## P1 RESULT (2026-07-23): coop MATMULS achieved; full flash blocked on Metal coop-elementwise limit
+## ✅ P1 COMPLETE (2026-07-23): WORKING coop flash attention on Metal, numerically correct
+The seed `iree_linalg_ext.attention` now compiles AND runs on Metal with the matmuls on the matrix
+units and the output matching the CPU reference exactly (0.0999756). **Full working flag recipe:**
+`IREE_METAL_COOP_ATTENTION_WIP` + `IREE_METAL_COOP_ATTN_DECOMP` + `IREE_METAL_COOP_ATTN_BUFFERIZE` +
+`NLEARN_NO_COOP_ELEMENTWISE` + `IREE_METAL_COOP_ATTN_M=16` + `IREE_METAL_COOP_ATTN_K2=16`, on top of the
+7 committed SPIRV/Passes.cpp fixes (specialize → config-trim → GenericVectorization wiring → MMA-pass
+wiring → bufferize-first). The **final unlock** was `NLEARN_NO_COOP_ELEMENTWISE` (a pre-existing gate in
+the llvm submodule): it makes `elementwiseSupportsMMAMatrixType` return false, so the softmax elementwise
+(the 3 `subgroup_mma_elementwise` ops that produced illegal `spvCoopMat*spvCoopMat`) stay VECTOR ops —
+forcing coop scores → `subgroup_mma_store` → vector softmax → `subgroup_mma_load` P → pv coop matmul.
+The matmuls run coop; the softmax runs on vectors; the whole thing is correct. **The metal-spirv
+attention scalar-codegen wall is broken.**
+NEXT: rigorous correctness (non-uniform inputs + full model bench), perf vs scalar/vs jax-metal, extend
+from the seed op to the real HF models (raise masked-softmax → `iree_linalg_ext.attention`), causal
+tile-skip (P4). Note the scale is fine now (it stays a vector op under NO_COOP_ELEMENTWISE).
+
+## (historical) P1 RESULT: coop MATMULS achieved; full flash blocked on Metal coop-elementwise limit
 **Milestone reached:** the decomposed attention qk/pv matmuls now emit cooperative matrices —
 seed `iree_linalg_ext.attention` → `CooperativeMatrixMulAdd=2`, `simdgroup_multiply=16` in MSL. The
 unlock was `addBufferizePasses` BEFORE the whole coop sequence (specialize → bufferize → tile-to-coop
