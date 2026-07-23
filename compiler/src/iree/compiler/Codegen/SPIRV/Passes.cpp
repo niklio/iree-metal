@@ -39,6 +39,7 @@
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Passes.h"
+#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -581,6 +582,43 @@ struct FoldContractExtPass
   }
 };
 
+// iree-metal (attention coop-port P1): the DecomposeAttention pass emits the qk/pv
+// matmuls as non-canonical linalg.generic (batch_matmul_transpose_b, reduction-in-
+// middle) which the linalg vectorizer does NOT vectorize to vector.contract -> they
+// go scalar and never reach the cooperative-matrix path. Raising them to named
+// linalg.matmul (via specializeGenericOp) makes them vectorize to vector.contract.
+// specializeGenericOp drops discardable attrs, so we copy the coop lowering_config
+// onto the new named op (SPIRVTileToCooperativeOps gates on matmul-WITH-config).
+struct SpecializeAttnMatmulPass
+    : PassWrapper<SpecializeAttnMatmulPass, OperationPass<>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SpecializeAttnMatmulPass)
+  StringRef getArgument() const final {
+    return "iree-metal-specialize-attn-matmul";
+  }
+  void runOnOperation() override {
+    IRRewriter rewriter(&getContext());
+    SmallVector<linalg::GenericOp> targets;
+    getOperation()->walk([&](linalg::GenericOp g) {
+      if (g->hasAttr("lowering_config"))
+        targets.push_back(g);
+    });
+    int nspec = 0;
+    for (linalg::GenericOp g : targets) {
+      Attribute cfg = g->getAttr("lowering_config");
+      rewriter.setInsertionPoint(g);
+      FailureOr<linalg::LinalgOp> named =
+          linalg::specializeGenericOp(rewriter, g);
+      if (succeeded(named)) {
+        (*named)->setAttr("lowering_config", cfg);
+        ++nspec;
+      }
+    }
+    if (std::getenv("IREE_METAL_COOP_ATTN_DECOMP"))
+      llvm::errs() << "[specialize-attn] targets=" << targets.size()
+                   << " specialized=" << nspec << "\n";
+  }
+};
+
 struct QkScoreBarrierPass
     : PassWrapper<QkScoreBarrierPass, OperationPass<>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(QkScoreBarrierPass)
@@ -800,6 +838,11 @@ void addSPIRVVectorDistributeAttentionPassPipeline(
       funcPassManager.addPass(std::make_unique<QkScoreBarrierPass>());
       funcPassManager.addPass(createConfigTrackingCanonicalizerPass());
     }
+    // iree-metal (attention coop-port P1): raise the decomposed qk/pv generics
+    // (batch_matmul_transpose_b, reduction-in-middle) to named linalg.matmul,
+    // preserving their coop lowering_config, so SPIRVVectorizeToCooperativeOps
+    // vectorizes them to a coop vector.contract instead of scalar fma.
+    funcPassManager.addPass(std::make_unique<SpecializeAttnMatmulPass>());
     funcPassManager.addPass(createSPIRVTileToCooperativeOpsPass());
     funcPassManager.addPass(createSPIRVVectorizeToCooperativeOpsPass());
     funcPassManager.addPass(createCanonicalizerPass());
