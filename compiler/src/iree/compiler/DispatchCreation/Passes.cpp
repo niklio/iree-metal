@@ -1,4 +1,5 @@
 // Copyright 2024 The IREE Authors
+#include <cstdlib>
 //
 // Licensed under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -143,7 +144,11 @@ static void addDispatchRegionCreationPreprocessingPasses(
       .addPass(IREE::Flow::createCanonicalizePass)
       .addPass(mlir::createCSEPass);
 
-  if (clEnableFuseHorizontalContractions) {
+  // nlearn: also run the pass when the reduction-fusion / variance-rewrite env knobs are set,
+  // so they work through the PJRT path (which can't pass the cl::opt above).
+  if (clEnableFuseHorizontalContractions ||
+      ::getenv("NLEARN_FUSE_HORIZ_REDUCTIONS") ||
+      ::getenv("NLEARN_LN_VAR_REWRITE")) {
     FunctionLikeNest(passManager)
         .addPass(createFuseHorizontalContractionsPass)
         .addPass(IREE::Flow::createCanonicalizePass)

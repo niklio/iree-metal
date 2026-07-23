@@ -81,7 +81,8 @@ LogicalResult setCooperativeMatrixConfig(
     const unsigned numMNTilesPerSubgroup,
     unsigned softwarePipelineDepth = defaultCoopMatrixSoftwarePipelineDepth,
     unsigned softwarePipelineStoreStage =
-        defaultCoopMatrixSoftwarePipelineStoreStage);
+        defaultCoopMatrixSoftwarePipelineStoreStage,
+    unsigned numKTiles = 2);
 
 /// Sets CodeGen configuration for GPUs from a specific vendor.
 ///

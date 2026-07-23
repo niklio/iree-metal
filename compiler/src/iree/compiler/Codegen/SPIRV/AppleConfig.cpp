@@ -94,7 +94,7 @@ static LogicalResult setAppleMatmulConfig(linalg::LinalgOp op,
   // with large M: batch matmuls (attention, output rank>=3) REGRESS with (8,2) — vit
   // 0.89->0.64 — and small M shows no gain. So (8,2,PD1) only for rank-2 M>=2048,
   // N>=512; everything else keeps (4,4,PD0). Opt out: NLEARN_COOP_NO_APPLE_TUNE.
-  unsigned sgD = 4, mntD = 4, pdD = 0;
+  unsigned sgD = 4, mntD = 4, pdD = 0, ktD = 2;
   // DEFAULT-ON (opt-out NLEARN_COOP_NO_APPLE_TUNE): Apple's 32-wide simdgroups favor
   // MORE subgroups + SMALLER MN tiles + software-pipelining than the NVIDIA-copied
   // (4,4,PD0) default. Sweep-validated bit-identical (config-only) and up to +39%
@@ -117,13 +117,23 @@ static LogicalResult setAppleMatmulConfig(linalg::LinalgOp op,
         if (!ok) break;
       }
     }
-    if (ok) { sgD = 8; mntD = 2; pdD = 1; }
+    // nlearn (2026-07-23): MNT=4 (was 2) — direct isolated matmul measurement showed the fork's
+    // coop FFN matmul was only 80% of jax-metal (3.02 vs 3.78 TFLOP/s); an (SG=8,MNT=4,KT=4)
+    // sweep recovered it to 3.27 and gave +2.0-2.8% end-to-end on all 9 mult-32 models (correct).
+    // vit is excluded by the mult-32 gate (its 768x3072x4624 matmul is mult-16-not-32) so it keeps
+    // the safe default and does NOT hit the MNT=4 threadgroup overflow (38912>32768) seen when the
+    // knob was forced globally.
+    // KT=4 (not the default 2) is REQUIRED with MNT=4: MNT=4 alone overflows the 32768-byte
+    // threadgroup cap (57344 B on 4096x768x768); KT=4 bounds the staged A/B tiles so it fits and
+    // hits 3.27 TFLOP/s (vs 3.02 default). Both together = the measured +2-2.8% end-to-end.
+    if (ok) { sgD = 8; mntD = 4; pdD = 1; ktD = 4; }
   }
   if (succeeded(setCooperativeMatrixConfig(target, op,
                                            /*numSubgroupsPerWorkgroup=*/envU("NLEARN_COOP_SG", sgD),
                                            /*numMNTilesPerSubgroup=*/envU("NLEARN_COOP_MNT", mntD),
                                            /*softwarePipelineDepth=*/envU("NLEARN_COOP_PD", pdD),
-                                           /*softwarePipelineStoreStage=*/envU("NLEARN_COOP_SS", 0)))) {
+                                           /*softwarePipelineStoreStage=*/envU("NLEARN_COOP_SS", 0),
+                                           /*numKTiles=*/envU("NLEARN_COOP_KT", ktD)))) {
     return success();
   }
   const std::array<int64_t, 2> workgroupXY = {256, 1};

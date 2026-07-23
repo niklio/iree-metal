@@ -894,7 +894,8 @@ setCooperativeMatrixConfig(IREE::GPU::TargetAttr target, linalg::LinalgOp op,
                            const unsigned numSubgroupsPerWorkgroup,
                            const unsigned numMNTilesPerSubgroup,
                            unsigned softwarePipelineDepth,
-                           unsigned softwarePipelineStoreStage) {
+                           unsigned softwarePipelineStoreStage,
+                           unsigned numKTiles) {
   LLVM_DEBUG(llvm::dbgs() << "trying to matmul cooperative matrix config...\n");
   // This configuration is only for cooperative matrix.
   if (target.getWgp().getMma().empty()) {
@@ -958,7 +959,7 @@ setCooperativeMatrixConfig(IREE::GPU::TargetAttr target, linalg::LinalgOp op,
   // nlearn: numKTilesPerSubgroup tunable (NLEARN_COOP_KT) to probe coop matmul
   // kernel quality — larger K-tiles do more reduction per workgroup load (fewer
   // barriers), closing toward jax-metal's hand-tuned MPS matmul.
-  unsigned ktiles = numKTilesPerSubgroup;
+  unsigned ktiles = numKTiles;
   if (const char *kt = getenv("NLEARN_COOP_KT"))
     ktiles = std::max(1, atoi(kt));
   GPUMMAHeuristicSeeds seeds{numSubgroupsPerWorkgroup, numMNTilesPerSubgroup,
