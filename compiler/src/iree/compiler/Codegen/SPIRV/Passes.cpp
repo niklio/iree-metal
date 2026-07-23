@@ -652,6 +652,64 @@ struct SpecializeAttnMatmulPass
   }
 };
 
+// iree-metal (attention coop-port P1): the softmax scale (1/sqrt(d)) is fused into
+// the qk contraction's LHS operand as arith.mulf(transfer_read, splat) — so the
+// operand is not a plain transfer_read and SPIRVVectorToGPUSubgroupMMA cannot load
+// it as a coop matrix. Hoist the scalar scale out to the result:
+//   contract(mulf(A, s), B, 0) == mulf(contract(A, B, 0), s)   (matmul is linear).
+// Requires the accumulator to be a zero constant (true for qk/pv first matmul).
+struct HoistScaleFromContractPass
+    : PassWrapper<HoistScaleFromContractPass, OperationPass<>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(HoistScaleFromContractPass)
+  StringRef getArgument() const final {
+    return "iree-metal-hoist-scale-from-contract";
+  }
+  static bool isSplatCst(Value v, double &out) {
+    DenseFPElementsAttr attr;
+    if (!matchPattern(v, m_Constant(&attr)) || !attr.isSplat())
+      return false;
+    out = attr.getSplatValue<APFloat>().convertToDouble();
+    return true;
+  }
+  void runOnOperation() override {
+    IRRewriter rewriter(&getContext());
+    SmallVector<vector::ContractionOp> ops;
+    getOperation()->walk([&](vector::ContractionOp op) { ops.push_back(op); });
+    for (vector::ContractionOp op : ops) {
+      // Accumulator must be a zero constant so scaling the result is exact.
+      DenseFPElementsAttr accAttr;
+      if (!matchPattern(op.getAcc(), m_Constant(&accAttr)) || !accAttr.isSplat() ||
+          !accAttr.getSplatValue<APFloat>().isZero())
+        continue;
+      auto mul = op.getLhs().getDefiningOp<arith::MulFOp>();
+      if (!mul)
+        continue;
+      double s;
+      Value x;
+      if (isSplatCst(mul.getRhs(), s))
+        x = mul.getLhs();
+      else if (isSplatCst(mul.getLhs(), s))
+        x = mul.getRhs();
+      else
+        continue;
+      rewriter.setInsertionPoint(op);
+      auto newContract = rewriter.create<vector::ContractionOp>(
+          op.getLoc(), op.getResultType(), x, op.getRhs(), op.getAcc(),
+          op.getIndexingMaps(), op.getIteratorTypes());
+      auto resTy = cast<VectorType>(op.getResultType());
+      APFloat sf(s);
+      bool losesInfo = false;
+      sf.convert(cast<FloatType>(resTy.getElementType()).getFloatSemantics(),
+                 APFloat::rmNearestTiesToEven, &losesInfo);
+      Value scaleCst = rewriter.create<arith::ConstantOp>(
+          op.getLoc(), resTy, DenseElementsAttr::get(resTy, sf));
+      Value scaled =
+          rewriter.create<arith::MulFOp>(op.getLoc(), newContract, scaleCst);
+      rewriter.replaceOp(op, scaled);
+    }
+  }
+};
+
 struct QkScoreBarrierPass
     : PassWrapper<QkScoreBarrierPass, OperationPass<>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(QkScoreBarrierPass)
@@ -887,6 +945,9 @@ void addSPIRVVectorDistributeAttentionPassPipeline(
       funcPassManager.addPass(createGenericVectorizationPass(options));
     }
     funcPassManager.addPass(std::make_unique<FoldContractExtPass>());
+    // iree-metal (attention coop-port P1): hoist the fused softmax scale out of the
+    // qk contract LHS so its operand is a plain transfer_read (coop-loadable).
+    funcPassManager.addPass(std::make_unique<HoistScaleFromContractPass>());
     funcPassManager.addPass(createSPIRVVectorizeToCooperativeOpsPass());
     funcPassManager.addPass(createCanonicalizerPass());
     funcPassManager.addPass(createCSEPass());
