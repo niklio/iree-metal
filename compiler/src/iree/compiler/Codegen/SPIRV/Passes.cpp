@@ -934,6 +934,12 @@ void addSPIRVVectorDistributeAttentionPassPipeline(
     // preserving their coop lowering_config, so SPIRVVectorizeToCooperativeOps
     // vectorizes them to a coop vector.contract instead of scalar fma.
     funcPassManager.addPass(std::make_unique<SpecializeAttnMatmulPass>());
+    // iree-metal (attention coop-port P1): bufferize BEFORE the coop passes so the
+    // whole sequence (tile-to-coop -> GV -> vectorize-to-coop -> MMA) runs on memrefs,
+    // matching the FFN coop pipeline. convertVectorToMMAOps requires memref
+    // transfer_reads. Gated IREE_METAL_COOP_ATTN_BUFFERIZE.
+    if (getenv("IREE_METAL_COOP_ATTN_BUFFERIZE"))
+      addBufferizePasses(funcPassManager, gpuAllocateWorkgroupMemoryFn);
     funcPassManager.addPass(createSPIRVTileToCooperativeOpsPass());
     // iree-metal (attention coop-port P1): SPIRVVectorizeToCooperativeOps UNROLLS an
     // existing vector.contract to the native coop size — it does not vectorize linalg.
@@ -948,13 +954,6 @@ void addSPIRVVectorDistributeAttentionPassPipeline(
     // iree-metal (attention coop-port P1): hoist the fused softmax scale out of the
     // qk contract LHS so its operand is a plain transfer_read (coop-loadable).
     funcPassManager.addPass(std::make_unique<HoistScaleFromContractPass>());
-    // iree-metal (attention coop-port P1): convertVectorToMMAOps requires the
-    // vector.transfer_read operands to be on MEMREFS (getStaticallyKnownRowStride ->
-    // dyn_cast<MemRefType>). GenericVectorization above produced tensor-level
-    // transfer_reads, so bufferize HERE (after vectorization, before coop/MMA) to
-    // move them onto memrefs. Gated experiment behind IREE_METAL_COOP_ATTN_BUFFERIZE.
-    if (getenv("IREE_METAL_COOP_ATTN_BUFFERIZE"))
-      addBufferizePasses(funcPassManager, gpuAllocateWorkgroupMemoryFn);
     funcPassManager.addPass(createSPIRVVectorizeToCooperativeOpsPass());
     funcPassManager.addPass(createCanonicalizerPass());
     funcPassManager.addPass(createCSEPass());
