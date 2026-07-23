@@ -948,6 +948,13 @@ void addSPIRVVectorDistributeAttentionPassPipeline(
     // iree-metal (attention coop-port P1): hoist the fused softmax scale out of the
     // qk contract LHS so its operand is a plain transfer_read (coop-loadable).
     funcPassManager.addPass(std::make_unique<HoistScaleFromContractPass>());
+    // iree-metal (attention coop-port P1): convertVectorToMMAOps requires the
+    // vector.transfer_read operands to be on MEMREFS (getStaticallyKnownRowStride ->
+    // dyn_cast<MemRefType>). GenericVectorization above produced tensor-level
+    // transfer_reads, so bufferize HERE (after vectorization, before coop/MMA) to
+    // move them onto memrefs. Gated experiment behind IREE_METAL_COOP_ATTN_BUFFERIZE.
+    if (getenv("IREE_METAL_COOP_ATTN_BUFFERIZE"))
+      addBufferizePasses(funcPassManager, gpuAllocateWorkgroupMemoryFn);
     funcPassManager.addPass(createSPIRVVectorizeToCooperativeOpsPass());
     funcPassManager.addPass(createCanonicalizerPass());
     funcPassManager.addPass(createCSEPass());
