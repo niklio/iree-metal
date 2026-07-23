@@ -54,12 +54,20 @@ iree-compile /tmp/attn_op.mlir --iree-hal-target-backends=metal-spirv --iree-met
 legalization failure), `COOP_ATTN_K2/SMEM/COOPSMEM`. All present-but-non-functional scaffolding.
 
 ## Phased implementation plan (re-ordered 2026-07-23: SPIR-V is fully scalar → MLIR coop conversion first)
-- **P1 — MLIR-level coop conversion (THE first blocker; layer 2).** The flash-nested qk/pv
-  `vector.contract`s go to scalar generic vectorization instead of coop. Generalize
-  `SPIRVTileAndVectorizeToCooperativeOps` (single-`rootOp`, .cpp:391-407) to convert BOTH matmuls
-  inside the flash `scf.for`, OR restructure `DecomposeAttention` so each contraction is a separately
-  coop-tileable region. Success metric on the seed repro: SPIR-V shows `CooperativeMatrixMulAdd` > 0
-  (currently 0 / 3128 scalar FMul). Everything else is downstream of this.
+- **P1 — MLIR-level coop conversion (THE first blocker; layer 2).** Pinned to the exact pass:
+  `GenericVectorization` (SPIRV/Passes.cpp:705, attention pipeline) vectorizes the decomposed qk/pv
+  matmul generics to **scalar `vector.fma`, not `vector.contract`** — so `SPIRVVectorizeToCooperativeOps`
+  never sees a contract to convert. RULED OUT: it is NOT the `generateContract` option (that defaults
+  true and the attention pipeline uses the default; `generateContract=false` only in
+  `addSPIRVSubgroupReducePassPipeline` for reductions). The real cause is op FORM: the decomposed op
+  is a non-canonical `linalg.generic` (batch_matmul_transpose_b, reduction-in-middle iterator
+  `[par,par,reduction,par]`) that the upstream linalg vectorizer's contraction path doesn't match.
+  **FIX:** make the decomposed qk/pv ops NAMED/canonical (`linalg.batch_matmul` via generalization,
+  or interchange the reduction to last) BEFORE GenericVectorization, so they vectorize to
+  `vector.contract`. Then the existing coop passes + `FoldContractExtPass` route them to coop.
+  Success metric on the seed repro: `CooperativeMatrixMulAdd` > 0 in SPIR-V (currently 0 / 3128 FMul).
+  (Verify `SPIRVTileAndVectorizeToCooperativeOps` single-`rootOp` at .cpp:391 then also handles both
+  matmuls; may need generalizing to multiple roots once contracts exist.)
 - **P2 — spirv-cross → MSL coop survival (layer 3).** Only relevant AFTER P1 emits coop SPIR-V:
   verify our `spvCoopMat` simdgroup emission (spirv_msl.cpp) lowers the attention path's
   `CooperativeMatrixMulAdd` to `simdgroup_multiply` in MSL (it handles the FFN path; confirm the
