@@ -53,6 +53,25 @@ iree-compile /tmp/attn_op.mlir --iree-hal-target-backends=metal-spirv --iree-met
 `COOP_ATTN_M` (1/16 scalar, 32 hangs), `COOP_ATTN_DECOMP` (0 coop), `COOP_ATTN_THREAD` (scf.forall
 legalization failure), `COOP_ATTN_K2/SMEM/COOPSMEM`. All present-but-non-functional scaffolding.
 
+## P1 IMPLEMENTATION STATUS (2026-07-23): 5 fixes landed; blocked at the bufferization stage
+Committed, gated `IREE_METAL_COOP_ATTN_DECOMP` (all in SPIRV/Passes.cpp): (1) `SpecializeAttnMatmulPass`
+raises the decomposed qk/pv generics to named `linalg.matmul` (+ copies the coop lowering_config);
+(2) config-rank **trim** (specialize drops the unit batch dim → getTileSizes read `[1,16,16]` → native
+size wrong → 8192 `vector<1x1>`; trim → L3 `[16,16,16]`); (3) `GenericVectorization` wired into the
+DECOMP branch (SPIRVVectorizeToCoop unrolls an existing contract, doesn't vectorize linalg); (4)
+`HoistScaleFromContractPass` hoists the softmax scale out of the qk LHS (`contract(mulf(A,s),B,0) ==
+mulf(contract(A,B,0),s)`) so the operand is a plain transfer_read; (5) `SPIRVVectorToGPUSubgroupMMA`
+wired in. Result: the qk/pv now become **2 clean coop-sized 16×16 `vector.contract` with plain
+transfer_read operands** (was 3128 scalar FMul).
+**HARD BLOCKER (architectural):** `convertVectorToMMAOps` needs **memrefs** —
+`transferReadSupportsMMAMatrixType`→`getStaticallyKnownRowStride`→`dyn_cast<MemRefType>`. The DECOMP
+coop path runs at **tensor** level (pre-bufferization), so every transfer_read is on a tensor → not
+MMA-supported → 0 mma ops → the graceful fallback unrolls to scalar. The FFN coop pipeline runs its
+coop/MMA passes POST-bufferization. **P1's remaining core = restructure the attention pipeline to
+bufferize the flash scores/accumulators BEFORE the coop/MMA passes** (the code's own comment: grafting
+promote/bufferize into the pre-bufferize tensor path "SEGFAULTS" — needs a proper restructure, the
+multi-week heart of the port). Metric `CooperativeMatrixMulAdd` still 0, blocked here.
+
 ## Phased implementation plan (re-ordered 2026-07-23: SPIR-V is fully scalar → MLIR coop conversion first)
 - **P1 — MLIR-level coop conversion (THE first blocker; layer 2).** Pinned to the exact pass:
   `GenericVectorization` (SPIRV/Passes.cpp:705, attention pipeline) vectorizes the decomposed qk/pv
