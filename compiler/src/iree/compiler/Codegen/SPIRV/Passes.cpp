@@ -951,9 +951,11 @@ void addSPIRVVectorDistributeAttentionPassPipeline(
       funcPassManager.addPass(createGenericVectorizationPass(options));
     }
     funcPassManager.addPass(std::make_unique<FoldContractExtPass>());
-    // iree-metal (attention coop-port P1): hoist the fused softmax scale out of the
-    // qk contract LHS so its operand is a plain transfer_read (coop-loadable).
-    funcPassManager.addPass(std::make_unique<HoistScaleFromContractPass>());
+    // iree-metal (attention coop-port P1): HoistScaleFromContractPass removed here —
+    // with bufferize-before-GV, the scale stays a separate buffer op instead of a
+    // vector mulf fused into the contract operand, so it no longer blocks MMA. Keeping
+    // the hoist created a mulf(coop_result, scale) that spirv-cross emits as
+    // spvCoopMat*spvCoopMat (Metal rejects: coop matrices aren't uniform-multiplicable).
     funcPassManager.addPass(createSPIRVVectorizeToCooperativeOpsPass());
     funcPassManager.addPass(createCanonicalizerPass());
     funcPassManager.addPass(createCSEPass());
