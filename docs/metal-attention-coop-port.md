@@ -38,11 +38,13 @@ iree-compile /tmp/attn_op.mlir --iree-hal-target-backends=metal-spirv --iree-met
    Built for single-matmul dispatches; attention has TWO matmuls (qk `batch_matmul_transpose_b` +
    pv) nested inside the flash `scf.for`. (Both share 16×16×16, so the single shape isn't wrong per se,
    but the tiling/distribution is not structured for two loop-nested contractions.)
-3. **SPIRV coop ops don't survive to MSL.** Even a tiny seq=16 attention produces `spirv.coopmatrix`
-   ops at the SPIRV level (seq=512 has 27 CooperativeMatrix refs), but the final MSL is **0
-   simdgroup_multiply / all scalar fma**. spirv-cross → MSL (our `spvCoopMat` simdgroup emission,
-   spirv_msl.cpp) does not lower the attention path's coop ops to `simdgroup_matrix` — a distinct
-   flavor/shape from the FFN matmul coop ops it does handle.
+3. **The SPIR-V is FULLY SCALAR — no coop compute is ever generated.** (Corrected 2026-07-23: an
+   earlier read of "spirv.coopmatrix ops present" was 1 unused *type declaration*.) The tiny seq=16
+   attention SPIR-V has **0 `CooperativeMatrixMulAdd`, 0 `CooperativeMatrixLoad`, and 3128 scalar
+   `spirv.FMul/FAdd`**. So the coop conversion never happens at the MLIR level: after
+   `SPIRVVectorizeToCooperativeOps` the flash-nested `vector.contract`s are gone but lowered to
+   **scalar** vector ops (generic vectorization), not coop — so nothing coop reaches SPIR-V, and
+   spirv-cross survival (a `spvCoopMat` question) is MOOT until MLIR-level coop conversion works.
 4. **Thread-distribution path is also broken.** `IREE_METAL_COOP_ATTN_THREAD` tiles to `scf.forall`
    with `#gpu.thread<linear_dim_0>` which "fails to legalize" — SPIRV has no scf.forall→thread
    distribution for that mapping (`createGPUDistributePass` is in the pipeline but doesn't handle it).
@@ -51,13 +53,17 @@ iree-compile /tmp/attn_op.mlir --iree-hal-target-backends=metal-spirv --iree-met
 `COOP_ATTN_M` (1/16 scalar, 32 hangs), `COOP_ATTN_DECOMP` (0 coop), `COOP_ATTN_THREAD` (scf.forall
 legalization failure), `COOP_ATTN_K2/SMEM/COOPSMEM`. All present-but-non-functional scaffolding.
 
-## Phased implementation plan
-- **P1 — SPIRV→MSL coop survival (layer 3 first; smallest, highest-leverage).** Make spirv-cross emit
-  `simdgroup_matrix` for the attention path's `spirv.coopmatrix` ops (match the FFN path). Verify a
-  tiny attention reaches `simdgroup_multiply` in MSL. Without this, nothing downstream matters.
-- **P2 — multi-root coop tiling (layer 2).** Generalize `SPIRVTileAndVectorizeToCooperativeOps` to
-  handle multiple matmul roots (qk + pv) within the flash loop, OR restructure `DecomposeAttention`
-  so each contraction is a separately coop-tileable region.
+## Phased implementation plan (re-ordered 2026-07-23: SPIR-V is fully scalar → MLIR coop conversion first)
+- **P1 — MLIR-level coop conversion (THE first blocker; layer 2).** The flash-nested qk/pv
+  `vector.contract`s go to scalar generic vectorization instead of coop. Generalize
+  `SPIRVTileAndVectorizeToCooperativeOps` (single-`rootOp`, .cpp:391-407) to convert BOTH matmuls
+  inside the flash `scf.for`, OR restructure `DecomposeAttention` so each contraction is a separately
+  coop-tileable region. Success metric on the seed repro: SPIR-V shows `CooperativeMatrixMulAdd` > 0
+  (currently 0 / 3128 scalar FMul). Everything else is downstream of this.
+- **P2 — spirv-cross → MSL coop survival (layer 3).** Only relevant AFTER P1 emits coop SPIR-V:
+  verify our `spvCoopMat` simdgroup emission (spirv_msl.cpp) lowers the attention path's
+  `CooperativeMatrixMulAdd` to `simdgroup_multiply` in MSL (it handles the FFN path; confirm the
+  attention shapes/flavor too).
 - **P3 — thread/subgroup distribution (layer 4).** Add scf.forall→thread legalization for the
   `linear_dim_0` mapping so M-block>1 runs at full occupancy without unroll explosion.
 - **P4 — causal tile-skip.** Recognize the `select(iota_i>=iota_j, scores, -inf)` mask (clean at
