@@ -333,13 +333,13 @@ public:
   }
 };
 
-/// nlearn: promote a bf16/f16-accumulator vector.contract to an f32 accumulator
+/// iree-metal: promote a bf16/f16-accumulator vector.contract to an f32 accumulator
 /// (+ truncf the result back to the original type) so it can use the
 /// f32-accumulate Apple MMA (WMMAR4_F32_16x16x16_BF16 accumulates f32, stores
 /// bf16). MLIR VectorToGPU lowers the extf/truncf to subgroup_mma_elementwise
 /// (fpExt/fpTruncSupportsMMAMatrixType == true). Paired with the canUpcastAcc
 /// config change (KernelConfig.cpp) — lets NAIVE bf16 models hit the matrix
-/// units. Gated by NLEARN_COOP_UPCAST.
+/// units. Gated by IREE_METAL_COOP_UPCAST.
 class PromoteContractAccToF32 final
     : public OpRewritePattern<vector::ContractionOp> {
 public:
@@ -347,7 +347,7 @@ public:
 
   LogicalResult matchAndRewrite(vector::ContractionOp op,
                                 PatternRewriter &rewriter) const override {
-    if (!getenv("NLEARN_COOP_UPCAST"))
+    if (!getenv("IREE_METAL_COOP_UPCAST"))
       return failure();
     auto accTy = dyn_cast<VectorType>(op.getAcc().getType());
     if (!accTy)

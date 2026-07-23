@@ -455,10 +455,10 @@ static std::string buildCeWrapper(StringRef target, StringRef exe, StringRef fn,
 //   dot_general(softmax(scale * dot_general(Q, Kᵀ) [+ causal select]), V)
 // and rewrite it to a `flash_attention_fwd` custom_call (which the loop below
 // lowers to the flash flow.dispatch) — automatic, NO shim. Opt-in via
-// NLEARN_COOP_RAISE_FLASH. Layer-1 targets causal + head_dim=64 (kernel scope);
+// IREE_METAL_COOP_RAISE_FLASH. Layer-1 targets causal + head_dim=64 (kernel scope);
 // forward-only, so it's for inference until the Layer-3 backward matcher pairs it.
 static void raiseFlashAttentionFwd(ModuleOp module) {
-  if (!std::getenv("NLEARN_COOP_RAISE_FLASH"))
+  if (!std::getenv("IREE_METAL_COOP_RAISE_FLASH"))
     return;
   SmallVector<mlir::stablehlo::DotGeneralOp> cands;
   module.walk([&](mlir::stablehlo::DotGeneralOp dg) { cands.push_back(dg); });
@@ -544,7 +544,7 @@ static void raiseFlashAttentionFwd(ModuleOp module) {
     if (dVdg)
       dO = (dVdg.getLhs() == Pv) ? dVdg.getRhs() : dVdg.getLhs();
     bool hasBwd = dKdg && dQdg && dVdg && dO;
-    if (std::getenv("NLEARN_RAISE_BWD_DEBUG"))
+    if (std::getenv("IREE_METAL_RAISE_BWD_DEBUG"))
       llvm::errs() << "[bwd-trace] hasBwd=" << hasBwd << "\n";
 
     // bwd requires dO to have a defining op (to position the bwd ops after it).
@@ -583,13 +583,13 @@ static void raiseFlashAttentionFwd(ModuleOp module) {
     // 768 tg races (NaN + silent corruption). Budget 384 sits 1.5x under the still-
     // clean 576 and 2x under the racing 768, while halving serialization depth vs
     // 192 (fewer chunks -> recovers the long-seq flash win). Grid per dispatch =
-    // chunkHeads * ceil(T/64), so the default is T-adaptive. NLEARN_COOP_FLASH_CHUNK
+    // chunkHeads * ceil(T/64), so the default is T-adaptive. IREE_METAL_COOP_FLASH_CHUNK
     // overrides (pass >=N to force a single dispatch for debugging).
     constexpr int64_t kTgBudget = 384;
     int64_t qTiles = std::max<int64_t>(1, (T + 63) / 64);
     int64_t chunkHeads =
         std::min<int64_t>(N, std::max<int64_t>(1, kTgBudget / qTiles));
-    if (const char *cs = std::getenv("NLEARN_COOP_FLASH_CHUNK"))
+    if (const char *cs = std::getenv("IREE_METAL_COOP_FLASH_CHUNK"))
       chunkHeads = std::min<int64_t>(N, std::max<int64_t>(1, atoi(cs)));
     auto chunkedFlash = [&](OpBuilder &bld, StringRef target,
                             ArrayRef<Value> operands,
@@ -687,7 +687,7 @@ struct ConvertFlashAttentionDispatch final
     MLIRContext *ctx = &getContext();
 
     // Layer-1 compiler-native flash: raise attention patterns to flash custom_calls
-    // BEFORE collecting/lowering custom_calls below (opt-in NLEARN_COOP_RAISE_FLASH).
+    // BEFORE collecting/lowering custom_calls below (opt-in IREE_METAL_COOP_RAISE_FLASH).
     raiseFlashAttentionFwd(module);
 
     SmallVector<mlir::stablehlo::CustomCallOp> calls;
@@ -718,7 +718,7 @@ struct ConvertFlashAttentionDispatch final
         std::string suffix = llvm::formatv("gemm_{0}x{1}x{2}", M, N, K).str();
         std::string fn = "__" + suffix, exe = "__exe_" + suffix;
         if (!symbolTable.lookup(fn)) {
-          const char *envPath = std::getenv("NLEARN_GEMM_KERNEL_PATH");
+          const char *envPath = std::getenv("IREE_METAL_GEMM_KERNEL_PATH");
           StringRef kernelPath =
               envPath ? StringRef(envPath) : StringRef("gemm.metal");
           std::string wrapperStr = buildGemmWrapper(exe, fn, M, N, K, kernelPath);
@@ -754,7 +754,7 @@ struct ConvertFlashAttentionDispatch final
         std::string suffix = llvm::formatv("{0}_{1}x{2}", target, M, V).str();
         std::string fn = "__" + suffix, exe = "__exe_" + suffix;
         if (!symbolTable.lookup(fn)) {
-          const char *envPath = std::getenv("NLEARN_CE_KERNEL_PATH");
+          const char *envPath = std::getenv("IREE_METAL_CE_KERNEL_PATH");
           StringRef kernelPath =
               envPath ? StringRef(envPath) : StringRef("cross_entropy.metal");
           std::string wrapperStr = buildCeWrapper(target, exe, fn, M, V, kernelPath);
@@ -794,7 +794,7 @@ struct ConvertFlashAttentionDispatch final
         // environment so it isn't baked into the compiler; findFileInPaths
         // resolves absolute paths directly (no --iree-hal-executable-object-
         // search-path needed, which the PJRT plugin's flag parser rejects).
-        const char *envPath = std::getenv("NLEARN_FLASH_KERNEL_PATH");
+        const char *envPath = std::getenv("IREE_METAL_FLASH_KERNEL_PATH");
         StringRef kernelPath = envPath ? StringRef(envPath)
                                        : StringRef("flash_attention.metal");
         std::string wrapperStr =

@@ -49,7 +49,7 @@ struct SPIRVVectorToGPUSubgroupMMAPass final
 
     IRRewriter rewriter(&getContext());
     if (failed(convertVectorToMMAOps(rewriter, funcOp))) {
-      // nlearn: convertVectorToMMAOps HARD-FAILING used to kill the WHOLE module
+      // iree-metal: convertVectorToMMAOps HARD-FAILING used to kill the WHOLE module
       // compile — but it fails for whole classes of matmuls that simply can't hit
       // the coop path in this context (unaligned/non-mult-16 shapes like vit
       // M=B*T=4616, attention batch-matmuls, some transposed backward forms). It
@@ -57,14 +57,14 @@ struct SPIRVVectorToGPUSubgroupMMAPass final
       // instead of failing, fall through: the "no subgroup_mma ops" branch below
       // scalarizes the leftover contracts (unroll -> SPIRVBreakDownLargeVector) so
       // the dispatch degrades GRACEFULLY to scalar. Dispatches that DID convert are
-      // unaffected. Opt back into the hard error with NLEARN_COOP_STRICT_MMA.
-      if (getenv("NLEARN_COOP_STRICT_MMA")) {
+      // unaffected. Opt back into the hard error with IREE_METAL_COOP_STRICT_MMA.
+      if (getenv("IREE_METAL_COOP_STRICT_MMA")) {
         funcOp->emitError("failed conversion to GPU subgroup MMA ops");
         return signalPassFailure();
       }
     }
 
-    // nlearn: convertVectorToMMAOps can leave the ORIGINAL vector.contract ops
+    // iree-metal: convertVectorToMMAOps can leave the ORIGINAL vector.contract ops
     // behind as DEAD code alongside the new gpu.subgroup_mma_compute ops (observed
     // in the fwd+bwd training graph: a K-loop ends up carrying BOTH a
     // !gpu.mma_matrix accumulator (used by the store) AND a parallel
@@ -81,7 +81,7 @@ struct SPIRVVectorToGPUSubgroupMMAPass final
       (void)applyPatternsGreedily(funcOp, std::move(cleanup));
     }
 
-    // nlearn: if the conversion produced NO subgroup mma ops (some matmul shapes,
+    // iree-metal: if the conversion produced NO subgroup mma ops (some matmul shapes,
     // esp. transposed backward forms, don't vectorize to coop), DON'T hard-fail —
     // the leftover unrolled vector.contract ops lower to scalar SPIR-V downstream
     // (addSPIRVVectorLoweringPasses). This makes the coop pipeline degrade
@@ -92,7 +92,7 @@ struct SPIRVVectorToGPUSubgroupMMAPass final
                                                 : WalkResult::advance();
     });
     if (!result.wasInterrupted()) {
-      if (getenv("NLEARN_COOP_STRICT_MMA")) {
+      if (getenv("IREE_METAL_COOP_STRICT_MMA")) {
         funcOp->emitError("no GPU subgroup mma compute ops generated");
         return signalPassFailure();
       }

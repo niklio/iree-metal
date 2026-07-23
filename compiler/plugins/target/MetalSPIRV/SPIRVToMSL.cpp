@@ -6,6 +6,8 @@
 
 #include "compiler/plugins/target/MetalSPIRV/SPIRVToMSL.h"
 
+#include <cstdlib>
+
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
@@ -105,14 +107,109 @@ public:
       spvCrossOptions.platform = SPIRVToMSLCompiler::Options::Platform::iOS;
       break;
     }
+    // iree-metal: Metal 4 cooperative-tensor (matmul2d) emission requires MSL 4.0.
+    // Env-gated so the shipped path stays on MSL 3.0 (inert by default); set
+    // IREE_METAL_MSL4 to emit MSL 4.0 for the matmul2d microkernel port. MSL 4.0 is
+    // a strict superset, so the existing coop-matrix simdgroup path is unaffected.
     spvCrossOptions.msl_version =
-        SPIRVToMSLCompiler::Options::make_msl_version(3, 0);
+        (std::getenv("IREE_METAL_MSL4") || std::getenv("IREE_METAL_MSL4_MATMUL2D"))
+            ? SPIRVToMSLCompiler::Options::make_msl_version(4, 0)
+            : SPIRVToMSLCompiler::Options::make_msl_version(3, 0);
     // Enable using Metal argument buffers. It is more akin to Vulkan descriptor
     // sets, which is how IREE HAL models resource bindings and mappings.
     spvCrossOptions.argument_buffers = true;
     return spvCrossOptions;
   }
 };
+
+// iree-metal / Metal 4 cooperative-tensor port (task#28).
+// For a plain bf16xbf16->bf16 (f32-accumulate) matmul dispatch, spirv-cross emits
+// the coop-matrix simdgroup_multiply_accumulate path (validated ~3.26 TFLOP/s on the
+// FFN GEMM). Measured in isolation, a DEVICE-DIRECT Metal 4 matmul2d over the same
+// 64x64 workgroup tile reaches ~3.58 (+10%, 95% of jax-metal) and the batched attention
+// bmm reaches +50% — the structure-preserving swap loses (per-subgroup matmul2d on 16x16
+// = 1.35-2.33 < 3.26), so we substitute the WHOLE kernel body with a device-direct
+// matmul2d microkernel. IREE's dispatch already uses a [64,64] workgroup tile with a
+// 128-thread (4-simdgroup) workgroup and grid=(ceil(N/64),ceil(M/64)) — which matches
+// matmul2d<execution_simdgroups<4>> over a 64x64 tile exactly, so we keep IREE's dispatch
+// and only replace the emitted MSL. Gated on IREE_METAL_MSL4_MATMUL2D (inert by default).
+//
+// Returns the substitute MSL, or std::nullopt to fall back to the spirv-cross output.
+static std::optional<std::string>
+tryEmitMatmul2dMSL(StringRef reviseName, StringRef origName, size_t numBuffers,
+                   bool hasPushConstant) {
+  if (!std::getenv("IREE_METAL_MSL4_MATMUL2D"))
+    return std::nullopt;
+  // Conservative first target: a pure static-shaped matmul dispatch with exactly
+  // A,B,C buffers and no push constants (no dynamic dims / fused operands yet).
+  if (numBuffers != 3 || hasPushConstant)
+    return std::nullopt;
+  // Parse "..._matmul_<M>x<N>x<K>_bf16xbf16xf32" out of the original entry name.
+  size_t mk = origName.find("_matmul_");
+  if (mk == StringRef::npos)
+    return std::nullopt;
+  StringRef rest = origName.substr(mk + 8);
+  if (!rest.contains("bf16xbf16xf32"))
+    return std::nullopt;
+  auto [dimsStr, tail] = rest.split('_');
+  SmallVector<StringRef, 3> dims;
+  dimsStr.split(dims, 'x');
+  if (dims.size() != 3)
+    return std::nullopt;
+  long long M = 0, N = 0, K = 0;
+  if (dims[0].getAsInteger(10, M) || dims[1].getAsInteger(10, N) ||
+      dims[2].getAsInteger(10, K))
+    return std::nullopt;
+  // matmul2d works on a 64x64 workgroup tile; require the problem to be tiled by 64
+  // so the grid IREE dispatches matches (no ragged edge handling in this first brick).
+  if (M % 64 || N % 64 || K % 8)
+    return std::nullopt;
+
+  if (std::getenv("IREE_METAL_MSL4_MATMUL2D_LOG"))
+    llvm::errs() << "[matmul2d] SUBSTITUTED " << origName << " (M=" << M
+                 << " N=" << N << " K=" << K << ")\n";
+
+  std::string s;
+  llvm::raw_string_ostream os(s);
+  os << "#include <metal_stdlib>\n"
+        "#include <metal_tensor>\n"
+        "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n"
+        "using namespace metal;\n"
+        "using namespace mpp::tensor_ops;\n"
+        "struct spvDescriptorSetBuffer0 {\n"
+        "  device bfloat* A [[id(0)]];\n"
+        "  device bfloat* B [[id(1)]];\n"
+        "  device bfloat* C [[id(2)]];\n"
+        "};\n"
+        "kernel void "
+     << reviseName
+     << "(constant spvDescriptorSetBuffer0& s [[buffer(0)]], "
+        "uint3 wg [[threadgroup_position_in_grid]], "
+        "uint3 lid [[thread_position_in_threadgroup]]) {\n"
+        "  tensor<device bfloat, dextents<int32_t,2>, tensor_inline> A(s.A, "
+        "dextents<int32_t,2>("
+     << K << ", " << M
+     << "));\n"
+        "  tensor<device bfloat, dextents<int32_t,2>, tensor_inline> B(s.B, "
+        "dextents<int32_t,2>("
+     << N << ", " << K
+     << "));\n"
+        "  tensor<device bfloat, dextents<int32_t,2>, tensor_inline> C(s.C, "
+        "dextents<int32_t,2>("
+     << N << ", " << M
+     << "));\n"
+        "  constexpr auto d = matmul2d_descriptor(64, 64, "
+        "static_cast<int>(dynamic_extent), false, false, false);\n"
+        "  matmul2d<d, execution_simdgroups<4>> op;\n"
+        "  auto mA = A.slice(0, wg.y*64);\n"
+        "  auto mB = B.slice(wg.x*64, 0);\n"
+        "  auto mC = C.slice(wg.x*64, wg.y*64);\n"
+        // The HW intrinsic (WMMAR4_F32_16x16x16_BF16) accumulates in f32 and
+        // converts to bf16 on store, matching IREE's f32-accumulate semantics.
+        "  op.run(mA, mB, mC);\n"
+        "}\n";
+  return os.str();
+}
 } // namespace
 
 std::optional<std::pair<MetalShader, std::string>>
@@ -166,6 +263,15 @@ crossCompileSPIRVToMSL(IREE::HAL::MetalTargetPlatform targetPlatform,
   // revised to avoid collision.
   const auto &spirvEntryPoint = spvCrossCompiler.get_entry_point(
       entryPoint.str(), spv::ExecutionModel::ExecutionModelGLCompute);
+
+  // iree-metal (task#28): optionally substitute a device-direct Metal 4 matmul2d
+  // microkernel for a plain matmul dispatch. Falls back to the spirv-cross MSL
+  // above when the gate is off or the dispatch is not a supported matmul shape.
+  if (auto m2d = tryEmitMatmul2dMSL(spirvEntryPoint.name, spirvEntryPoint.orig_name,
+                                    descriptors.size(), hasPushConstant)) {
+    mslSource = std::move(*m2d);
+  }
+
   LLVM_DEBUG({
     llvm::dbgs() << "Original entry point name: '" << spirvEntryPoint.orig_name
                  << "'\n";

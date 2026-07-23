@@ -1,4 +1,5 @@
 // Copyright 2022 The IREE Authors
+#include <cstdlib>
 //
 // Licensed under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -82,7 +83,7 @@ tileToInvocation(mlir::FunctionOpInterface funcOp,
 
 static const char promoteBothMarker[] = "promote_lhs_and_rhs";
 
-// nlearn: targeted A/B threadgroup-staging for the coop path. Compute the bytes a matmul's A+B tiles
+// iree-metal: targeted A/B threadgroup-staging for the coop path. Compute the bytes a matmul's A+B tiles
 // would occupy in threadgroup memory (operands are already workgroup+reduction tiled at this point).
 // Small tiles (all real matmul shapes incl. large-K backward weight-grads) get staged -> K-loop reuse
 // -> ~2x on large-K; big/fused tiles that would over-allocate past Metal's 32KB cap stay device-loaded
@@ -100,7 +101,17 @@ static int64_t coopPromoteABBytes(linalg::LinalgOp op) {
 }
 // A+B staging budget (bytes). Metal threadgroup cap is 32KB; leave headroom for the f32 C accumulator
 // staging (promoteCMatrix) + margin. Known-good staged FFN A/B ~5KB; the wedging fused shapes were ~50KB.
-static constexpr int64_t kCoopStageABByteCap = 20480;
+// iree-metal (task#26, 2026-07-23): env-tunable A/B stage cap. Raising it lets BIGGER A/B tiles stay
+// STAGED in threadgroup memory (more MAC:Load reuse) instead of device-loaded — probing the FFN's
+// 1:1-reuse residual (3.26 vs jax-metal 3.78). Metal cap is 32768; leave headroom for C+epilogue.
+static int64_t coopStageABByteCap() {
+  static const int64_t cap = []() -> int64_t {
+    if (const char *e = ::getenv("IREE_METAL_COOP_STAGE_CAP"))
+      return (int64_t)atoi(e);
+    return 20480;
+  }();
+  return cap;
+}
 
 static void populatePromotionPatterns(RewritePatternSet &patterns,
                                       StringAttr replaceMarker) {
@@ -214,8 +225,8 @@ void SPIRVTileAndPromotePass::runOnOperation() {
   }
 
   // Only promote to workgroup size if there are multiple warps.
-  // nlearn: for the cooperative-matrix path (skipOperandPromotion), A/B staging is TARGETED — stage a
-  // matmul's A/B in threadgroup memory only when the tiles fit under kCoopStageABByteCap (restores the
+  // iree-metal: for the cooperative-matrix path (skipOperandPromotion), A/B staging is TARGETED — stage a
+  // matmul's A/B in threadgroup memory only when the tiles fit under coopStageABByteCap() (restores the
   // K-loop reuse that device-only simdgroup_load loses -> ~2x on large-K backward weight-grads), and
   // device-load the big/fused shapes that would over-allocate past Metal's 32KB cap (the HAL-wedge fix).
   if (totalThreads > *subgroupSize) {
@@ -224,14 +235,14 @@ void SPIRVTileAndPromotePass::runOnOperation() {
       if (isMatmulOrBatchMatmul(op)) {
         if (skipOperandPromotion) {
           int64_t abBytes = coopPromoteABBytes(op);
-          if (getenv("NLEARN_STAGE_DEBUG")) {
+          if (getenv("IREE_METAL_STAGE_DEBUG")) {
             auto aTy = dyn_cast<ShapedType>(op.getDpsInputOperand(0)->get().getType());
             auto bTy = dyn_cast<ShapedType>(op.getDpsInputOperand(1)->get().getType());
-            llvm::errs() << "[stage] abBytes=" << abBytes << " cap=" << kCoopStageABByteCap
-                         << " -> " << (abBytes < 0 || abBytes > kCoopStageABByteCap ? "DEVICE" : "STAGE")
+            llvm::errs() << "[stage] abBytes=" << abBytes << " cap=" << coopStageABByteCap()
+                         << " -> " << (abBytes < 0 || abBytes > coopStageABByteCap() ? "DEVICE" : "STAGE")
                          << "  A=" << (aTy ? aTy : Type()) << " B=" << (bTy ? bTy : Type()) << "\n";
           }
-          if (abBytes < 0 || abBytes > kCoopStageABByteCap)
+          if (abBytes < 0 || abBytes > coopStageABByteCap())
             return; // too big / dynamic -> device-load (no wedge)
         }
         auto promoteMarker = StringAttr::get(context, promoteBothMarker);
@@ -316,7 +327,7 @@ LogicalResult SPIRVTileAndPromotePass::doPromoteCMatrix(
     return success();
   }
 
-  // nlearn (cont85): the single-matmul detection below (finds ONE matmulOutBuf,
+  // iree-metal (cont85): the single-matmul detection below (finds ONE matmulOutBuf,
   // errors on >2 linalg ops, bf16-only) cannot reason about the coop attention
   // flash (TWO matmuls qk+pv + the softmax C-region, f16). Both qk and pv store an
   // f32 accumulator into f16 buffers -> invalid f16-accumulator coop store unless C
@@ -324,7 +335,7 @@ LogicalResult SPIRVTileAndPromotePass::doPromoteCMatrix(
   // promotion pattern on ALL contractions (it promotes each matmul's f32 C to a
   // shared-memory buffer + a separate copy-out, which is exactly what both attention
   // matmuls need). Gated to the coop-flash pipeline so normal codegen is unchanged.
-  if (getenv("NLEARN_COOP_ATTN_COOPSMEM")) {
+  if (getenv("IREE_METAL_COOP_ATTN_COOPSMEM")) {
     RewritePatternSet patterns(context);
     populateContractPromotionPatterns(patterns, {2});
     if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
@@ -355,7 +366,7 @@ LogicalResult SPIRVTileAndPromotePass::doPromoteCMatrix(
       continue; // Don't care
     }
     if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
-      // nlearn: skip the f32->bf16 input-trunc PROLOGUE producers from the NLEARN_COOP_BF16CAST
+      // iree-metal: skip the f32->bf16 input-trunc PROLOGUE producers from the IREE_METAL_COOP_BF16CAST
       // downcast (elementwise, single input, f32->bf16). On memref semantics they feed the matmul via
       // memory (not SSA), so identify them by signature. They fuse into the matmul tiles; doPromoteCMatrix
       // only reasons about the contraction + its epilogue.
@@ -374,7 +385,7 @@ LogicalResult SPIRVTileAndPromotePass::doPromoteCMatrix(
         // store. Large-N matmuls (FFN/projections, N>=512) forward-fuse their
         // truncf and don't need promotion; force-promoting them just adds staging
         // (measured: ~10% training regression). Threshold 256 splits GQA KV heads
-        // from real projections. Opt out with NLEARN_COOP_NO_PROMOTE_DOWNCAST.
+        // from real projections. Opt out with IREE_METAL_COOP_NO_PROMOTE_DOWNCAST.
         int64_t outN = 0;
         if (auto mt = dyn_cast<MemRefType>(linalgOp.getDpsInitOperand(0)
                                                ->get()
@@ -414,7 +425,7 @@ LogicalResult SPIRVTileAndPromotePass::doPromoteCMatrix(
     return success();
   }
 
-  // nlearn: a NARROWING store-downcast (f32->bf16 truncf) fused into the coop
+  // iree-metal: a NARROWING store-downcast (f32->bf16 truncf) fused into the coop
   // matmul MUST force C-promotion. Apple's coop store is f32-accumulate only and
   // Metal's simdgroup_store requires matching matrix/pointer element types with NO
   // element-conversion primitive — so an un-promoted (coop-fused) narrowing store
@@ -422,9 +433,9 @@ LogicalResult SPIRVTileAndPromotePass::doPromoteCMatrix(
   // data into the bf16 buffer => GARBAGE (root cause of the GQA k-proj N=128 NaN;
   // proven un-fixable at the spirv_cross/Metal level). Promoting C stages the f32
   // accumulator to shared memory + does the truncf as a separate copy-out (the
-  // path the working q-proj already takes). Opt out with NLEARN_COOP_NO_PROMOTE_DOWNCAST.
+  // path the working q-proj already takes). Opt out with IREE_METAL_COOP_NO_PROMOTE_DOWNCAST.
   bool isNarrowingCast = false;
-  if (!getenv("NLEARN_COOP_NO_PROMOTE_DOWNCAST") &&
+  if (!getenv("IREE_METAL_COOP_NO_PROMOTE_DOWNCAST") &&
       genericOp.getNumDpsInputs() == 1 && genericOp.getNumDpsInits() == 1) {
     auto inTy = dyn_cast<ShapedType>(genericOp.getDpsInputs()[0].getType());
     auto outTy =

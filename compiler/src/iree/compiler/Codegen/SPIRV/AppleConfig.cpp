@@ -21,7 +21,7 @@
 
 namespace mlir::iree_compiler::detail {
 
-// nlearn: emit an in-dispatch f32->bf16 truncate of `src` (a ranked f32 tensor) as a linalg.generic.
+// iree-metal: emit an in-dispatch f32->bf16 truncate of `src` (a ranked f32 tensor) as a linalg.generic.
 // Since config assignment runs AFTER dispatch-region formation, this op lands INSIDE the matmul's
 // dispatch and the SPIRV tiler fuses the elementwise producer into the matmul's tiled loops -> the
 // downcast happens IN-REGISTER (no separate cast dispatch). Lets an f32-input matmul use the bf16
@@ -44,11 +44,11 @@ static Value truncTensorToBF16(OpBuilder &b, Location loc, Value src) {
 
 static LogicalResult setAppleMatmulConfig(linalg::LinalgOp op,
                                           IREE::GPU::TargetAttr target) {
-  // nlearn EXPERIMENT (NLEARN_COOP_BF16CAST): if the matmul has f32 inputs, truncate them to bf16
+  // iree-metal EXPERIMENT (IREE_METAL_COOP_BF16CAST): if the matmul has f32 inputs, truncate them to bf16
   // in-dispatch and REBUILD it as a bf16 matmul so it uses the bf16 matrix units (faster than f32 coop)
   // with no separate cast dispatch. Must build a NEW named op (its region block args are typed to the
   // operands) — can't just setOperand on the f32 matmul.
-  if (getenv("NLEARN_COOP_BF16CAST")) {
+  if (getenv("IREE_METAL_COOP_BF16CAST")) {
     // IREE generalizes named matmuls to linalg.generic before config, so handle the generic
     // contraction: rebuild with bf16 inputs + a mixed-precision body (extf bf16->f32, mulf, addf)
     // keeping the f32 accumulator. The in-dispatch truncs fuse into the matmul tiles (in-register).
@@ -79,23 +79,23 @@ static LogicalResult setAppleMatmulConfig(linalg::LinalgOp op,
       op = cast<linalg::LinalgOp>(newGen.getOperation());
     }
   }
-  // nlearn: first try Apple's matrix units via the cooperative-matrix pipeline (SPIR-V coop-matrix →
+  // iree-metal: first try Apple's matrix units via the cooperative-matrix pipeline (SPIR-V coop-matrix →
   // MSL simdgroup_matrix). Falls back to the scalar/vector config below if no MMA schedule fits.
   // The (4,4) copied from NVIDIA is not tuned for Apple's 32-wide simdgroups / 8x8 simdgroup_matrix;
-  // sweep the schedule via env (NLEARN_COOP_{SG,MNT,PD,SS}) to find Apple-optimal tiling.
+  // sweep the schedule via env (IREE_METAL_COOP_{SG,MNT,PD,SS}) to find Apple-optimal tiling.
   auto envU = [](const char *n, unsigned d) -> unsigned {
     if (const char *v = getenv(n)) return (unsigned)atoi(v);
     return d;
   };
-  // nlearn (cont313): Apple's 32-wide simdgroups favor MORE subgroups + SMALLER MN
+  // iree-metal (cont313): Apple's 32-wide simdgroups favor MORE subgroups + SMALLER MN
   // tiles + software-pipelining for LARGE 2D (non-batch) matmuls (FFN/proj). Sweep-
   // validated bit-identical (config-only) and up to +39% (M=8192 wide-N), +9% wide-N,
   // +2-3% deep-K vs the NVIDIA-copied (4,4,PD0) default. RESTRICT to rank-2 outputs
   // with large M: batch matmuls (attention, output rank>=3) REGRESS with (8,2) — vit
   // 0.89->0.64 — and small M shows no gain. So (8,2,PD1) only for rank-2 M>=2048,
-  // N>=512; everything else keeps (4,4,PD0). Opt out: NLEARN_COOP_NO_APPLE_TUNE.
+  // N>=512; everything else keeps (4,4,PD0). Opt out: IREE_METAL_COOP_NO_APPLE_TUNE.
   unsigned sgD = 4, mntD = 4, pdD = 0, ktD = 2;
-  // DEFAULT-ON (opt-out NLEARN_COOP_NO_APPLE_TUNE): Apple's 32-wide simdgroups favor
+  // DEFAULT-ON (opt-out IREE_METAL_COOP_NO_APPLE_TUNE): Apple's 32-wide simdgroups favor
   // MORE subgroups + SMALLER MN tiles + software-pipelining than the NVIDIA-copied
   // (4,4,PD0) default. Sweep-validated bit-identical (config-only) and up to +39%
   // (M=8192 wide-N), +54% ([4736x768x768]), +9% wide-N. RESTRICT to rank-2 large 2D
@@ -103,7 +103,7 @@ static LogicalResult setAppleMatmulConfig(linalg::LinalgOp op,
   // 8 subgroups a mult-16-but-not-32 dim (e.g. ViT M=B*577 padded to 4624=16*289, or
   // its backward K=4624) makes a partial tile that REGRESSES hard (-31..-78%). All-
   // mult-32 shapes (gpt2/bert M=B*512, FFN N=3072, K=768) get the win; ViT is excluded.
-  if (!getenv("NLEARN_COOP_NO_APPLE_TUNE")) {
+  if (!getenv("IREE_METAL_COOP_NO_APPLE_TUNE")) {
     auto outTy = dyn_cast<ShapedType>(op.getDpsInitOperand(0)->get().getType());
     bool ok = outTy && outTy.getRank() == 2 && outTy.getDimSize(0) >= 2048 &&
               outTy.getDimSize(1) >= 512 && outTy.getDimSize(0) % 32 == 0 &&
@@ -117,7 +117,7 @@ static LogicalResult setAppleMatmulConfig(linalg::LinalgOp op,
         if (!ok) break;
       }
     }
-    // nlearn (2026-07-23): MNT=4 (was 2) — direct isolated matmul measurement showed the fork's
+    // iree-metal (2026-07-23): MNT=4 (was 2) — direct isolated matmul measurement showed the fork's
     // coop FFN matmul was only 80% of jax-metal (3.02 vs 3.78 TFLOP/s); an (SG=8,MNT=4,KT=4)
     // sweep recovered it to 3.27 and gave +2.0-2.8% end-to-end on all 9 mult-32 models (correct).
     // vit is excluded by the mult-32 gate (its 768x3072x4624 matmul is mult-16-not-32) so it keeps
@@ -129,11 +129,11 @@ static LogicalResult setAppleMatmulConfig(linalg::LinalgOp op,
     if (ok) { sgD = 8; mntD = 4; pdD = 1; ktD = 4; }
   }
   if (succeeded(setCooperativeMatrixConfig(target, op,
-                                           /*numSubgroupsPerWorkgroup=*/envU("NLEARN_COOP_SG", sgD),
-                                           /*numMNTilesPerSubgroup=*/envU("NLEARN_COOP_MNT", mntD),
-                                           /*softwarePipelineDepth=*/envU("NLEARN_COOP_PD", pdD),
-                                           /*softwarePipelineStoreStage=*/envU("NLEARN_COOP_SS", 0),
-                                           /*numKTiles=*/envU("NLEARN_COOP_KT", ktD)))) {
+                                           /*numSubgroupsPerWorkgroup=*/envU("IREE_METAL_COOP_SG", sgD),
+                                           /*numMNTilesPerSubgroup=*/envU("IREE_METAL_COOP_MNT", mntD),
+                                           /*softwarePipelineDepth=*/envU("IREE_METAL_COOP_PD", pdD),
+                                           /*softwarePipelineStoreStage=*/envU("IREE_METAL_COOP_SS", 0),
+                                           /*numKTiles=*/envU("IREE_METAL_COOP_KT", ktD)))) {
     return success();
   }
   const std::array<int64_t, 2> workgroupXY = {256, 1};

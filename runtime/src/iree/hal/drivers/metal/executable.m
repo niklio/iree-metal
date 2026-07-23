@@ -115,7 +115,13 @@ static iree_status_t iree_hal_metal_executable_flatbuffer_verify(
       // platform may not support the version even if the enum is valid and we won't know until we
       // try compiling it.
       uint32_t version = iree_hal_metal_MSLSourceDef_version_get(source_def);
-      if (version > MTLLanguageVersion3_0) {
+      // iree-metal (task#28): allow up to MSL 4.0 so Metal 4 cooperative-tensor (matmul2d)
+      // kernels compile at runtime. macOS 26 / M4 supports 4.0; the actual per-platform
+      // support is still verified when Metal compiles the source below.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunguarded-availability-new"
+      if (version > MTLLanguageVersion4_0) {
+#pragma clang diagnostic pop
         return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
                                 "libraries[%" PRIhsz
                                 "] MSL language version %u is unsupported by the compiled runtime",
@@ -195,10 +201,10 @@ static iree_status_t iree_hal_metal_compile_source(id<MTLDevice> device,
   id<MTLLibrary> library = nil;
   @autoreleasepool {
     MTLCompileOptions* compile_options = [[MTLCompileOptions new] autorelease];
-    // nlearn §13: floor at MSL 3.1 — the `bfloat`/`bfloat4` types used by nlearn's bf16
+    // iree-metal §13: floor at MSL 3.1 — the `bfloat`/`bfloat4` types used by iree-metal's bf16
     // GEMM/flash/CE kernels (and IREE bf16 codegen) are unknown in MSL 3.0. Use a higher
     // version if the compiler embedded one.
-    // nlearn: MTLLanguageVersion3_1 is macOS-14+; the build min-target is 13.0 so -Werror
+    // iree-metal: MTLLanguageVersion3_1 is macOS-14+; the build min-target is 13.0 so -Werror
     // flags -Wunguarded-availability-new. This box is macOS 26, so the 3.1 path always runs;
     // suppress the (compile-time-only) availability warning so iree-run-module builds.
 #pragma clang diagnostic push

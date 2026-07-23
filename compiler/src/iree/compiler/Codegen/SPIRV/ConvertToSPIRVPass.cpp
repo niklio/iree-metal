@@ -684,7 +684,7 @@ void ConvertToSPIRVPass::runOnOperation() {
 
   SPIRVTypeConverter typeConverter(targetAttr, options);
 
-  // nlearn: the SPIRVTypeConverter converts scalar `index` (via the index
+  // iree-metal: the SPIRVTypeConverter converts scalar `index` (via the index
   // bitwidth) but does NOT substitute `index` when it appears as a MEMREF
   // ELEMENT type, so an `index`-element workgroup allocation
   // (memref<Nxindex, #spirv.storage_class<Workgroup>>) fails to legalize

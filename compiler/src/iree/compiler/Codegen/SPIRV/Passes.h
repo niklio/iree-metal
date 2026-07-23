@@ -53,7 +53,7 @@ void addSPIRVSubgroupReducePassPipeline(OpPassManager &funcPassManager);
 ///
 void addSPIRVWinogradVectorizePassPipeline(OpPassManager &funcPassManager);
 
-/// nlearn: flash-attention pipeline. Decomposes iree_linalg_ext.attention (online
+/// iree-metal: flash-attention pipeline. Decomposes iree_linalg_ext.attention (online
 /// form) within codegen and tiles/vectorizes the per-tile qk/pv matmuls onto the
 /// coop matrix units, keeping the [T,T] scores un-materialized.
 void addSPIRVVectorDistributeAttentionPassPipeline(OpPassManager &funcPassManager);

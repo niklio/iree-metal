@@ -1707,7 +1707,7 @@ struct CustomCallIsTopK final
   }
 };
 
-// nlearn: handle the `@mhlo.topk` custom_call form of top-k. Unlike the `@TopK`
+// iree-metal: handle the `@mhlo.topk` custom_call form of top-k. Unlike the `@TopK`
 // form above (which carries a comparison sub-computation), mhlo.topk carries `k`
 // in an `mhlo.attributes` dict and is always DESCENDING top-k (largest values).
 // jax 0.6.1 lowers jax.lax.top_k to this form, which IREE otherwise fails to
@@ -1942,7 +1942,7 @@ struct ApproxTopK final : OpRewritePattern<mlir::stablehlo::CustomCallOp> {
   }
 };
 
-// nlearn: strip the optional `algorithm` (#stablehlo.dot_algorithm) attribute
+// iree-metal: strip the optional `algorithm` (#stablehlo.dot_algorithm) attribute
 // from stablehlo.dot_general. jax.nn.dot_product_attention (and any precision-
 // annotated matmul, e.g. jax.lax.dot with a DotAlgorithmPreset) emits
 // dot_general carrying a #stablehlo.dot_algorithm attr (typically
@@ -2016,7 +2016,7 @@ struct StableHLOToStableHLOPreprocessing final
                     ScatterImplicitBatch, ScatterMaterializeInsertedDim,
                     ScatterCollapseBatch, ScatterBatchFirst>(context);
 
-    // nlearn: strip #stablehlo.dot_algorithm before any dot_general lowering so
+    // iree-metal: strip #stablehlo.dot_algorithm before any dot_general lowering so
     // jax.nn.dot_product_attention / precision-annotated matmuls don't fail
     // legalization. High benefit so it fires ahead of the dot rewrites.
     patterns.insert<DropDotAlgorithm>(context, /*benefit=*/500);
@@ -2040,7 +2040,7 @@ struct StableHLOToStableHLOPreprocessing final
 
     // Identify known custom calls and convert them to equivalent StableHLO.
     patterns.insert<CustomCallIsTopK>(context);
-    // nlearn: also handle jax/mhlo's @mhlo.topk custom_call form (jax.lax.top_k).
+    // iree-metal: also handle jax/mhlo's @mhlo.topk custom_call form (jax.lax.top_k).
     patterns.insert<MhloTopKCustomCall>(context);
 
     // Identify an iota->sort->slice pattern that maps to TopK.

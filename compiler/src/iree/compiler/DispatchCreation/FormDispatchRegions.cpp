@@ -4,7 +4,7 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include <cstdlib> // nlearn: getenv for aggressive-fusion bypass bisect guards
+#include <cstdlib> // iree-metal: getenv for aggressive-fusion bypass bisect guards
 
 #include "iree/compiler/Dialect/Flow/Transforms/FormDispatchRegions.h"
 #include "iree/compiler/Dialect/Encoding/IR/EncodingOps.h"
@@ -395,7 +395,7 @@ static bool isUnpackLikeOp(Operation *op) {
 static SmallVector<OpOperand *>
 getFusableUses(MLIRContext *context, Operation *op,
                DominanceInfo const &dominanceInfo, bool aggressiveFusion) {
-  // nlearn (SHIPPED 2026-07-17): multi-use fusion under aggressive fusion double-counts gradients
+  // iree-metal (SHIPPED 2026-07-17): multi-use fusion under aggressive fusion double-counts gradients
   // when a fan-out (multi-use) producer is cloned into a REDUCTION consumer — the residual
   // (x = x + sublayer(x)) makes a LayerNorm/bias-backward reduction multi-use, and aggressive
   // fusion recomputes the producer inside the reduction's tiling with a wrong range -> +16% (bert
@@ -403,10 +403,10 @@ getFusableUses(MLIRContext *context, Operation *op,
   // (blanket). Validated bit-exact grads vs non-aggressive on gpt2-small/bert/distilbert/roberta/vit
   // and +1.5-2.6% fwd+bwd. A consumer-side narrow (restrict only reduction consumers) was tried and
   // REJECTED: it's correct but the partial-fusion graph makes metal-spirv compile blow up (>7min/
-  // model). Escape hatch NLEARN_ALLOW_MULTIUSE_RED = original (faster but training-INCORRECT) multi-
+  // model). Escape hatch IREE_METAL_ALLOW_MULTIUSE_RED = original (faster but training-INCORRECT) multi-
   // use fusion, for A/B only. Fully closing the fusion gap needs correct fused reduction+matmul
   // codegen (deep, in progress) — then this restriction can lift.
-  bool restrictSingleUse = !aggressiveFusion || !getenv("NLEARN_ALLOW_MULTIUSE_RED");
+  bool restrictSingleUse = !aggressiveFusion || !getenv("IREE_METAL_ALLOW_MULTIUSE_RED");
   if (restrictSingleUse &&
       llvm::count_if(op->getUses(), [](OpOperand &use) {
         return !isa<tensor::DimOp>(use.getOwner());
@@ -490,7 +490,7 @@ isFusableWithConsumer(OpOperand &fusedOperand, const FusionTracker &tracker,
   Operation *producer = fusedOperand.get().getDefiningOp();
   Operation *consumer = fusedOperand.getOwner();
 
-  // (nlearn 2026-07-21: a transpose-split guard here was a DEAD-END — the transpose co-locates with the
+  // (iree-metal 2026-07-21: a transpose-split guard here was a DEAD-END — the transpose co-locates with the
   // reduction via a non-consumer-fusion path; reverted. See CAMPAIGN.md ledger.)
 
   // If consumer is a dequant operation, dont fuse it. These get cloned
@@ -587,9 +587,9 @@ isFusableWithConsumer(OpOperand &fusedOperand, const FusionTracker &tracker,
   // Check if the iteration spaces of the producer and consumer are same.
   // TODO(#12664): This is unnecessary requirement, but we need a better config
   // to tile the consumer with a larger iteration space.
-  // nlearn bisect: NLEARN_ITERSPACE_GUARD restores the producer<consumer iteration-space
+  // iree-metal bisect: IREE_METAL_ITERSPACE_GUARD restores the producer<consumer iteration-space
   // block under aggressive fusion (isolates a small reduction fused into a larger consumer).
-  if (!options.aggressiveFusion || getenv("NLEARN_ITERSPACE_GUARD")) {
+  if (!options.aggressiveFusion || getenv("IREE_METAL_ITERSPACE_GUARD")) {
     // FIXME: Implement getStaticLoopRanges for LinalgExt::CustomOp.
     if (isa<IREE::LinalgExt::CustomOp>(producer)) {
       return false;
@@ -626,9 +626,9 @@ isFusableWithConsumer(OpOperand &fusedOperand, const FusionTracker &tracker,
 
   // Under aggressive fusion assume that the dispatches are vectorized. In which
   // case we dont need to account for the subsequent stack allocation condition.
-  // nlearn bisect: NLEARN_STACKALLOC_GUARD makes aggressive fusion still run the
+  // iree-metal bisect: IREE_METAL_STACKALLOC_GUARD makes aggressive fusion still run the
   // stack-allocation bufferization check below (isolates that bypass).
-  if (options.aggressiveFusion && !getenv("NLEARN_STACKALLOC_GUARD")) {
+  if (options.aggressiveFusion && !getenv("IREE_METAL_STACKALLOC_GUARD")) {
     return true;
   }
 
@@ -757,9 +757,9 @@ static bool isFusableWithProducer(OpOperand &operand,
     return false;
   }
 
-  // nlearn bisect: NLEARN_NONINIT_GUARD restores the "only fuse into DPS-init operand"
+  // iree-metal bisect: IREE_METAL_NONINIT_GUARD restores the "only fuse into DPS-init operand"
   // restriction under aggressive fusion (isolates fusing a producer into a non-init input).
-  if (!options.aggressiveFusion || getenv("NLEARN_NONINIT_GUARD")) {
+  if (!options.aggressiveFusion || getenv("IREE_METAL_NONINIT_GUARD")) {
     auto consumerFusionOp = dyn_cast<DestinationStyleOpInterface>(consumer);
     if (consumerFusionOp && !consumerFusionOp.isDpsInit(&operand)) {
       return false;

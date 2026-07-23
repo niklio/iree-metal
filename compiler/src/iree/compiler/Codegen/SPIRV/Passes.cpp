@@ -62,7 +62,7 @@ namespace mlir::iree_compiler {
 static llvm::cl::opt<int> clSPIRVIndexingBits(
     "iree-spirv-index-bits",
     llvm::cl::desc("Set the bit width of indices in SPIR-V."),
-    // nlearn: 64-bit indices needed for deep UNROLLED models (buffer offsets exceed 2^32, e.g. 4.5B at
+    // iree-metal: 64-bit indices needed for deep UNROLLED models (buffer offsets exceed 2^32, e.g. 4.5B at
     // 12L unrolled). Combined with --iree-dispatch-creation-fuse-multi-use=false (which fixes the grad-graph
     // miscompile), this unlocks full unrolling -> ~65% MFU (vs scan ~45%). 64-bit alone NaN'd only because
     // the fuse-multi-use miscompile was still present.
@@ -366,7 +366,7 @@ void addSPIRVBaseVectorizePassPipeline(OpPassManager &funcPassManager) {
   funcPassManager.addPass(createOptimizeVectorTransferPass());
 }
 
-// nlearn: flash-attention. Mirrors the Winograd pipeline (decompose a linalg_ext
+// iree-metal: flash-attention. Mirrors the Winograd pipeline (decompose a linalg_ext
 // aggregate op mid-pipeline, then generically vectorize) but for
 // iree_linalg_ext.attention: convert to the online form, tile the reduction
 // (K/scores) dim to serial loops so the softmax runs per-tile (scores stay
@@ -374,7 +374,7 @@ void addSPIRVBaseVectorizePassPipeline(OpPassManager &funcPassManager) {
 // First increment: attention COMPILES on metal-spirv via this path (matmuls
 // generic-vectorized); routing the per-tile matmuls onto coop is a follow-up.
 namespace {
-// nlearn: de-alias online-softmax SCRATCH writes to flash-loop iter_args so the
+// iree-metal: de-alias online-softmax SCRATCH writes to flash-loop iter_args so the
 // tensor-level flash loop can one-shot-bufferize. Upstream one-shot-bufferize
 // FAILS ("yield not equivalent to iter bbArg") when a loop's yielded value isn't
 // buffer-equivalent to its iter_arg — the decomposed online-softmax reuses the
@@ -388,7 +388,7 @@ namespace {
 struct DeAliasFlashScratchPass
     : PassWrapper<DeAliasFlashScratchPass, OperationPass<>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(DeAliasFlashScratchPass)
-  StringRef getArgument() const final { return "nlearn-dealias-flash-scratch"; }
+  StringRef getArgument() const final { return "iree-metal-dealias-flash-scratch"; }
   void runOnOperation() override {
     getOperation()->walk([](scf::ForOp forOp) {
       auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
@@ -450,7 +450,7 @@ struct DeAliasFlashScratchPass
 } // namespace
 
 namespace {
-// nlearn: attach a THREAD lowering_config to the decomposed online-softmax
+// iree-metal: attach a THREAD lowering_config to the decomposed online-softmax
 // generics (the non-matmul linalg ops — the qk/pv matmuls carry a coop
 // decomposition_config already) so GPUApplyTilingLevel(Thread) distributes the
 // M query-rows across the subgroup's threads. Viable in the shared-memory-staged
@@ -461,9 +461,9 @@ struct ConfigSoftmaxThreadsPass
     : PassWrapper<ConfigSoftmaxThreadsPass, OperationPass<>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ConfigSoftmaxThreadsPass)
   int64_t mBlock = 1;
-  StringRef getArgument() const final { return "nlearn-config-softmax-threads"; }
+  StringRef getArgument() const final { return "iree-metal-config-softmax-threads"; }
   void runOnOperation() override {
-    int64_t m = getenv("NLEARN_COOP_ATTN_M") ? atoi(getenv("NLEARN_COOP_ATTN_M"))
+    int64_t m = getenv("IREE_METAL_COOP_ATTN_M") ? atoi(getenv("IREE_METAL_COOP_ATTN_M"))
                                              : mBlock;
     getOperation()->walk([&](linalg::LinalgOp op) {
       SmallVector<int64_t> ranges = op.getStaticLoopRanges();
@@ -489,7 +489,7 @@ struct ConfigSoftmaxThreadsPass
   }
 };
 
-// nlearn (NLEARN_COOP_ATTN_BARRIER): isolate the qk (scores) contraction from its
+// iree-metal (IREE_METAL_COOP_ATTN_BARRIER): isolate the qk (scores) contraction from its
 // softmax REDUCTION epilogue by inserting a util.optimization_barrier on its result.
 // In decomposed attention the qk matmul feeds (through the parallel scale generic) a
 // rowmax REDUCTION; the coop passes (SPIRVTileToCooperativeOps) INFINITE-LOOP on this
@@ -518,12 +518,12 @@ static bool feedsReductionForward(Value v, int depth) {
   return false;
 }
 
-// nlearn (cont80d): fold arith.extf(f16->f32) on a vector.contract's A/B operands
+// iree-metal (cont80d): fold arith.extf(f16->f32) on a vector.contract's A/B operands
 // INTO the contract, so the decomposed attention qk/pv matmuls become f16xf16->f32
 // (the Apple coop-native mixed-precision form) instead of f32xf32->f32 (which the
 // coop intrinsic doesn't match -> falls to scalar). Numerically identical (coop
 // accumulates in f32). This is the last blocker to coop firing in COOPSMEM.
-// nlearn (cont83): true if `v` reaches a vector.multi_reduction/reduction forward
+// iree-metal (cont83): true if `v` reaches a vector.multi_reduction/reduction forward
 // (through elementwise ops) — i.e. it's the qk scores feeding the softmax.
 static bool vectorFeedsReduction(Value v, int depth) {
   if (depth < 0)
@@ -540,7 +540,7 @@ static bool vectorFeedsReduction(Value v, int depth) {
   return false;
 }
 
-// nlearn (cont83, NLEARN_COOP_ATTN_VBARRIER): insert a VECTOR-level
+// iree-metal (cont83, IREE_METAL_COOP_ATTN_VBARRIER): insert a VECTOR-level
 // util.optimization_barrier on the qk vector.contract result (the one feeding the
 // softmax reduction), right before SPIRVVectorToGPUSubgroupMMA. convertVectorToMMAOps
 // won't propagate the COp mma type across the barrier, so the softmax stays as
@@ -549,7 +549,7 @@ static bool vectorFeedsReduction(Value v, int depth) {
 struct VectorContractBarrierPass
     : PassWrapper<VectorContractBarrierPass, OperationPass<>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(VectorContractBarrierPass)
-  StringRef getArgument() const final { return "nlearn-vector-contract-barrier"; }
+  StringRef getArgument() const final { return "iree-metal-vector-contract-barrier"; }
   void runOnOperation() override {
     SmallVector<Operation *> qks;
     getOperation()->walk([&](vector::ContractionOp c) {
@@ -572,7 +572,7 @@ struct VectorContractBarrierPass
 struct FoldContractExtPass
     : PassWrapper<FoldContractExtPass, OperationPass<>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FoldContractExtPass)
-  StringRef getArgument() const final { return "nlearn-fold-contract-ext"; }
+  StringRef getArgument() const final { return "iree-metal-fold-contract-ext"; }
   void runOnOperation() override {
     RewritePatternSet patterns(&getContext());
     vector::populateFoldArithExtensionPatterns(patterns);
@@ -584,7 +584,7 @@ struct FoldContractExtPass
 struct QkScoreBarrierPass
     : PassWrapper<QkScoreBarrierPass, OperationPass<>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(QkScoreBarrierPass)
-  StringRef getArgument() const final { return "nlearn-qk-score-barrier"; }
+  StringRef getArgument() const final { return "iree-metal-qk-score-barrier"; }
   void runOnOperation() override {
     SmallVector<Operation *> qks;
     getOperation()->walk([&](linalg::LinalgOp op) {
@@ -633,7 +633,7 @@ void addSPIRVVectorDistributeAttentionPassPipeline(
     funcPassManager.addPass(createGPUApplyTilingLevelPass(options));
   }
 
-  // nlearn (NLEARN_COOP_ATTN_THREAD): distribute the query-M block across the
+  // iree-metal (IREE_METAL_COOP_ATTN_THREAD): distribute the query-M block across the
   // subgroup's threads by tiling the ATTENTION/online_attention op (which
   // carries the "thread" tiling level in its config and implements
   // TilingInterface) to M->1 BEFORE decompose. Each thread then decomposes to a
@@ -641,7 +641,7 @@ void addSPIRVVectorDistributeAttentionPassPipeline(
   // interface, full occupancy. Doing this pre-decompose is the fix for cont57:
   // post-decompose the softmax generics carry NO config so the thread pass
   // couldn't reach them.
-  if (getenv("NLEARN_COOP_ATTN_THREAD")) {
+  if (getenv("IREE_METAL_COOP_ATTN_THREAD")) {
     GPUApplyTilingLevelPassOptions topts;
     topts.tilingLevel = IREE::GPU::TilingLevel::Thread;
     topts.allowZeroSlices = true;
@@ -654,14 +654,14 @@ void addSPIRVVectorDistributeAttentionPassPipeline(
   funcPassManager.addPass(createConfigTrackingCanonicalizerPass());
   funcPassManager.addPass(createCSEPass());
 
-  // nlearn (NLEARN_COOP_ATTN_SMEM): shared-memory-staged flash. Mirror the coop
+  // iree-metal (IREE_METAL_COOP_ATTN_SMEM): shared-memory-staged flash. Mirror the coop
   // MATMUL pipeline's order (bufferize-to-workgroup-mem -> promote C -> coop) for
   // the decomposed attention so the qk scores land in a REGULAR row-major SHARED-
   // MEMORY buffer (via the opaque coop store) and the inter-matmul softmax runs
   // as a normal smem reduction — NO coop layout, sidestepping the research-grade
   // Apple simdgroup-layout blocker that walls vector-distribute. Returns early to
   // skip the tensor-level vectorization + function-memory end-bufferize below.
-  // nlearn (NLEARN_COOP_ATTN_COOPSMEM): the CORRECT-ORDER coop flash (cont78d root
+  // iree-metal (IREE_METAL_COOP_ATTN_COOPSMEM): the CORRECT-ORDER coop flash (cont78d root
   // cause: the DECOMP branch called the coop passes PRE-bufferize so they never
   // fired -> huge vector<64x64> contracts hung SPIRVInitialVectorLowering). Mirror
   // addSPIRVCooperativeMatrixVectorizePassPipeline's order — bufferize(smem) FIRST,
@@ -671,26 +671,26 @@ void addSPIRVVectorDistributeAttentionPassPipeline(
   // reductions between them are left to the normal vector lowering (they break down
   // fine; only the CONTRACTs hung, and those are now coop). GPUDistribute resolves
   // any thread foralls post-bufferize.
-  if (getenv("NLEARN_COOP_ATTN_COOPSMEM")) {
+  if (getenv("IREE_METAL_COOP_ATTN_COOPSMEM")) {
     funcPassManager.addPass(std::make_unique<DeAliasFlashScratchPass>());
     funcPassManager.addPass(createConfigTrackingCanonicalizerPass());
     funcPassManager.addPass(createCSEPass());
-    // nlearn (cont82, NLEARN_COOP_ATTN_BARRIER): isolate the qk coop result from the
+    // iree-metal (cont82, IREE_METAL_COOP_ATTN_BARRIER): isolate the qk coop result from the
     // softmax so convertVectorToMMAOps doesn't propagate the COp mma type THROUGH the
     // softmax to the pv-A truncf (which makes an invalid f16-accumulator coop op,
     // cont81e). The barrier forces the softmax to read a regular vector, not a coop
     // mma_load, keeping the softmax off the matrix units while qk/pv stay coop.
-    if (getenv("NLEARN_COOP_ATTN_BARRIER")) {
+    if (getenv("IREE_METAL_COOP_ATTN_BARRIER")) {
       funcPassManager.addPass(std::make_unique<QkScoreBarrierPass>());
       funcPassManager.addPass(createConfigTrackingCanonicalizerPass());
     }
     addBufferizePasses(funcPassManager, gpuAllocateWorkgroupMemoryFn);
     // C-promotion (doPromoteCMatrix) SEGFAULTS on the attention (the qk matmul's C
     // feeds the softmax reduction, not a plain store) — cont78g. Skip it by default
-    // (coop can store to smem directly); opt back in with NLEARN_COOP_ATTN_PROMOTEC.
+    // (coop can store to smem directly); opt back in with IREE_METAL_COOP_ATTN_PROMOTEC.
     funcPassManager.addPass(
         createSPIRVTileAndPromotePass(SPIRVTileAndPromotePassOptions{
-            /*promoteCMatrix=*/getenv("NLEARN_COOP_ATTN_PROMOTEC") != nullptr,
+            /*promoteCMatrix=*/getenv("IREE_METAL_COOP_ATTN_PROMOTEC") != nullptr,
             /*skipThreadLevel=*/true,
             /*skipOperandPromotion=*/true}));
     funcPassManager.addPass(createRemoveSingleIterationLoopPass());
@@ -710,9 +710,9 @@ void addSPIRVVectorDistributeAttentionPassPipeline(
     funcPassManager.addPass(createSPIRVVectorizeToCooperativeOpsPass());
     funcPassManager.addPass(createCSEPass());
     // Vector-level barrier on the qk scores so the softmax doesn't fuse into coop.
-    if (getenv("NLEARN_COOP_ATTN_VBARRIER"))
+    if (getenv("IREE_METAL_COOP_ATTN_VBARRIER"))
       funcPassManager.addPass(std::make_unique<VectorContractBarrierPass>());
-    // nlearn (cont81): convert the (f16-native) qk/pv vector.contract + its operand
+    // iree-metal (cont81): convert the (f16-native) qk/pv vector.contract + its operand
     // loads/store to gpu.subgroup_mma ops NOW, before the vector lowering below —
     // otherwise addSPIRVVectorLoweringPasses scalarizes the contract AND its operand
     // transfer_reads (cont80f/81), destroying the coop matmul. Once they're mma ops
@@ -722,7 +722,7 @@ void addSPIRVVectorDistributeAttentionPassPipeline(
     funcPassManager.addPass(createCSEPass());
     funcPassManager.addPass(createSPIRVBreakDownLargeVectorPass());
     addSPIRVVectorLoweringPasses(funcPassManager);
-    // nlearn (cont80): addSPIRVVectorLoweringPasses lowers the softmax
+    // iree-metal (cont80): addSPIRVVectorLoweringPasses lowers the softmax
     // multi_reduction to a vector<M>-wide from_elements/addf (e.g. vector<16> for an
     // M-tile=16), which ConvertToSPIRV can't legalize (Apple has no Vector16 cap).
     // The FIRST BreakDownLargeVector above runs BEFORE this lowering so it misses
@@ -738,7 +738,7 @@ void addSPIRVVectorDistributeAttentionPassPipeline(
     return;
   }
 
-  if (getenv("NLEARN_COOP_ATTN_SMEM")) {
+  if (getenv("IREE_METAL_COOP_ATTN_SMEM")) {
     // De-alias the online-softmax scratch writes to the flash-loop iter_args so
     // the flash loop one-shot-bufferizes (see the pass comment).
     funcPassManager.addPass(std::make_unique<DeAliasFlashScratchPass>());
@@ -781,22 +781,22 @@ void addSPIRVVectorDistributeAttentionPassPipeline(
     return;
   }
 
-  // nlearn (NLEARN_COOP_ATTN_DECOMP): route the decomposed qk/pv matmuls (which
+  // iree-metal (IREE_METAL_COOP_ATTN_DECOMP): route the decomposed qk/pv matmuls (which
   // carry SPIR-V coop lowering_configs from decomposition_config) onto the
   // matrix units via the existing coop passes, instead of generic vectorization
   // (which can't legalize M>=16 and is scalar-slow at M=1). The coop passes only
   // touch matmuls that HAVE a lowering_config; the softmax generics fall through
   // to GenericVectorization below.
-  if (getenv("NLEARN_COOP_ATTN_DECOMP")) {
-    // nlearn: shared-memory-staged flash (the tractable path — softmax on a
+  if (getenv("IREE_METAL_COOP_ATTN_DECOMP")) {
+    // iree-metal: shared-memory-staged flash (the tractable path — softmax on a
     // regular row-major smem buffer, no coop layout) needs a proper pipeline
     // RESTRUCTURE to bufferize the scores then SPIRVTileAndPromote(promoteC) —
     // grafting the promote pass into this pre-bufferize tensor-level path
     // SEGFAULTS (verified cont64). Left as the documented next build step.
-    // nlearn (NLEARN_COOP_ATTN_BARRIER): isolate the qk contraction from its
+    // iree-metal (IREE_METAL_COOP_ATTN_BARRIER): isolate the qk contraction from its
     // reduction epilogue so the coop passes don't infinite-loop on the
     // matmul->reduction fusion (cont78b) — try to make qk a clean coop matmul.
-    if (getenv("NLEARN_COOP_ATTN_BARRIER")) {
+    if (getenv("IREE_METAL_COOP_ATTN_BARRIER")) {
       funcPassManager.addPass(std::make_unique<QkScoreBarrierPass>());
       funcPassManager.addPass(createConfigTrackingCanonicalizerPass());
     }
@@ -817,7 +817,7 @@ void addSPIRVVectorDistributeAttentionPassPipeline(
     GenericVectorizationPassOptions options;
     funcPassManager.addPass(createGenericVectorizationPass(options));
   }
-  // nlearn: the online-softmax reductions between the (now coop) qk/pv matmuls
+  // iree-metal: the online-softmax reductions between the (now coop) qk/pv matmuls
   // get generic-vectorized to coop-tile-wide vectors (e.g. vector<16xf32> from
   // an M-tile=16), which ConvertToSPIRV can't legalize ("failed to legalize
   // arith.constant vector<16xf32>"). Break them down to SPIR-V-legal widths
@@ -880,17 +880,17 @@ void addSPIRVCooperativeMatrixVectorizePassPipeline(
     unsigned storeStage) {
   addTileAndDistributeToWorkgroupsPasses(
       funcPassManager, /*useFuseTensorPadWithConsumerPass=*/false,
-      // nlearn: the WAR padding (64->68) creates a strided C-staging subview that
+      // iree-metal: the WAR padding (64->68) creates a strided C-staging subview that
       // FoldMemRefAliasOps can't fold to a static offset on the bf16-store path.
       // Env-toggle to test disabling it.
-      /*useWARForCooperativeMatrixCodegen=*/getenv("NLEARN_COOP_NO_WAR") == nullptr);
+      /*useWARForCooperativeMatrixCodegen=*/getenv("IREE_METAL_COOP_NO_WAR") == nullptr);
 
   addBufferizePasses(funcPassManager, gpuAllocateWorkgroupMemoryFn);
 
   // Tile to GPU workgroups and promote.
   funcPassManager.addPass(
       createSPIRVTileAndPromotePass(SPIRVTileAndPromotePassOptions{
-          /*promoteCMatrix=*/getenv("NLEARN_COOP_NO_CPROMOTE") == nullptr,
+          /*promoteCMatrix=*/getenv("IREE_METAL_COOP_NO_CPROMOTE") == nullptr,
           /*skipThreadLevel=*/true,
           /*skipOperandPromotion=*/true}));
   funcPassManager.addPass(createPropagateDispatchSizeBoundsPass());
@@ -955,7 +955,7 @@ void addSPIRVCooperativeMatrixVectorizePassPipeline(
   funcPassManager.addPass(createSPIRVVectorToGPUSubgroupMMAPass());
   funcPassManager.addPass(createCanonicalizerPass());
   funcPassManager.addPass(createCSEPass());
-  // nlearn: matmuls that DON'T convert to subgroup_mma (e.g. some training
+  // iree-metal: matmuls that DON'T convert to subgroup_mma (e.g. some training
   // backward contractions) fall back to scalar inside the coop pipeline, leaving
   // coop-native-shaped vectors (vector<16x16xf32> accumulators, vector<16xf32>
   // temporaries). Unlike the scalar tile-and-vectorize pipeline, the coop pipeline
@@ -988,10 +988,10 @@ void addSPIRVMatmulPromoteVectorizePassPipeline(OpPassManager &funcPassManager,
                           << "\n";);
   addTileAndDistributeToWorkgroupsPasses(
       funcPassManager, /*useFuseTensorPadWithConsumerPass=*/false,
-      // nlearn: the WAR padding (64->68) creates a strided C-staging subview that
+      // iree-metal: the WAR padding (64->68) creates a strided C-staging subview that
       // FoldMemRefAliasOps can't fold to a static offset on the bf16-store path.
       // Env-toggle to test disabling it.
-      /*useWARForCooperativeMatrixCodegen=*/getenv("NLEARN_COOP_NO_WAR") == nullptr);
+      /*useWARForCooperativeMatrixCodegen=*/getenv("IREE_METAL_COOP_NO_WAR") == nullptr);
 
   // Promote to workgroups and tile to threads.
   funcPassManager.addPass(createGPUTensorTileToSerialLoopsPass());

@@ -195,7 +195,7 @@ void addMatrixFeatures(IREE::GPU::MMAOpsArrayAttr mmaOps,
     caps.insert(Capability::CooperativeMatrixKHR);
     exts.insert(Extension::SPV_KHR_cooperative_matrix);
     // If any MMA op uses bf16, advertise the bf16 type + bf16-coop capabilities.
-    // (nlearn trains in bf16; Metal has simdgroup_matrix<bfloat,8,8>.)
+    // (iree-metal trains in bf16; Metal has simdgroup_matrix<bfloat,8,8>.)
     for (IREE::GPU::MMAAttr mma : mmaOps) {
       auto [aType, bType, cType] = mma.getABCElementTypes();
       if (isa<BFloat16Type>(aType) || isa<BFloat16Type>(bType) ||
@@ -221,7 +221,7 @@ spirv::ResourceLimitsAttr convertLimits(IREE::GPU::TargetAttr target) {
 
     // Filter out types not supported by VK_KHR_cooperative_matrix. See
     // https://registry.khronos.org/vulkan/specs/latest/man/html/VkComponentTypeKHR.html.
-    // NOTE(nlearn): we don't target Vulkan — the SPIR-V is consumed by spirv-cross and
+    // NOTE(iree-metal): we don't target Vulkan — the SPIR-V is consumed by spirv-cross and
     // lowered to MSL, and Metal has simdgroup_matrix<bfloat,8,8>. So bf16 IS supported on
     // this path; keep the <16-bit (f8) filter but allow bf16 through.
     bool isSupportedByCoopMatrix = true;

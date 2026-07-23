@@ -113,7 +113,7 @@ int getComputeVectorSize(int64_t size) {
 }
 
 int getMemoryVectorSize(Value source, Type scalarType, int64_t size) {
-  // nlearn: guard non-int/float element types — getIntOrFloatBitWidth() asserts
+  // iree-metal: guard non-int/float element types — getIntOrFloatBitWidth() asserts
   // (and in release SEGFAULTS) on types like `index` or complex, which can show
   // up in vector.transfer_read of gather/mask index computations (observed in
   // the jax.nn.dot_product_attention BACKWARD graph). Such vectors can't be
@@ -274,7 +274,7 @@ SmallVector<int64_t> getNativeVectorShapeImpl(vector::MultiDimReductionOp op) {
   ArrayRef<int64_t> dims = op.getReductionDims();
   llvm::SmallDenseSet<int64_t> redSet(dims.begin(), dims.end());
   for (int64_t i = 0, e = nativeSize.size(); i < e; ++i) {
-    // nlearn (cont80c): also cap the PARALLEL dims to the SPIR-V native compute
+    // iree-metal (cont80c): also cap the PARALLEL dims to the SPIR-V native compute
     // vector size (<=4). The original left parallel dims at full width, so an
     // attention softmax multi_reduction over a mult-16 query-M tile lowered to an
     // illegal vector<16xf32> (Apple has no Vector16 capability) — the flash-coop

@@ -239,7 +239,7 @@ static bool checkContractionOpEquivalence(MLIRContext *context, Operation *aOp,
   return true;
 }
 
-// nlearn (2026-07-22): HORIZONTAL REDUCTION FUSION (env NLEARN_FUSE_HORIZ_REDUCTIONS).
+// iree-metal (2026-07-22): HORIZONTAL REDUCTION FUSION (env IREE_METAL_FUSE_HORIZ_REDUCTIONS).
 // LayerNorm/softmax emit several reductions (mean/var fwd, dgamma/dbeta/dx bwd) that share
 // the reduced input and iteration space, but each is a dispatch root -> LN fwd+bwd = 14
 // dispatches vs ~2 on MPS (the glue-fusion gap). Fuse same-iteration-space reduction generics
@@ -247,12 +247,12 @@ static bool checkContractionOpEquivalence(MLIRContext *context, Operation *aOp,
 // codegens to a single dispatch). Reuses fuseContractionsHorizontally's generic multi-result
 // generation. Unlike the contraction check, we do NOT require region equivalence (mean=sum,
 // var=sum-of-squares have different bodies) — the generator merges distinct bodies.
-static bool nlearnFuseHorizReductions() {
-  static const bool on = ::getenv("NLEARN_FUSE_HORIZ_REDUCTIONS") != nullptr;
+static bool ireeMetalFuseHorizReductions() {
+  static const bool on = ::getenv("IREE_METAL_FUSE_HORIZ_REDUCTIONS") != nullptr;
   return on;
 }
 
-// nlearn (2026-07-22): VARIANCE-REWRITE (env NLEARN_LN_VAR_REWRITE). LayerNorm's variance
+// iree-metal (2026-07-22): VARIANCE-REWRITE (env IREE_METAL_LN_VAR_REWRITE). LayerNorm's variance
 // reduction sum((x-mean)^2) reduces a DERIVED value (x-mean), so it can't horizontally fuse
 // with the mean's sum(x). Rewrite it to sum(x^2) - N*mean^2: sum(x^2) reduces x DIRECTLY
 // (squares per-element in the reduction body), so it shares operand-0 with sum(x) and the
@@ -303,7 +303,7 @@ struct RewriteVarianceToSumSq final : OpRewritePattern<linalg::GenericOp> {
   using OpRewritePattern::OpRewritePattern;
   LogicalResult matchAndRewrite(linalg::GenericOp varGen,
                                 PatternRewriter &rewriter) const override {
-    if (!::getenv("NLEARN_LN_VAR_REWRITE"))
+    if (!::getenv("IREE_METAL_LN_VAR_REWRITE"))
       return failure();
     auto varOp = cast<linalg::LinalgOp>(varGen.getOperation());
     if (varOp.getNumReductionLoops() == 0 || varGen.getNumDpsInputs() != 2 ||
@@ -485,9 +485,9 @@ static std::optional<SmallVector<Operation *>> getHorizontalFusionGroupMembers(
     }
 
     // Constraints of the operation itself. When the seed is a reduction generic
-    // (NLEARN_FUSE_HORIZ_REDUCTIONS), use the reduction-equivalence predicate;
+    // (IREE_METAL_FUSE_HORIZ_REDUCTIONS), use the reduction-equivalence predicate;
     // otherwise the contraction one.
-    if (nlearnFuseHorizReductions() && isHorizFusableReduction(seedOp)) {
+    if (ireeMetalFuseHorizReductions() && isHorizFusableReduction(seedOp)) {
       if (!isHorizFusableReduction(linalgOp) ||
           !checkReductionOpEquivalence(context, linalgOp, seedOp)) {
         return false;
@@ -703,9 +703,9 @@ static void fuseGroup(RewriterBase &rewriter,
 void FuseHorizontalContractionsPass::runOnOperation() {
   MLIRContext *context = &getContext();
 
-  // nlearn: rewrite LayerNorm variance sum((x-mean)^2) -> sum(x^2) - N*mean^2 so the
-  // mean/var reductions read x and horizontally fuse below (env NLEARN_LN_VAR_REWRITE).
-  if (::getenv("NLEARN_LN_VAR_REWRITE")) {
+  // iree-metal: rewrite LayerNorm variance sum((x-mean)^2) -> sum(x^2) - N*mean^2 so the
+  // mean/var reductions read x and horizontally fuse below (env IREE_METAL_LN_VAR_REWRITE).
+  if (::getenv("IREE_METAL_LN_VAR_REWRITE")) {
     RewritePatternSet varPatterns(context);
     varPatterns.add<RewriteVarianceToSumSq>(context);
     if (failed(applyPatternsGreedily(getOperation(), std::move(varPatterns))))
@@ -717,17 +717,17 @@ void FuseHorizontalContractionsPass::runOnOperation() {
   SmallVector<SmallVector<Operation *>> horizontalFusionGroups;
   llvm::SmallDenseSet<Operation *> groupedOperations;
 
-  // nlearn: when the pass is triggered ONLY by the reduction/variance env knobs (not the
+  // iree-metal: when the pass is triggered ONLY by the reduction/variance env knobs (not the
   // cl::opt), seed reductions only — horizontally fusing the matmuls regresses them on Metal
-  // ("runs but slower"), which would swamp the reduction-fusion signal. NLEARN_HORIZ_CONTRACTIONS
+  // ("runs but slower"), which would swamp the reduction-fusion signal. IREE_METAL_HORIZ_CONTRACTIONS
   // re-enables contraction seeding alongside.
   bool reductionOnlyMode =
-      (nlearnFuseHorizReductions() || ::getenv("NLEARN_LN_VAR_REWRITE")) &&
-      !::getenv("NLEARN_HORIZ_CONTRACTIONS");
+      (ireeMetalFuseHorizReductions() || ::getenv("IREE_METAL_LN_VAR_REWRITE")) &&
+      !::getenv("IREE_METAL_HORIZ_CONTRACTIONS");
   getOperation()->walk([&](linalg::LinalgOp linalgOp) {
     // Seed from contractions, or (env-gated) from fusable reduction generics.
     bool isSeed = (!reductionOnlyMode && linalg::isaContractionOpInterface(linalgOp)) ||
-                  (nlearnFuseHorizReductions() &&
+                  (ireeMetalFuseHorizReductions() &&
                    isHorizFusableReduction(linalgOp));
     if (!isSeed) {
       return;

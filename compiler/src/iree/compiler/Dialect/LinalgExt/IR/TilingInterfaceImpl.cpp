@@ -297,14 +297,14 @@ LogicalResult ScatterOp::generateScalarImplementation(OpBuilder &b,
     starts[dim] = ret;
   }
 
-  // nlearn (NLEARN_SCATTER_ATOMIC): a scatter whose combiner is a single float add (the embedding /
+  // iree-metal (IREE_METAL_SCATTER_ATOMIC): a scatter whose combiner is a single float add (the embedding /
   // vocab-grad scatter-add) is emitted as a serial load-add-store because unique_indices=false makes
   // the update dim a reduction. That forces a ~1-workgroup serial kernel (embedding-backward is ~10x
   // slower than jax-metal). Emit an atomic_rmw addf instead: duplicate indices are handled by the
   // atomic, so the update dim becomes parallel and the config distributes it across the GPU. (Metal
   // supports atomic float add; spirv-cross emits OpAtomicFAddEXT.) Falls through to the store below
   // for any non-add combiner.
-  if (getenv("NLEARN_SCATTER_ATOMIC")) {
+  if (getenv("IREE_METAL_SCATTER_ATOMIC")) {
     Block &blk = getRegion().front();
     auto *term = blk.getTerminator();
     auto addf = term->getOperand(0).getDefiningOp<arith::AddFOp>();

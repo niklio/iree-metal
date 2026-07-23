@@ -542,7 +542,7 @@ static iree_status_t iree_hal_metal_device_queue_execute(
       }];
       [signal_command_buffer commit];
 
-      // HEADLESS-DCP MITIGATION (nlearn EXPERIMENT_gpu_yield.md §13): briefly yield the GPU
+      // HEADLESS-DCP MITIGATION (iree-metal EXPERIMENT_gpu_yield.md §13): briefly yield the GPU
       // after each submit so the headless Display Coprocessor / RTBuddy can service its
       // periodic link re-sync. Without an idle window, sustained submission wedges the DCP and
       // the userspace watchdog panics the machine (~44-87 min). Env-gated, no-op unless

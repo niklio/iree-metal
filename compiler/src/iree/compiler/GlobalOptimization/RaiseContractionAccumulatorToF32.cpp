@@ -98,17 +98,17 @@ struct RaiseAccumulatorPattern : OpInterfaceRewritePattern<linalg::LinalgOp> {
     // paired with the reduction-epilogue barrier split below that isolates them
     // from the softmax into their own clean coop dispatch on the matrix units.
     //
-    // nlearn (cont408): DEFAULT-ON after a full 10-model correctness-gated A/B
+    // iree-metal (cont408): DEFAULT-ON after a full 10-model correctness-gated A/B
     // (all 10 correct vs deployed; mean +3.6% throughput, gpt2 +10.1%, deit +4.9%,
     // the four 512-seq encoders +3.4%; vit-base neutral+correct via the pad-skip
     // gate below). Two gates below keep it safe: (1) skip PADDED bmms (odd-seq vit
     // corrupts under f32-promote), (2) only promote when mn<=MAXMN so the isolation
     // gate also fires (large-T gpt2 T=1024 stayed on the untouched path pre-gate,
-    // -34% → now neutral/positive). Opt out entirely with NLEARN_COOP_NO_ATTN_SPLIT.
-    //   NLEARN_COOP_ATTN_F32ACC = force promotion-only (no barrier) for experiments
+    // -34% → now neutral/positive). Opt out entirely with IREE_METAL_COOP_NO_ATTN_SPLIT.
+    //   IREE_METAL_COOP_ATTN_F32ACC = force promotion-only (no barrier) for experiments
     //     (bmm stays scalar-fused with softmax but accumulates in f32).
-    bool allowBatch = getenv("NLEARN_COOP_NO_ATTN_SPLIT") == nullptr ||
-                      getenv("NLEARN_COOP_ATTN_F32ACC") != nullptr;
+    bool allowBatch = getenv("IREE_METAL_COOP_NO_ATTN_SPLIT") == nullptr ||
+                      getenv("IREE_METAL_COOP_ATTN_F32ACC") != nullptr;
     bool isBatchMatmul = allowBatch && IREE::LinalgExt::isPureBatchMatmul(op);
     if (!isMatmul && !isBatchMatmul) {
       return failure();
@@ -120,7 +120,7 @@ struct RaiseAccumulatorPattern : OpInterfaceRewritePattern<linalg::LinalgOp> {
       if (isBatchMatmul) {
         if (ranges.size() < 3)
           return failure();
-        // nlearn (cont407): do NOT f32-promote a PADDED attention batch-matmul.
+        // iree-metal (cont407): do NOT f32-promote a PADDED attention batch-matmul.
         // PadBatchMatmulToCoopPattern pads an odd-seq bmm (e.g. vit 197->208) to
         // reach coop; f32-promoting the *padded* op corrupts the result (vit-base:
         // 141x drift / blowup — the fake padded score columns interact badly with
@@ -135,7 +135,7 @@ struct RaiseAccumulatorPattern : OpInterfaceRewritePattern<linalg::LinalgOp> {
         for (int64_t d : ArrayRef<int64_t>(ranges).take_back(3))
           if (ShapedType::isDynamic(d) || d < 16 || (d % 16) != 0)
             return failure();
-        // nlearn (cont405): ONLY promote an attention batch-matmul to f32 when the
+        // iree-metal (cont405): ONLY promote an attention batch-matmul to f32 when the
         // isolation gate below (IsolateBatchMatmulPattern, mn<=MAXMN) will ALSO
         // fire. Promoting without isolating leaves an f32 bmm FUSED into the
         // softmax epilogue: still scalar (reduction blocks coop) but now
@@ -146,7 +146,7 @@ struct RaiseAccumulatorPattern : OpInterfaceRewritePattern<linalg::LinalgOp> {
         int64_t M = ranges[ranges.size() - 3];
         int64_t N = ranges[ranges.size() - 2];
         int64_t maxMN = 600000;
-        if (const char *e = getenv("NLEARN_COOP_ATTN_ISOLATE_MAXMN"))
+        if (const char *e = getenv("IREE_METAL_COOP_ATTN_ISOLATE_MAXMN"))
           maxMN = std::strtoll(e, nullptr, 10);
         if (M * N > maxMN)
           return failure();
@@ -204,7 +204,7 @@ struct RaiseAccumulatorPattern : OpInterfaceRewritePattern<linalg::LinalgOp> {
     // cast, no consumer" case fuses the truncf BACKWARD into the matmul and
     // miscompiles the store-downcast — opt into the barrier there via env.
     Value f32Res = newOp->getResult(0);
-    if (getenv("NLEARN_COOP_BARRIER"))
+    if (getenv("IREE_METAL_COOP_BARRIER"))
       f32Res = IREE::Util::OptimizationBarrierOp::create(rewriter, loc, f32Res)
                    ->getResult(0);
     // Narrow the f32 result back to the original low-precision type.
@@ -284,7 +284,7 @@ struct SplitTransposeEpiloguePattern : OpRewritePattern<linalg::GenericOp> {
   }
 };
 
-// NLEARN_COOP_ATTN_SPLIT experiment: isolate every (promoted, f32-output) batch
+// IREE_METAL_COOP_ATTN_SPLIT experiment: isolate every (promoted, f32-output) batch
 // matmul into its OWN dispatch by putting a barrier on its result. Attention
 // q@kᵀ / a@v are the only batch matmuls; isolating them from their scale/softmax/
 // transpose epilogue makes each a clean f32-output coop dispatch (materializing
@@ -296,7 +296,7 @@ struct IsolateBatchMatmulPattern : OpRewritePattern<linalg::BatchMatmulOp> {
   LogicalResult matchAndRewrite(linalg::BatchMatmulOp bmm,
                                 PatternRewriter &rewriter) const override {
     Value result = bmm.getResult(0);
-    // Normally only isolate the f32-output (promoted) form. NLEARN_COOP_ATTN_
+    // Normally only isolate the f32-output (promoted) form. IREE_METAL_COOP_ATTN_
     // ISOLATE_BF16 also isolates bf16 bmms (un-fuse the attention bmm from its
     // softmax/scale/transpose backward epilogue WITHOUT f32 promotion) — tests
     // whether un-fusing alone fixes the bf16 attention-backward NaN while keeping
@@ -304,9 +304,9 @@ struct IsolateBatchMatmulPattern : OpRewritePattern<linalg::BatchMatmulOp> {
     // DEFAULT-ON (Nik-approved cont190): un-fusing the bf16 attention bmm from its
     // backward epilogue fixes a real correctness bug (NaN on 6/10 std bf16
     // transformers) + is faster on 8/10, zero regressions. Opt out with
-    // NLEARN_COOP_NO_ATTN_ISOLATE_BF16.
+    // IREE_METAL_COOP_NO_ATTN_ISOLATE_BF16.
     static const bool isolateBf16 =
-        ::getenv("NLEARN_COOP_NO_ATTN_ISOLATE_BF16") == nullptr;
+        ::getenv("IREE_METAL_COOP_NO_ATTN_ISOLATE_BF16") == nullptr;
     Type et = cast<ShapedType>(result.getType()).getElementType();
     if (!et.isF32() && !(isolateBf16 && et.isBF16()))
       return failure();
@@ -319,7 +319,7 @@ struct IsolateBatchMatmulPattern : OpRewritePattern<linalg::BatchMatmulOp> {
     // gpt2-1024, which doesn't need the NaN fix anyway). Skip isolation when the
     // per-batch output M*N exceeds a threshold (default 600k ≈ T≤775 for square
     // scores) so the T=512 NaN models + vit still isolate but large-T stays fused.
-    // Override via NLEARN_COOP_ATTN_ISOLATE_MAXMN.
+    // Override via IREE_METAL_COOP_ATTN_ISOLATE_MAXMN.
     {
       auto rTy = cast<ShapedType>(result.getType());
       int64_t rank = rTy.getRank();
@@ -327,7 +327,7 @@ struct IsolateBatchMatmulPattern : OpRewritePattern<linalg::BatchMatmulOp> {
           !rTy.isDynamicDim(rank - 2)) {
         int64_t mn = rTy.getDimSize(rank - 1) * rTy.getDimSize(rank - 2);
         int64_t maxMN = 600000;
-        if (const char *e = ::getenv("NLEARN_COOP_ATTN_ISOLATE_MAXMN"))
+        if (const char *e = ::getenv("IREE_METAL_COOP_ATTN_ISOLATE_MAXMN"))
           maxMN = std::strtoll(e, nullptr, 10);
         if (mn > maxMN)
           return failure();
@@ -349,7 +349,7 @@ struct IsolateBatchMatmulPattern : OpRewritePattern<linalg::BatchMatmulOp> {
 // unaligned support, so odd-sized models (e.g. vit: M=B*T=4616) otherwise fall to
 // scalar (0.31 vs jax-metal 2.51). Padding makes them aligned → they hit the
 // matrix units. The padded matmul is then f32-promoted by RaiseAccumulatorPattern
-// (dims now mult-16 and, for vit, >=128). Env-gated NLEARN_COOP_PAD.
+// (dims now mult-16 and, for vit, >=128). Env-gated IREE_METAL_COOP_PAD.
 struct PadMatmulToCoopPattern : OpInterfaceRewritePattern<linalg::LinalgOp> {
   using OpInterfaceRewritePattern<linalg::LinalgOp>::OpInterfaceRewritePattern;
 
@@ -401,7 +401,7 @@ struct PadMatmulToCoopPattern : OpInterfaceRewritePattern<linalg::LinalgOp> {
 // [.,M,N] shape, so the fake padded rows/cols are dropped before the softmax
 // consumer -> numerically exact IF the slice survives downstream fusion
 // (validated on vit attention vs a numpy ref before trusting). Opt-in
-// (experimental): NLEARN_COOP_PAD_ATTN.
+// (experimental): IREE_METAL_COOP_PAD_ATTN.
 struct PadBatchMatmulToCoopPattern
     : OpRewritePattern<linalg::BatchMatmulOp> {
   using OpRewritePattern<linalg::BatchMatmulOp>::OpRewritePattern;
@@ -453,34 +453,34 @@ public:
     MLIRContext *ctx = &getContext();
     RewritePatternSet patterns(ctx);
     patterns.add<RaiseAccumulatorPattern>(ctx);
-    // NLEARN_COOP_PAD (default ON): pad non-mult-16 matmuls to mult-16 so
+    // IREE_METAL_COOP_PAD (default ON): pad non-mult-16 matmuls to mult-16 so
     // odd-sized models (vit M=B*T=4616: 0.31->0.66, 2.1×) reach the matrix units
     // instead of scalar. Validated exact (identical rel_err with/without padding)
     // and zero-regression on aligned models (gpt2 3.49, bert 2.94 unchanged — pad
-    // no-ops when all dims are already mult-16). Opt out with NLEARN_COOP_NO_PAD.
-    if (!getenv("NLEARN_COOP_NO_PAD")) {
+    // no-ops when all dims are already mult-16). Opt out with IREE_METAL_COOP_NO_PAD.
+    if (!getenv("IREE_METAL_COOP_NO_PAD")) {
       patterns.add<PadMatmulToCoopPattern>(ctx);
     }
-    // NLEARN_COOP_PAD_ATTN (default ON): also coop-pad attention batch-matmuls
+    // IREE_METAL_COOP_PAD_ATTN (default ON): also coop-pad attention batch-matmuls
     // so odd-seq models (vit seq=577) leave the scalar path (0.21->0.73 TFLOP/s,
     // 3.5x; loss rel 5.7e-4 vs scalar ref — per-op slice-back is exact, no mask).
     // No-op / zero-regression on mult-16 models (10-model sweep: 8/8 aligned
-    // models byte-identical flag on==off). Opt out with NLEARN_COOP_NO_PAD_ATTN.
-    if (!getenv("NLEARN_COOP_NO_PAD_ATTN")) {
+    // models byte-identical flag on==off). Opt out with IREE_METAL_COOP_NO_PAD_ATTN.
+    if (!getenv("IREE_METAL_COOP_NO_PAD_ATTN")) {
       patterns.add<PadBatchMatmulToCoopPattern>(ctx);
     }
-    // NLEARN_COOP_SPLIT_TRANSPOSE (default ON when this pass runs): isolate
+    // IREE_METAL_COOP_SPLIT_TRANSPOSE (default ON when this pass runs): isolate
     // transpose-epilogue matmuls so the backward weight-grads reach the matrix
-    // units. Opt out with NLEARN_COOP_NO_SPLIT_TRANSPOSE.
-    if (!getenv("NLEARN_COOP_NO_SPLIT_TRANSPOSE")) {
+    // units. Opt out with IREE_METAL_COOP_NO_SPLIT_TRANSPOSE.
+    if (!getenv("IREE_METAL_COOP_NO_SPLIT_TRANSPOSE")) {
       patterns.add<SplitTransposeEpiloguePattern>(ctx);
     }
     // IsolateBatchMatmulPattern isolates attention batch-matmuls from their
     // epilogue. bf16 isolation is DEFAULT-ON (the NaN correctness fix; opt out
-    // per-pattern via NLEARN_COOP_NO_ATTN_ISOLATE_BF16). f32 isolation only has
-    // an effect under NLEARN_COOP_ATTN_SPLIT (which produces f32 bmms). Opt the
-    // whole pattern out with NLEARN_COOP_NO_ATTN_ISOLATE.
-    if (!getenv("NLEARN_COOP_NO_ATTN_ISOLATE")) {
+    // per-pattern via IREE_METAL_COOP_NO_ATTN_ISOLATE_BF16). f32 isolation only has
+    // an effect under IREE_METAL_COOP_ATTN_SPLIT (which produces f32 bmms). Opt the
+    // whole pattern out with IREE_METAL_COOP_NO_ATTN_ISOLATE.
+    if (!getenv("IREE_METAL_COOP_NO_ATTN_ISOLATE")) {
       patterns.add<IsolateBatchMatmulPattern>(ctx);
     }
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {

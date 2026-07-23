@@ -1,4 +1,4 @@
-# nlearn submodule patches
+# IREE-Metal submodule patches
 
 This fork (`iree-metal`) carries changes to three vendored submodules that can't be
 committed into this superproject directly (they live in their own git repos). They are
@@ -13,7 +13,7 @@ preserved here as diffs so **all** code changes are captured in one place.
 ## Apply
 
 ```bash
-./nlearn-submodule-patches/apply.sh      # from the repo root, after `git submodule update --init`
+./iree-metal-submodule-patches/apply.sh      # from the repo root, after `git submodule update --init`
 ```
 
 The submodule pointers in this superproject are left at their upstream commits; applying

@@ -78,14 +78,14 @@ public:
                          .setVectorTransposeLowering(
                              vector::VectorTransposeLowering::EltWise);
       vector::populateVectorBroadcastLoweringPatterns(patterns);
-      // nlearn (cont81): in the coop-flash pipeline, DON'T lower vector.contract to
+      // iree-metal (cont81): in the coop-flash pipeline, DON'T lower vector.contract to
       // outerproduct/fma here — that scalarizes the qk/pv coop matmuls before
       // ConvertToSPIRV can emit spirv.KHR.CooperativeMatrix from them (the standard
       // coop matmul pipeline never runs this pass; attention needs it only for the
       // softmax reductions, which carry no contracts). Leaving the coop contracts
       // intact lets them survive to the coop conversion. Gated so normal codegen is
       // unchanged.
-      if (!getenv("NLEARN_COOP_ATTN_KEEPCONTRACT"))
+      if (!getenv("IREE_METAL_COOP_ATTN_KEEPCONTRACT"))
         vector::populateVectorContractLoweringPatterns(
             patterns, options.vectorContractLowering);
       vector::populateVectorMultiReductionReorderPatterns(
