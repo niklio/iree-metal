@@ -62,10 +62,15 @@ legalization failure), `COOP_ATTN_K2/SMEM/COOPSMEM`. All present-but-non-functio
   `addSPIRVSubgroupReducePassPipeline` for reductions). The real cause is op FORM: the decomposed op
   is a non-canonical `linalg.generic` (batch_matmul_transpose_b, reduction-in-middle iterator
   `[par,par,reduction,par]`) that the upstream linalg vectorizer's contraction path doesn't match.
-  **FIX:** make the decomposed qk/pv ops NAMED/canonical (`linalg.batch_matmul` via generalization,
-  or interchange the reduction to last) BEFORE GenericVectorization, so they vectorize to
-  `vector.contract`. Then the existing coop passes + `FoldContractExtPass` route them to coop.
-  Success metric on the seed repro: `CooperativeMatrixMulAdd` > 0 in SPIR-V (currently 0 / 3128 FMul).
+  **FIX (validated at IR level 2026-07-23):** run `linalg-specialize-generic-ops` on the decomposed
+  ops BEFORE GenericVectorization — it raises the qk/pv generics to named `linalg.matmul` (verified:
+  11 generics → 9 + 2 matmul on the seed pre-GV IR). GOTCHA: `specializeGenericOp` DROPS the coop
+  `lowering_config` (raised ops have 0 config), and `SPIRVTileToCooperativeOps` gates on
+  matmul-*with-config* (.cpp:392). So the fix is a small pass that specializes the qk/pv generics AND
+  copies their `lowering_config` to the new named op (or emit named ops with config directly in
+  `DecomposeAttention`). Add it after `SPIRVTileToCooperativeOps`/before `GenericVectorization`
+  (Passes.cpp:~704). Success metric on the seed repro: `CooperativeMatrixMulAdd` > 0 in SPIR-V
+  (currently 0 / 3128 FMul).
   (Verify `SPIRVTileAndVectorizeToCooperativeOps` single-`rootOp` at .cpp:391 then also handles both
   matmuls; may need generalizing to multiple roots once contracts exist.)
 - **P2 — spirv-cross → MSL coop survival (layer 3).** Only relevant AFTER P1 emits coop SPIR-V:
