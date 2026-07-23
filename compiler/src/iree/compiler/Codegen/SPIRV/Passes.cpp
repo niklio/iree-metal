@@ -844,7 +844,24 @@ void addSPIRVVectorDistributeAttentionPassPipeline(
     // vectorizes them to a coop vector.contract instead of scalar fma.
     funcPassManager.addPass(std::make_unique<SpecializeAttnMatmulPass>());
     funcPassManager.addPass(createSPIRVTileToCooperativeOpsPass());
+    // iree-metal (attention coop-port P1): SPIRVVectorizeToCooperativeOps UNROLLS an
+    // existing vector.contract to the native coop size — it does not vectorize linalg.
+    // The FFN coop pipeline runs GenericVectorization between tile-to-coop and
+    // vectorize-to-coop for exactly this; the DECOMP branch was missing it, so the
+    // named qk/pv matmuls stayed linalg and never got a coop contract. Add it here.
+    {
+      GenericVectorizationPassOptions options;
+      funcPassManager.addPass(createGenericVectorizationPass(options));
+    }
+    funcPassManager.addPass(std::make_unique<FoldContractExtPass>());
     funcPassManager.addPass(createSPIRVVectorizeToCooperativeOpsPass());
+    funcPassManager.addPass(createCanonicalizerPass());
+    funcPassManager.addPass(createCSEPass());
+    // iree-metal (attention coop-port P1): convert the coop-native vector.contract
+    // to gpu.subgroup_mma NOW — the DECOMP path otherwise falls through to
+    // addSPIRVVectorLoweringPasses which SCALARIZES the contract (the FFN coop
+    // pipeline runs this pass for the same reason).
+    funcPassManager.addPass(createSPIRVVectorToGPUSubgroupMMAPass());
     funcPassManager.addPass(createCanonicalizerPass());
     funcPassManager.addPass(createCSEPass());
   }
