@@ -14,6 +14,7 @@
 #include "iree/compiler/Codegen/Utils/LinalgOpInfo.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
+#include "iree/compiler/Dialect/LinalgExt/Utils/IndexingUtils.h"
 #include "iree/compiler/Dialect/TensorExt/IR/TensorExtOps.h"
 #include "iree/compiler/Dialect/Util/IR/UtilTypes.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -466,13 +467,22 @@ static bool tileMatmulK(const int64_t dimK, const int64_t residualTilingFactor,
 }
 
 int64_t getTileBytes(int64_t mTileSize, int64_t nTileSize, int64_t kTileSize,
-                     int64_t elementBits, bool promoteC) {
+                     int64_t elementBits, bool promoteC, int64_t cElementBits) {
+  // The promoted C matrix is the ACCUMULATOR (e.g. f32 for a bf16/f16 matmul),
+  // which is wider than the A/B inputs. Using the input width for C underestimates
+  // the threadgroup memory (by 2x for bf16->f32), letting the config emit a kernel
+  // that over-allocates shared memory and silently HANGS Metal. Account for C's own
+  // width. (nlearn fix.)
+  if (cElementBits == 0)
+    cElementBits = elementBits;
   int64_t paddingBits = detail::bankConflictReductionPaddingBits / elementBits;
-  int64_t count = (mTileSize + nTileSize) * (kTileSize + paddingBits);
+  int64_t bytes =
+      (elementBits / 8) * ((mTileSize + nTileSize) * (kTileSize + paddingBits));
   if (promoteC) {
-    count += mTileSize * (nTileSize + paddingBits);
+    int64_t cPaddingBits = detail::bankConflictReductionPaddingBits / cElementBits;
+    bytes += (cElementBits / 8) * (mTileSize * (nTileSize + cPaddingBits));
   }
-  return (elementBits / 8) * count;
+  return bytes;
 }
 
 int64_t getMultiBufferMemoryUsage(int64_t singleBufferBytes, unsigned depth,
@@ -945,11 +955,25 @@ setCooperativeMatrixConfig(IREE::GPU::TargetAttr target, linalg::LinalgOp op,
     intrinsics.emplace_back(mSize, nSize, kSize, aType, bType, cType, mma);
   }
 
+  // nlearn: numKTilesPerSubgroup tunable (NLEARN_COOP_KT) to probe coop matmul
+  // kernel quality — larger K-tiles do more reduction per workgroup load (fewer
+  // barriers), closing toward jax-metal's hand-tuned MPS matmul.
+  unsigned ktiles = numKTilesPerSubgroup;
+  if (const char *kt = getenv("NLEARN_COOP_KT"))
+    ktiles = std::max(1, atoi(kt));
   GPUMMAHeuristicSeeds seeds{numSubgroupsPerWorkgroup, numMNTilesPerSubgroup,
-                             numKTilesPerSubgroup};
+                             ktiles};
 
   int64_t sharedMemoryLimitInBytes =
       target.getWgp().getMaxWorkgroupMemoryBytes();
+  // nlearn (cont330): under aggressive-fusion a matmul's fused epilogue stages extra
+  // threadgroup memory ON TOP of the coop A/B/C tiles this budget bounds, overflowing
+  // Apple's 32768 cap on the backward dW/dX matmuls (38-54KB) -> Metal mis-executes ->
+  // 34x GNORM. NLEARN_COOP_SMEM_BUDGET lowers the schedule's budget so tiles shrink and
+  // leave headroom for the fused epilogue (test the fix direction: does correctness
+  // return + does the +7% FFN+LN fusion survive).
+  if (const char *b = getenv("NLEARN_COOP_SMEM_BUDGET"))
+    sharedMemoryLimitInBytes = std::min<int64_t>(sharedMemoryLimitInBytes, atoi(b));
 
   // AMD RDNA architectures supports both wave32 and wave64 modes. Prefer to use
   // wave32 mode for better performance.
@@ -962,9 +986,79 @@ setCooperativeMatrixConfig(IREE::GPU::TargetAttr target, linalg::LinalgOp op,
   bool transposedRhs =
       nIndex != cast<AffineDimExpr>(maps[1].getResults().back()).getPosition();
 
+  // nlearn: transposed-operand matmuls (e.g. training gradients dW = xᵀ·dY and
+  // dX = dY·Wᵀ) DO reach the matrix units — deduceMMASchedule handles the
+  // transposed layout, and once the DCE cleanup (dead cloned contracts) +
+  // SPIRVBreakDownLargeVector fallback are in place they vectorize+legalize
+  // correctly. Allowing them roughly DOUBLES training throughput (1.0 -> 1.86
+  // TFLOP/s on gpt2-small fwd+bwd) with the backward grads on coop, and does not
+  // regress inference (still 3.49). Kept as default-on (matching upstream, which
+  // never rejected transposed); opt OUT with NLEARN_COOP_NO_TRANSPOSED only if a
+  // specific transposed shape misbehaves.
+  if ((transposedLhs || transposedRhs) && getenv("NLEARN_COOP_NO_TRANSPOSED")) {
+    return failure();
+  }
+
+  // nlearn: reject coop if the matmul result feeds a LAYOUT-CHANGING or
+  // REDUCING epilogue fused into the same dispatch. The coop store codegen writes
+  // the mma_matrix result straight through the output layout with a plain
+  // parallel-parallel store; if the consumer transposes (e.g. training backward
+  // dW = xᵀ·dY, identity-in/transposed-out maps) OR reduces (e.g. attention
+  // q@kᵀ feeding the softmax max/sum reduction), VectorToGPU converts only part
+  // of the K-loop and leaves illegal coop-native vectors (vector<16x16xf32> /
+  // vector<16xf32>) that fail SPIR-V legalization and kill the WHOLE module
+  // compile. Routing these to the scalar pipeline compiles cleanly (it has the
+  // full vector-breakdown passes). A CLEAN elementwise epilogue (truncf/gelu,
+  // identity maps, all-parallel) is fine and stays on coop. Opt out with
+  // NLEARN_COOP_ALLOW_TRANSPOSE_EPILOGUE.
+  if (!getenv("NLEARN_COOP_ALLOW_TRANSPOSE_EPILOGUE")) {
+    Value mmResult = op.getOperation()->getResult(0);
+    for (Operation *user : mmResult.getUsers()) {
+      auto genericOp = dyn_cast<linalg::GenericOp>(user);
+      if (!genericOp || genericOp.getNumDpsInits() != 1)
+        continue;
+      // A consumer with any reduction iterator (softmax/norm) can't be a coop
+      // store epilogue.
+      if (genericOp.getNumReductionLoops() != 0)
+        return failure();
+      AffineMap outMap =
+          genericOp.getMatchingIndexingMap(genericOp.getDpsInitOperand(0));
+      for (OpOperand *in : genericOp.getDpsInputOperands()) {
+        if (in->get() != mmResult)
+          continue;
+        AffineMap inMap = genericOp.getMatchingIndexingMap(in);
+        // Different in/out maps on the matmul result => a transpose (or other
+        // layout-changing) epilogue. Coop can't store through it.
+        if (inMap != outMap)
+          return failure();
+      }
+    }
+  }
+
   FailureOr<GPUMMASchedule> schedule = deduceMMASchedule(
       problem, intrinsics, seeds, sharedMemoryLimitInBytes, subgroupSize,
-      /*cuCount=*/std::nullopt, op.getLoc(), transposedLhs, transposedRhs);
+      /*cuCount=*/std::nullopt, op.getLoc(), transposedLhs, transposedRhs,
+      // nlearn: canUpcastAcc lets a bf16-OUTPUT matmul match the f32-acc bf16 MMA.
+      // But the RaiseContractionAccumulatorToF32 pass already makes the target
+      // matmuls f32-OUTPUT (exact coop match, no upcast needed). canUpcastAcc only
+      // affects the bf16-OUTPUT matmuls the pass DIDN'T promote (attention +
+      // transposed backward forms), which FAIL coop vectorization. So keep it OFF
+      // by default (separate env) — promoted matmuls still get matrix units via
+      // exact match; the failing bf16-output ones cleanly fall to scalar.
+      /*canUpcastAcc=*/getenv("NLEARN_COOP_UPCAST_ACC") != nullptr &&
+          dimM >= 128 && dimN >= 128 && dimK >= 128,
+      /*useDirectLoad=*/false, /*prefetchNumStages=*/0,
+      // nlearn: mustBeAligned=true (default) rejects non-mult-16 M/N/K from coop
+      // (e.g. vit M=B*T=4616 -> scalar, 0.31 TFLOP/s vs jax-metal 2.51). Allow
+      // UNALIGNED coop (the codegen pads/masks the boundary tiles) so odd-sized
+      // models still hit the matrix units. Env-gated NLEARN_COOP_UNALIGNED until
+      // validated numerically on the Metal path.
+      /*mustBeAligned=*/getenv("NLEARN_COOP_UNALIGNED") == nullptr);
+  if (getenv("NLEARN_COOP_DEBUG")) {
+    llvm::errs() << "[coop] MxNxK=" << dimM << "x" << dimN << "x" << dimK
+                 << " lhs=" << lhsElem << " " << (failed(schedule) ? "SCALAR" : "COOP")
+                 << "\n";
+  }
   if (failed(schedule)) {
     return failure();
   }
@@ -1026,12 +1120,36 @@ setCooperativeMatrixConfig(IREE::GPU::TargetAttr target, linalg::LinalgOp op,
   auto usedBytes =
       getTileBytes(workgroupTileSizes[mIndex], workgroupTileSizes[nIndex],
                    reductionTileSizes[kIndex],
-                   IREE::Util::getTypeBitWidth(getElementType(lhs)), promoteC);
+                   IREE::Util::getTypeBitWidth(getElementType(lhs)), promoteC,
+                   /*cElementBits=*/IREE::Util::getTypeBitWidth(
+                       getElementType(init)));
 
   while (pipelineDepth > 0 &&
          getMultiBufferMemoryUsage(usedBytes, pipelineDepth, storeStage) >
              maxBytes) {
     pipelineDepth--;
+  }
+
+  if (getenv("NLEARN_COOP_MEM_DEBUG")) {
+    llvm::errs() << "[coop-mem] MxNxK=" << dimM << "x" << dimN << "x" << dimK
+                 << " wgTile M/N=" << workgroupTileSizes[mIndex] << "/"
+                 << workgroupTileSizes[nIndex]
+                 << " redK=" << reductionTileSizes[kIndex]
+                 << " promoteC=" << promoteC << " pd=" << pipelineDepth
+                 << " usedBytes=" << usedBytes << " multiBuf="
+                 << getMultiBufferMemoryUsage(usedBytes, pipelineDepth, storeStage)
+                 << " max=" << maxBytes << "\n";
+  }
+
+  // nlearn: even at minimum pipeline depth the tile may exceed the target's
+  // threadgroup-memory limit (getTileBytes only reflects the base tiles; the
+  // pipeline-depth loop above can't shrink the tile itself). Emitting such a
+  // kernel makes Metal SILENTLY HANG at runtime (52KB requested vs 32KB limit —
+  // the HAL wedge). Refuse the coop config here so this op falls back to the
+  // scalar/vector pipeline instead of generating an over-allocating kernel.
+  if (getMultiBufferMemoryUsage(usedBytes, pipelineDepth, storeStage) >
+      maxBytes) {
+    return failure();
   }
 
   return setOpConfigAndEntryPointFnTranslation(
@@ -1046,6 +1164,157 @@ setCooperativeMatrixConfig(IREE::GPU::TargetAttr target, linalg::LinalgOp op,
 //===----------------------------------------------------------------------===//
 // FFT Default Configuration
 //===----------------------------------------------------------------------===//
+
+// nlearn: flash-attention config. Routes iree_linalg_ext.attention to the
+// SPIRVVectorDistributeAttention pipeline (decompose online-attention within
+// codegen -> per-tile matmul+softmax -> vectorize). First increment: distribute
+// the leading parallel dims (batch + query-M) one-per-workgroup and let the
+// reduction (scores/K2) tile via the pipeline's GPUApplyTilingLevel. Tile sizes
+// are intentionally simple; perf tuning (coop routing) is a follow-up.
+static LogicalResult setAttentionOpConfig(IREE::GPU::TargetAttr target,
+                                          IREE::LinalgExt::AttentionOp op) {
+  LLVM_DEBUG(llvm::dbgs() << "trying to deduce config as attention...\n");
+  // nlearn: the SPIRVVectorDistributeAttention pipeline + this config are DORMANT
+  // scaffolding. Routing attention to it hangs codegen: the decomposed per-tile
+  // matmuls need proper tile configs, and the only machinery that produces them
+  // (LLVMGPU vector-distribute: ConfigureTensorLayouts + PackToIntrinsics + vector
+  // distribution) is deeply LLVMGPU/LLVM-coupled with no SPIR-V/coop equivalent —
+  // a major codegen port, not a wiring job. Until that's built, return failure so
+  // attention ops don't route to the (non-functional) pipeline. Opt in for
+  // development with NLEARN_COOP_ATTENTION_WIP.
+  if (!getenv("NLEARN_COOP_ATTENTION_WIP")) {
+    return failure();
+  }
+  int subgroupSize = target.getPreferredSubgroupSize();
+  auto pipeline = CodeGenPipeline::SPIRVVectorDistributeAttention;
+
+  FailureOr<SmallVector<int64_t>> maybeBounds = op.getStaticLoopRanges();
+  if (failed(maybeBounds) || maybeBounds->size() < 2 ||
+      llvm::any_of(*maybeBounds, ShapedType::isDynamic)) {
+    return failure();
+  }
+  ArrayRef<int64_t> bounds = *maybeBounds;
+
+  // nlearn: classify the attention iteration dims (batch, M=query, K1=qk-dim,
+  // K2=kv-seq, N=value-dim) so we can build a proper iree_gpu.lowering_config
+  // with named tiling levels. The earlier scaffold set a generic
+  // Codegen::LoweringConfig with only a flat workgroup list — but
+  // GPUApplyTilingLevel(Reduction) reads hasTilingLevel(Reduction) off an
+  // IREE::GPU::LoweringConfigAttr, so with the generic config it was a NO-OP:
+  // the kv-reduction never tiled, each workgroup materialized the FULL [M,K2]
+  // scores, and SPIRVVectorLowering HUNG unrolling 256-wide vectors. Here we
+  // (a) workgroup-tile batch+query-M and (b) reduction-tile the kv-seq (K2), so
+  // the flash scf.for loop forms and the decomposed per-tile matmul/softmax ops
+  // stay small (first increment: COMPILE without hanging; coop routing of the
+  // per-tile matmuls is the perf follow-up).
+  auto opInfo = IREE::LinalgExt::AttentionOpDetail::get(
+      op.getQueryMap(), op.getKeyMap(), op.getValueMap(), op.getOutputMap());
+  if (failed(opInfo)) {
+    return failure();
+  }
+  int64_t rank = opInfo->getDomainRank();
+  if (opInfo->getMDims().empty() || opInfo->getK2Dims().empty()) {
+    return failure();
+  }
+  SmallVector<int64_t> workgroupTileSizes(rank, 0);
+  SmallVector<int64_t> reductionTileSizes(rank, 0);
+  for (int64_t d : opInfo->getBatchDims())
+    workgroupTileSizes[d] = 1;
+  for (int64_t d : llvm::drop_end(opInfo->getMDims()))
+    workgroupTileSizes[d] = 1;
+  int64_t mDim = opInfo->getMDims().back();
+  // nlearn first-increment: tile query-M to a small block. Without thread-level
+  // distribution (the LLVMGPU vector-distribute step this SPIRV pipeline lacks),
+  // the per-workgroup tile is fully UNROLLED to vector<4> ops, so a large M-tile
+  // (e.g. 32) explodes code size (~1.2M ops -> effectively hangs). Keep M small
+  // until proper thread/subgroup distribution is added (perf follow-up).
+  int64_t mBlock = std::min<int64_t>(bounds[mDim], getenv("NLEARN_COOP_ATTN_M")
+                                                       ? atoi(getenv("NLEARN_COOP_ATTN_M"))
+                                                       : 1);
+  workgroupTileSizes[mDim] = mBlock;
+  for (int64_t d : llvm::drop_end(opInfo->getK2Dims()))
+    reductionTileSizes[d] = 1;
+  int64_t k2Dim = opInfo->getK2Dims().back();
+  reductionTileSizes[k2Dim] = std::min<int64_t>(
+      bounds[k2Dim],
+      getenv("NLEARN_COOP_ATTN_K2") ? atoi(getenv("NLEARN_COOP_ATTN_K2")) : 32);
+
+  Builder b(op.getContext());
+  SmallVector<NamedAttribute, 3> attrs = {
+      b.getNamedAttr("workgroup", b.getI64ArrayAttr(workgroupTileSizes)),
+      b.getNamedAttr("reduction", b.getI64ArrayAttr(reductionTileSizes))};
+  // nlearn (NLEARN_COOP_ATTN_THREAD): distribute the query-M block across the
+  // subgroup's threads (each thread does ONE query's full attention: scalar
+  // qk/softmax/pv). This makes a workgroup process mBlock queries in PARALLEL
+  // instead of 1 (fixing the M=1 32x-redundancy) and keeps per-thread code small
+  // (fixing the M=32 unroll explosion) — WITHOUT the coop-layout/softmax
+  // thread-distribution interface that walls the coop path. No matrix units, but
+  // full occupancy.
+  if (getenv("NLEARN_COOP_ATTN_THREAD")) {
+    SmallVector<int64_t> threadTileSizes(rank, 0);
+    threadTileSizes[mDim] = 1; // one query per thread
+    attrs.push_back(
+        b.getNamedAttr("thread", b.getI64ArrayAttr(threadTileSizes)));
+  }
+  auto configDict = DictionaryAttr::get(op.getContext(), attrs);
+  auto loweringConfig =
+      IREE::GPU::LoweringConfigAttr::get(op.getContext(), configDict);
+
+  // nlearn (NLEARN_COOP_ATTN_DECOMP): attach SPIR-V coop lowering_configs to the
+  // decomposed qk/pv matmuls via decomposition_config, so the coop passes
+  // (SPIRVTileToCooperativeOps + SPIRVVectorizeToCooperativeOps, wired into the
+  // attention pipeline under the same env) route them onto the matrix units
+  // instead of generic vectorization. qk loops = [batch, M, K1(reduction), K2]
+  // (coop M=M, N=K2, K=K1); pv loops = [batch, M, K2(reduction), N] (coop M=M,
+  // N=N, K=K2). Levels: L0 workgroup (already attention-tiled), L1 subgroup,
+  // L2 reduction, L3 native/coop shape (16x16x16). Perf follow-up to the
+  // correct-but-slow M=1 path; must run with NLEARN_COOP_ATTN_M>=16.
+  if (getenv("NLEARN_COOP_ATTN_DECOMP") || getenv("NLEARN_COOP_ATTN_SMEM") ||
+      getenv("NLEARN_COOP_ATTN_COOPSMEM")) {
+    auto mk = [&](TileSizesListType t) {
+      return IREE::Codegen::LoweringConfigAttr::get(op.getContext(), t);
+    };
+    // L0 workgroup + L1 subgroup must be NON-ZERO on the parallel dims or
+    // deduceSubgroupCounts (SPIRVTileAndVectorizeToCooperativeOps.cpp:107) computes
+    // workgroupTile/subgroupTile = 0/16 = 0 subgroups -> affine.delinearize_index
+    // non-positive-basis error (cont78g). Set L0==L1 = the full per-workgroup op
+    // size so subgroupCount=1 (matches the attention workgroupSize={subgroupSize,1,1});
+    // the L3 native 16x16x16 tile makes the single subgroup loop coop tiles.
+    // qk loops [batch, M, K1(reduction), K2]; pv loops [batch, M, K2(reduction), N].
+    // GENERALIZED off the op's real dims (cont80): mBlock (query tile), k2Tile (kv
+    // reduction tile), k1Size (qk reduction = head dim), nSize (pv N = value dim).
+    int64_t k2Tile = reductionTileSizes[k2Dim];
+    int64_t k1Size = opInfo->getK1Dims().empty()
+                         ? 16
+                         : bounds[opInfo->getK1Dims().back()];
+    int64_t nSize = opInfo->getNDims().empty()
+                        ? 16
+                        : bounds[opInfo->getNDims().back()];
+    auto redTile = [](int64_t d) { return d >= 16 ? int64_t(16) : d; };
+    TileSizesListType qkT = {{0, mBlock, 0, k2Tile},
+                             {0, mBlock, 0, k2Tile},
+                             {0, 0, redTile(k1Size), 0},
+                             {1, 16, 16, 16}};
+    TileSizesListType pvT = {{0, mBlock, 0, nSize},
+                             {0, mBlock, 0, nSize},
+                             {0, 0, redTile(k2Tile), 0},
+                             {1, 16, 16, 16}};
+    auto qkAttrs = DictionaryAttr::get(
+        op.getContext(), {b.getNamedAttr("lowering_config", mk(qkT))});
+    auto pvAttrs = DictionaryAttr::get(
+        op.getContext(), {b.getNamedAttr("lowering_config", mk(pvT))});
+    auto decomp = DictionaryAttr::get(
+        op.getContext(),
+        {b.getNamedAttr(IREE::LinalgExt::AttentionOp::getQKAttrStr(), qkAttrs),
+         b.getNamedAttr(IREE::LinalgExt::AttentionOp::getPVAttrStr(), pvAttrs)});
+    op.setDecompositionConfigAttr(decomp);
+  }
+
+  std::array<int64_t, 3> workgroupSize = {subgroupSize, 1, 1};
+  return setOpConfigAndEntryPointFnTranslation(
+      op->getParentOfType<mlir::FunctionOpInterface>(), op, loweringConfig,
+      pipeline, workgroupSize, subgroupSize);
+}
 
 static LogicalResult setFftOpConfig(IREE::GPU::TargetAttr target,
                                     IREE::LinalgExt::FftOp op) {
@@ -1077,6 +1346,58 @@ static LogicalResult setFftOpConfig(IREE::GPU::TargetAttr target,
     }
   }
   TileSizesListType tileSizes = {workgroupTileSize};
+  return setOpConfigAndEntryPointFnTranslation(
+      op->getParentOfType<mlir::FunctionOpInterface>(), op, tileSizes, pipeline,
+      workgroupSize);
+}
+
+//===----------------------------------------------------------------------===//
+// Scatter Default Configuration
+//===----------------------------------------------------------------------===//
+
+// nlearn: scatter config. By default a scatter whose leading (batch/index) loop
+// is a reduction (non-unique indices, e.g. embedding-gradient scatter-add) gets
+// NO partitionable loops -> SPIRVBaseDistribute with workgroup_size [1,1,1] =
+// ONE thread does the whole scatter (measured 27x slower than jax-metal). But
+// the update-vector (D) loops ARE parallel: distribute them to threads, keeping
+// the reduction batch loop untiled/serial inside each thread. Each thread then
+// owns distinct output COLUMNS, so scatter-add into overlapping rows has no
+// cross-thread race (no atomics needed). Restores parallelism.
+static LogicalResult setScatterOpConfig(IREE::GPU::TargetAttr target,
+                                        IREE::LinalgExt::ScatterOp op) {
+  int subgroupSize = target.getPreferredSubgroupSize();
+  auto pipeline = CodeGenPipeline::SPIRVBaseDistribute;
+  std::array<int64_t, 3> workgroupSize = {subgroupSize, 1, 1};
+
+  SmallVector<utils::IteratorType> its = op.getLoopIteratorTypes();
+  unsigned depth = its.size();
+  SmallVector<int64_t> wgTile(depth, 0), threadTile(depth, 0);
+  int lastParallel = -1;
+  // nlearn (NLEARN_SCATTER_ATOMIC): a non-unique-index scatter marks its batch dims as REDUCTION, so
+  // by default only the window dim is distributed and the (large) update batch runs serially in ~1
+  // workgroup — the ~10x-slow embedding-backward. When the scatter-add is lowered to atomic_rmw (see
+  // ScatterOp::generateScalarImplementation), duplicate indices are safe, so the batch IS parallel:
+  // tile those reduction dims into a workgroup grid too.
+  bool atomicParallel = getenv("NLEARN_SCATTER_ATOMIC") != nullptr;
+  for (auto [i, it] : llvm::enumerate(its)) {
+    if (it == utils::IteratorType::parallel) {
+      wgTile[i] = 1;
+      threadTile[i] = 1;
+      lastParallel = i;
+    } else if (atomicParallel) {
+      wgTile[i] = 1; // atomic scatter-add -> batch dim is safe to distribute across workgroups
+      threadTile[i] = 1;
+    }
+  }
+  if (lastParallel < 0) { // no parallel loop -> keep serial [1,1,1] (old default)
+    return setOpConfigAndEntryPointFnTranslation(
+        op->getParentOfType<mlir::FunctionOpInterface>(), op, TileSizesListType{},
+        pipeline, std::array<int64_t, 3>{1, 1, 1});
+  }
+  // Distribute the innermost parallel loop across the subgroup's threads.
+  wgTile[lastParallel] = subgroupSize;
+  threadTile[lastParallel] = 1;
+  TileSizesListType tileSizes = {wgTile, threadTile};
   return setOpConfigAndEntryPointFnTranslation(
       op->getParentOfType<mlir::FunctionOpInterface>(), op, tileSizes, pipeline,
       workgroupSize);
@@ -1353,7 +1674,32 @@ static LogicalResult setReductionConfig(IREE::GPU::TargetAttr target,
     reductionSize *= bounds[dim];
   }
   if (reductionSize % subgroupSize != 0) {
-    return failure();
+    // NLEARN_COOP_REDUCE_NONMULT (default ON): a STATIC reduction whose size isn't
+    // a multiple of the subgroup (e.g. softmax over seq=577) would otherwise bail to
+    // the scalar default config — which is BOTH 16.6x slower AND (validated vs CPU)
+    // computes WRONG gradients on the softmax backward (vit grad-norm was 43% off).
+    // The subgroup-reduce pipeline already handles arbitrary sizes with a masked
+    // remainder (the dynamic-reduction path above), so use it here too: correct +
+    // fast. Opt out with NLEARN_COOP_NO_REDUCE_NONMULT.
+    if (getenv("NLEARN_COOP_NO_REDUCE_NONMULT")) {
+      return failure();
+    }
+    SmallVector<int64_t> reductionTileSizes(op.getNumLoops(), 0);
+    reductionTileSizes[reductionDims[0]] = subgroupSize;
+    TileSizesListType tileSizes;
+    tileSizes.emplace_back(std::move(workgroupTileSizes)); // Workgroup level
+    tileSizes.emplace_back(std::move(reductionTileSizes)); // Reduction level
+    std::array<int64_t, 3> workgroupSize = {subgroupSize, 1, 1};
+    if (failed(setOpConfigAndEntryPointFnTranslation(
+            op->getParentOfType<mlir::FunctionOpInterface>(), op, tileSizes,
+            CodeGenPipeline::SPIRVSubgroupReduce, workgroupSize))) {
+      return failure();
+    }
+    op->getParentOfType<FunctionOpInterface>().walk([&](linalg::LinalgOp op2) {
+      setLoweringConfig(op2, IREE::Codegen::LoweringConfigAttr::get(
+                                 op2.getContext(), tileSizes));
+    });
+    return success();
   }
 
   const Type elementType =
@@ -1402,9 +1748,14 @@ static LogicalResult setReductionConfig(IREE::GPU::TargetAttr target,
   }
   // Total parallel size that can fill the GPU with enough workgorups.
   // TODO: query from the target device; roughly 2x hardware compute unit.
+  // nlearn: env-tunable (NLEARN_RED_PT) to probe reduction occupancy on Apple —
+  // the default 256 (NVIDIA-era) may under/over-subscribe Apple's ~10-20 cores.
   int parallelThreshold = 256;
-  // How many 128-bit vectors each thread should at least read.
-  const int targetVectorCount = 8;
+  if (const char *v = getenv("NLEARN_RED_PT")) parallelThreshold = atoi(v);
+  // How many 128-bit vectors each thread should at least read (NLEARN_RED_VC):
+  // more work/thread => fewer subgroups => less reduction-tree overhead.
+  int targetVectorCount = 8;
+  if (const char *v = getenv("NLEARN_RED_VC")) targetVectorCount = atoi(v);
   while (parallelSize > parallelThreshold &&
          (groupSize / 2) % subgroupSize == 0 &&
          reductionSize / (groupSize * vectorSize) < targetVectorCount) {
@@ -1609,13 +1960,23 @@ static LogicalResult setDefaultOpConfig(IREE::GPU::TargetAttr target,
       for (int64_t candidate : candidates) {
         int64_t scaledTileSize = candidate * scaleToByte;
         if (loopBound % scaledTileSize != 0) {
-          if (!lossFactor) {
-            continue;
-          }
-          // Skip this candidate if it causes many threads to be idle.
-          int64_t idleThreads = candidate - (loopBound % scaledTileSize);
-          if (idleThreads > candidate / *lossFactor) {
-            continue;
+          // NLEARN_COOP_VEC_NONMULT (opt-in): for a non-divisible INNERMOST dim
+          // (e.g. transpose/elementwise over a prime seq=577), the divisibility
+          // gate otherwise rejects every vectorizable tile and falls to tile-1
+          // (scalar) — measured ~2.7x slower. Accept the vectorizable candidate
+          // (4*numThreads, %4==0) anyway and let IREE tile-with-remainder +
+          // vectorize the main body. Gated + correctness-validated before default.
+          bool forceVec = !getenv("NLEARN_COOP_NO_VEC_NONMULT") && vectorizable &&
+                          wgDim == 0 && !lossFactor && candidate % 4 == 0;
+          if (!forceVec) {
+            if (!lossFactor) {
+              continue;
+            }
+            // Skip this candidate if it causes many threads to be idle.
+            int64_t idleThreads = candidate - (loopBound % scaledTileSize);
+            if (idleThreads > candidate / *lossFactor) {
+              continue;
+            }
           }
         }
         // If the workload is too small and we cannot distribute to more than 2
@@ -1714,6 +2075,28 @@ static LogicalResult setDefaultOpConfig(IREE::GPU::TargetAttr target,
 
 /// Sets the CodeGen configuration as attributes to the given `rootOp` if it's a
 /// known Linalg matmul/convolution op with good configurations.
+// nlearn: does the dispatch emit a TRANSPOSED parallel output — a linalg op whose init
+// indexing map is a permutation but not the identity (e.g. a fused weight-grad store [N,M]
+// alongside an [M,N] reduction)? The SPIRVSubgroupReduce pipeline mis-distributes such a
+// transpose write under the reduction tiling, so a reduction dispatch that also transposes
+// must NOT take the subgroup-reduce path (see the fused LayerNorm-backward over/under-count
+// root-caused 2026-07-17). A projected-permutation reduction output like (d0,d1)->(d0) is NOT
+// flagged (results < dims => not a full permutation), so ordinary reductions keep the fast path.
+static bool dispatchHasTransposeOutput(mlir::FunctionOpInterface funcOp) {
+  bool hasTranspose = false;
+  funcOp.walk([&](linalg::LinalgOp linalgOp) {
+    for (OpOperand &init : linalgOp.getDpsInitsMutable()) {
+      AffineMap m = linalgOp.getMatchingIndexingMap(&init);
+      if (m.isPermutation() && !m.isIdentity()) {
+        hasTranspose = true;
+        return WalkResult::interrupt();
+      }
+    }
+    return WalkResult::advance();
+  });
+  return hasTranspose;
+}
+
 static LogicalResult setSPIRVOpConfig(IREE::GPU::TargetAttr target,
                                       mlir::FunctionOpInterface entryPointFn,
                                       Operation *rootOp) {
@@ -1776,7 +2159,15 @@ static LogicalResult setSPIRVOpConfig(IREE::GPU::TargetAttr target,
         LLVM_DEBUG(llvm::dbgs()
                    << "failed to set matmul op config, trying reduction\n");
 
-        if (succeeded(setReductionConfig(target, op))) {
+        // nlearn: NLEARN_REDUCE_SKIP_TRANSPOSE = experiment (REJECTED, kept opt-in): skip the
+        // subgroup-reduce pipeline for a dispatch that also emits a transposed parallel output.
+        // The intent was to dodge the fused-LN-backward reduction+transpose mis-tile, but the
+        // fallback (default distribute pipeline) overflows Metal stack on the 4096x768 reduction
+        // ("Compute function exceeds available stack space"). Neither pipeline handles reduction
+        // +transpose co-located -> the real fix is at dispatch FORMATION (don't co-locate them).
+        if (!(getenv("NLEARN_REDUCE_SKIP_TRANSPOSE") &&
+              dispatchHasTransposeOutput(entryPointFn)) &&
+            succeeded(setReductionConfig(target, op))) {
           return success();
         }
         LLVM_DEBUG(llvm::dbgs() << "failed to set reduction op config");
@@ -1794,6 +2185,12 @@ static LogicalResult setSPIRVOpConfig(IREE::GPU::TargetAttr target,
       })
       .Case([target](IREE::LinalgExt::FftOp op) {
         return setFftOpConfig(target, op);
+      })
+      .Case([target](IREE::LinalgExt::ScatterOp op) {
+        return setScatterOpConfig(target, op);
+      })
+      .Case([target](IREE::LinalgExt::AttentionOp op) {
+        return setAttentionOpConfig(target, op);
       })
       .Case<IREE::LinalgExt::WinogradInputTransformOp,
             IREE::LinalgExt::WinogradOutputTransformOp>(

@@ -1707,6 +1707,44 @@ struct CustomCallIsTopK final
   }
 };
 
+// nlearn: handle the `@mhlo.topk` custom_call form of top-k. Unlike the `@TopK`
+// form above (which carries a comparison sub-computation), mhlo.topk carries `k`
+// in an `mhlo.attributes` dict and is always DESCENDING top-k (largest values).
+// jax 0.6.1 lowers jax.lax.top_k to this form, which IREE otherwise fails to
+// legalize ("failed to legalize operation 'stablehlo.custom_call'" — hit on MoE
+// top-k routing). Convert it to chlo.top_k (which lowers correctly), taking k
+// from the result's last dimension.
+struct MhloTopKCustomCall final
+    : OpRewritePattern<mlir::stablehlo::CustomCallOp> {
+  using Base::Base;
+
+  LogicalResult matchAndRewrite(mlir::stablehlo::CustomCallOp op,
+                                PatternRewriter &rewriter) const override {
+    if (op.getCallTargetName() != "mhlo.topk") {
+      return rewriter.notifyMatchFailure(op, "not a mhlo.topk custom call");
+    }
+    if (op.getNumOperands() != 1 || op.getNumResults() != 2) {
+      return rewriter.notifyMatchFailure(op, "expected 1 operand, 2 results");
+    }
+    auto operand = op.getOperand(0);
+    auto operandTy = dyn_cast<ShapedType>(operand.getType());
+    auto topVTy = dyn_cast<ShapedType>(op.getType(0));
+    auto topITy = dyn_cast<ShapedType>(op.getType(1));
+    if (!operandTy || !operandTy.hasRank() || operandTy.getRank() != 2 ||
+        !topVTy || !topITy) {
+      return rewriter.notifyMatchFailure(op, "unsupported types / rank");
+    }
+    int64_t k = topVTy.getDimSize(1);
+    if (ShapedType::isDynamic(k)) {
+      return rewriter.notifyMatchFailure(op, "dynamic top-k k value");
+    }
+    auto newTopK = chlo::TopKOp::create(rewriter, op.getLoc(),
+                                        TypeRange{topVTy, topITy}, operand, k);
+    rewriter.replaceOp(op, newTopK.getResults());
+    return success();
+  }
+};
+
 // Recursive helper function that identifies an Iota followed by a set of
 // broadcasts where the last dimension of the iota is preserved throughout.
 bool isIotaOrIotaBroadcast(PatternRewriter &rewriter, Value input) {
@@ -1904,6 +1942,32 @@ struct ApproxTopK final : OpRewritePattern<mlir::stablehlo::CustomCallOp> {
   }
 };
 
+// nlearn: strip the optional `algorithm` (#stablehlo.dot_algorithm) attribute
+// from stablehlo.dot_general. jax.nn.dot_product_attention (and any precision-
+// annotated matmul, e.g. jax.lax.dot with a DotAlgorithmPreset) emits
+// dot_general carrying a #stablehlo.dot_algorithm attr (typically
+// bf16xbf16->f32-accumulate). The upstream stablehlo-legalize-to-linalg pass
+// marks dot_general-with-algorithm as ILLEGAL and has no lowering for it, so the
+// WHOLE module fails to compile ("failed to legalize operation
+// 'stablehlo.dot_general'"). The algorithm is only a numeric-precision hint and
+// the operand/result element types already encode bf16-in/f32-accumulate (which
+// is exactly what our coop matrix-unit path does), so dropping the attr is
+// semantics-preserving for this backend and unblocks the compile. This is the
+// prerequisite for modern jax attention (jax.nn.dot_product_attention) to run.
+struct DropDotAlgorithm final
+    : OpRewritePattern<mlir::stablehlo::DotGeneralOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(mlir::stablehlo::DotGeneralOp op,
+                                PatternRewriter &rewriter) const override {
+    if (!op.getAlgorithmAttr()) {
+      return rewriter.notifyMatchFailure(op, "no dot_algorithm attr");
+    }
+    rewriter.modifyOpInPlace(
+        op, [&]() { op->removeAttr(op.getAlgorithmAttrName()); });
+    return success();
+  }
+};
+
 struct StableHLOToStableHLOPreprocessing final
     : impl::StableHLOToStableHLOPreprocessingBase<
           StableHLOToStableHLOPreprocessing> {
@@ -1952,6 +2016,11 @@ struct StableHLOToStableHLOPreprocessing final
                     ScatterImplicitBatch, ScatterMaterializeInsertedDim,
                     ScatterCollapseBatch, ScatterBatchFirst>(context);
 
+    // nlearn: strip #stablehlo.dot_algorithm before any dot_general lowering so
+    // jax.nn.dot_product_attention / precision-annotated matmuls don't fail
+    // legalization. High benefit so it fires ahead of the dot rewrites.
+    patterns.insert<DropDotAlgorithm>(context, /*benefit=*/500);
+
     // dot_general canonicalization patterns.
     populatePreprocessingDotGeneralToDotPatterns(context, &patterns);
 
@@ -1971,6 +2040,8 @@ struct StableHLOToStableHLOPreprocessing final
 
     // Identify known custom calls and convert them to equivalent StableHLO.
     patterns.insert<CustomCallIsTopK>(context);
+    // nlearn: also handle jax/mhlo's @mhlo.topk custom_call form (jax.lax.top_k).
+    patterns.insert<MhloTopKCustomCall>(context);
 
     // Identify an iota->sort->slice pattern that maps to TopK.
     patterns.insert<IotaSortSliceIsTopK, ApproxTopK>(context);

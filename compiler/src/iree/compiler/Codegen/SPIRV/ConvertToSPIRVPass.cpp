@@ -684,6 +684,30 @@ void ConvertToSPIRVPass::runOnOperation() {
 
   SPIRVTypeConverter typeConverter(targetAttr, options);
 
+  // nlearn: the SPIRVTypeConverter converts scalar `index` (via the index
+  // bitwidth) but does NOT substitute `index` when it appears as a MEMREF
+  // ELEMENT type, so an `index`-element workgroup allocation
+  // (memref<Nxindex, #spirv.storage_class<Workgroup>>) fails to legalize
+  // ("failed to legalize operation 'memref.alloc'"). This shows up when a
+  // linalg.index-based epilogue (e.g. the causal mask recomputed in the
+  // jax.nn.dot_product_attention BACKWARD) gets promoted to shared memory.
+  // Rebuild such memrefs with the concrete index-integer type and delegate to
+  // the existing memref conversion; loads/stores stay consistent because scalar
+  // index is converted to the same integer width everywhere. Registered after
+  // construction so it runs before the built-in memref conversion.
+  {
+    unsigned idxBits = use64bitIndex ? 64 : 32;
+    typeConverter.addConversion(
+        [&typeConverter, idxBits](MemRefType type) -> std::optional<Type> {
+          if (!type.getElementType().isIndex())
+            return std::nullopt; // let the default memref conversion handle it
+          auto intTy = IntegerType::get(type.getContext(), idxBits);
+          auto newType = MemRefType::get(type.getShape(), intTy,
+                                         type.getLayout(), type.getMemorySpace());
+          return typeConverter.convertType(newType);
+        });
+  }
+
   // Additionally pull in conversion rules for GPU subgroup MMA ops.
   populateMMAToSPIRVCoopMatrixTypeConversion(typeConverter);
   RewritePatternSet patterns(&getContext());

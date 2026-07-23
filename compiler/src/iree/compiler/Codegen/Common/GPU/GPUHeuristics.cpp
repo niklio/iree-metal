@@ -265,7 +265,15 @@ static LogicalResult canTargetIntrinsic(const GPUMatmulShapeType &problem,
          intrinsic.kSizes.size() <= 2 &&
          "expected intrinsic to have a single M, N, and K <= 2 dimensions");
   if (problem.aType != intrinsic.aType || problem.bType != intrinsic.bType) {
-    return failure(); // Cannot use this intrinsic for mismatched types
+    // nlearn EXPERIMENT (env-gated): allow a wider-float problem to DOWNCAST into a narrower-float
+    // MMA intrinsic (f32 inputs -> bf16 matrix units, truncated in-register) — tests whether the coop
+    // lowering auto-inserts the truncf or miscompiles. Off by default (normal exact-match behaviour).
+    bool aDown = isa<FloatType>(problem.aType) && isa<FloatType>(intrinsic.aType) &&
+                 problem.aType.getIntOrFloatBitWidth() > intrinsic.aType.getIntOrFloatBitWidth();
+    bool bDown = isa<FloatType>(problem.bType) && isa<FloatType>(intrinsic.bType) &&
+                 problem.bType.getIntOrFloatBitWidth() > intrinsic.bType.getIntOrFloatBitWidth();
+    if (!(getenv("NLEARN_COOP_DOWNCAST") && aDown && bDown))
+      return failure(); // Cannot use this intrinsic for mismatched types
   }
   if (problem.cType != intrinsic.cType) {
     bool isFpCase =

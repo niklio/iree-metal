@@ -82,6 +82,26 @@ tileToInvocation(mlir::FunctionOpInterface funcOp,
 
 static const char promoteBothMarker[] = "promote_lhs_and_rhs";
 
+// nlearn: targeted A/B threadgroup-staging for the coop path. Compute the bytes a matmul's A+B tiles
+// would occupy in threadgroup memory (operands are already workgroup+reduction tiled at this point).
+// Small tiles (all real matmul shapes incl. large-K backward weight-grads) get staged -> K-loop reuse
+// -> ~2x on large-K; big/fused tiles that would over-allocate past Metal's 32KB cap stay device-loaded
+// (the HAL-wedge fix). Returns -1 if shapes are dynamic (be conservative -> skip staging).
+static int64_t coopPromoteABBytes(linalg::LinalgOp op) {
+  auto aTy = dyn_cast<ShapedType>(op.getDpsInputOperand(0)->get().getType());
+  auto bTy = dyn_cast<ShapedType>(op.getDpsInputOperand(1)->get().getType());
+  if (!aTy || !bTy || !aTy.hasStaticShape() || !bTy.hasStaticShape())
+    return -1;
+  int64_t aElems = 1, bElems = 1;
+  for (int64_t d : aTy.getShape()) aElems *= d;
+  for (int64_t d : bTy.getShape()) bElems *= d;
+  return (aElems * aTy.getElementTypeBitWidth() +
+          bElems * bTy.getElementTypeBitWidth()) / 8;
+}
+// A+B staging budget (bytes). Metal threadgroup cap is 32KB; leave headroom for the f32 C accumulator
+// staging (promoteCMatrix) + margin. Known-good staged FFN A/B ~5KB; the wedging fused shapes were ~50KB.
+static constexpr int64_t kCoopStageABByteCap = 20480;
+
 static void populatePromotionPatterns(RewritePatternSet &patterns,
                                       StringAttr replaceMarker) {
   MLIRContext *context = patterns.getContext();
@@ -194,10 +214,26 @@ void SPIRVTileAndPromotePass::runOnOperation() {
   }
 
   // Only promote to workgroup size if there are multiple warps.
+  // nlearn: for the cooperative-matrix path (skipOperandPromotion), A/B staging is TARGETED — stage a
+  // matmul's A/B in threadgroup memory only when the tiles fit under kCoopStageABByteCap (restores the
+  // K-loop reuse that device-only simdgroup_load loses -> ~2x on large-K backward weight-grads), and
+  // device-load the big/fused shapes that would over-allocate past Metal's 32KB cap (the HAL-wedge fix).
   if (totalThreads > *subgroupSize) {
     // Attach markers to contract ops to drive promotion.
     funcOp.walk([&](linalg::LinalgOp op) {
       if (isMatmulOrBatchMatmul(op)) {
+        if (skipOperandPromotion) {
+          int64_t abBytes = coopPromoteABBytes(op);
+          if (getenv("NLEARN_STAGE_DEBUG")) {
+            auto aTy = dyn_cast<ShapedType>(op.getDpsInputOperand(0)->get().getType());
+            auto bTy = dyn_cast<ShapedType>(op.getDpsInputOperand(1)->get().getType());
+            llvm::errs() << "[stage] abBytes=" << abBytes << " cap=" << kCoopStageABByteCap
+                         << " -> " << (abBytes < 0 || abBytes > kCoopStageABByteCap ? "DEVICE" : "STAGE")
+                         << "  A=" << (aTy ? aTy : Type()) << " B=" << (bTy ? bTy : Type()) << "\n";
+          }
+          if (abBytes < 0 || abBytes > kCoopStageABByteCap)
+            return; // too big / dynamic -> device-load (no wedge)
+        }
         auto promoteMarker = StringAttr::get(context, promoteBothMarker);
         op->setAttr(markerAttrName, promoteMarker);
       }
@@ -280,13 +316,74 @@ LogicalResult SPIRVTileAndPromotePass::doPromoteCMatrix(
     return success();
   }
 
+  // nlearn (cont85): the single-matmul detection below (finds ONE matmulOutBuf,
+  // errors on >2 linalg ops, bf16-only) cannot reason about the coop attention
+  // flash (TWO matmuls qk+pv + the softmax C-region, f16). Both qk and pv store an
+  // f32 accumulator into f16 buffers -> invalid f16-accumulator coop store unless C
+  // is staged in f32 (cont81e-84). Bypass the detection and directly run the C-
+  // promotion pattern on ALL contractions (it promotes each matmul's f32 C to a
+  // shared-memory buffer + a separate copy-out, which is exactly what both attention
+  // matmuls need). Gated to the coop-flash pipeline so normal codegen is unchanged.
+  if (getenv("NLEARN_COOP_ATTN_COOPSMEM")) {
+    RewritePatternSet patterns(context);
+    populateContractPromotionPatterns(patterns, {2});
+    if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
+      return failure();
+    }
+    propagateSharedMemoryCopy(funcOp);
+    return success();
+  }
+
   SmallVector<Operation *> computeOps = getComputeOps(funcOp);
+  // Find the contraction (the matmul) so we can tell a PROLOGUE f32->bf16 cast
+  // (output feeds the matmul input) from an EPILOGUE one (input is the matmul
+  // output = the store-downcast truncf we must NOT skip).
+  Value matmulOutBuf;
+  for (Operation *op : computeOps) {
+    if (auto l = dyn_cast<linalg::LinalgOp>(op))
+      if (l.getNumReductionLoops() > 0)
+        matmulOutBuf = l.getDpsInitOperand(0)->get();
+  }
+  auto baseBuffer = [](Value v) -> Value {
+    while (auto sv = v.getDefiningOp<memref::SubViewOp>())
+      v = sv.getViewSource();
+    return v;
+  };
   SmallVector<Operation *> linalgOps;
   for (Operation *op : computeOps) {
     if (isa<linalg::FillOp>(op)) {
       continue; // Don't care
     }
     if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
+      // nlearn: skip the f32->bf16 input-trunc PROLOGUE producers from the NLEARN_COOP_BF16CAST
+      // downcast (elementwise, single input, f32->bf16). On memref semantics they feed the matmul via
+      // memory (not SSA), so identify them by signature. They fuse into the matmul tiles; doPromoteCMatrix
+      // only reasons about the contraction + its epilogue.
+      // BUT do NOT skip the EPILOGUE store-downcast truncf (same f32->bf16 signature but its INPUT is the
+      // matmul OUTPUT): skipping it left linalgOps=[matmul] -> no C-promotion -> an invalid bf16 coop
+      // store of the f32 accumulator -> GARBAGE (the GQA k-proj N=128 NaN). Keep it so C gets promoted.
+      if (linalgOp.getNumReductionLoops() == 0 && linalgOp.getNumDpsInputs() == 1 &&
+          cast<ShapedType>(linalgOp.getDpsInputOperand(0)->get().getType()).getElementType().isF32() &&
+          cast<ShapedType>(linalgOp.getDpsInitOperand(0)->get().getType()).getElementType().isBF16()) {
+        bool isEpilogue =
+            matmulOutBuf &&
+            baseBuffer(linalgOp.getDpsInputOperand(0)->get()) ==
+                baseBuffer(matmulOutBuf);
+        // Only force-promote (keep the epilogue) for SMALL-N matmuls — the GQA KV
+        // projections (N = KV*head_dim, e.g. 128) that hit the invalid bf16 coop
+        // store. Large-N matmuls (FFN/projections, N>=512) forward-fuse their
+        // truncf and don't need promotion; force-promoting them just adds staging
+        // (measured: ~10% training regression). Threshold 256 splits GQA KV heads
+        // from real projections. Opt out with NLEARN_COOP_NO_PROMOTE_DOWNCAST.
+        int64_t outN = 0;
+        if (auto mt = dyn_cast<MemRefType>(linalgOp.getDpsInitOperand(0)
+                                               ->get()
+                                               .getType()))
+          if (mt.getRank() >= 1)
+            outN = mt.getShape().back();
+        if (!isEpilogue || outN <= 0 || outN > 256)
+          continue;
+      }
       linalgOps.push_back(linalgOp);
     } else {
       return funcOp.emitError("unknown compute op ") << *op;
@@ -317,9 +414,31 @@ LogicalResult SPIRVTileAndPromotePass::doPromoteCMatrix(
     return success();
   }
 
+  // nlearn: a NARROWING store-downcast (f32->bf16 truncf) fused into the coop
+  // matmul MUST force C-promotion. Apple's coop store is f32-accumulate only and
+  // Metal's simdgroup_store requires matching matrix/pointer element types with NO
+  // element-conversion primitive — so an un-promoted (coop-fused) narrowing store
+  // emits a bf16 coop store of the f32 accumulator matrix, which mis-stores f32
+  // data into the bf16 buffer => GARBAGE (root cause of the GQA k-proj N=128 NaN;
+  // proven un-fixable at the spirv_cross/Metal level). Promoting C stages the f32
+  // accumulator to shared memory + does the truncf as a separate copy-out (the
+  // path the working q-proj already takes). Opt out with NLEARN_COOP_NO_PROMOTE_DOWNCAST.
+  bool isNarrowingCast = false;
+  if (!getenv("NLEARN_COOP_NO_PROMOTE_DOWNCAST") &&
+      genericOp.getNumDpsInputs() == 1 && genericOp.getNumDpsInits() == 1) {
+    auto inTy = dyn_cast<ShapedType>(genericOp.getDpsInputs()[0].getType());
+    auto outTy =
+        dyn_cast<ShapedType>(genericOp.getDpsInitOperand(0)->get().getType());
+    if (inTy && outTy && inTy.getElementType().isIntOrFloat() &&
+        outTy.getElementType().isIntOrFloat() &&
+        inTy.getElementType().getIntOrFloatBitWidth() >
+            outTy.getElementType().getIntOrFloatBitWidth())
+      isNarrowingCast = true;
+  }
+
   // If the fused elementwise ops are allowed to use cooperative types, we can
   // also avoid promoting C matrix.
-  if (isCooperativeMatrixFusable(genericOp)) {
+  if (!isNarrowingCast && isCooperativeMatrixFusable(genericOp)) {
     return success();
   }
 

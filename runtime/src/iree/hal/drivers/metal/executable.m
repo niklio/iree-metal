@@ -195,10 +195,20 @@ static iree_status_t iree_hal_metal_compile_source(id<MTLDevice> device,
   id<MTLLibrary> library = nil;
   @autoreleasepool {
     MTLCompileOptions* compile_options = [[MTLCompileOptions new] autorelease];
-    compile_options.languageVersion = MTLLanguageVersion3_0;
+    // nlearn §13: floor at MSL 3.1 — the `bfloat`/`bfloat4` types used by nlearn's bf16
+    // GEMM/flash/CE kernels (and IREE bf16 codegen) are unknown in MSL 3.0. Use a higher
+    // version if the compiler embedded one.
+    // nlearn: MTLLanguageVersion3_1 is macOS-14+; the build min-target is 13.0 so -Werror
+    // flags -Wunguarded-availability-new. This box is macOS 26, so the 3.1 path always runs;
+    // suppress the (compile-time-only) availability warning so iree-run-module builds.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunguarded-availability-new"
+    compile_options.languageVersion = MTLLanguageVersion3_1;
+#pragma clang diagnostic pop
     if (iree_hal_metal_MSLSourceDef_version_is_present(source_def)) {
-      compile_options.languageVersion =
+      MTLLanguageVersion v =
           (MTLLanguageVersion)iree_hal_metal_MSLSourceDef_version_get(source_def);
+      if (v > compile_options.languageVersion) compile_options.languageVersion = v;
     }
 
     flatbuffers_string_t code = iree_hal_metal_MSLSourceDef_code_get(source_def);

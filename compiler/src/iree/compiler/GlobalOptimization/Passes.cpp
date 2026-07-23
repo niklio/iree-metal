@@ -157,6 +157,14 @@ void buildGlobalOptimizationPassPipeline(
   mainPassManager.addPass(DispatchCreation::createFoldUnitExtentDimsPass());
   FunctionLikeNest(mainPassManager)
       .addPass(DispatchCreation::createFoldReshapesIntoTensorBarriersPass)
+      // nlearn (metal-spirv): accumulate bf16/f16 matmuls in f32 (round once) so
+      // the f32-accumulate Apple MMA (bf16-in/f32-acc) is used and the K-loop
+      // carries f32 — lets naive bf16 models hit the matrix units. DEFAULT-ON
+      // (2026-07-14, validated: 2.0× fwd / 2.17× train on vanilla bf16 transformers,
+      // 3.4× more accurate, grad-neutral, degenerate case safe). Opt out with
+      // NLEARN_COOP_NO_UPCAST to restore the scalar bf16-accum behaviour.
+      .addPredicatedPass(getenv("NLEARN_COOP_NO_UPCAST") == nullptr,
+                         createRaiseContractionAccumulatorToF32Pass)
       .addPass([&]() {
         return createDemoteContractionInputsToBF16Pass(
             clDemoteContractionInputsToBF16Strategy);

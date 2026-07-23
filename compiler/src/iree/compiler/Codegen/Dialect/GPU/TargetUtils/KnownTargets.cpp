@@ -765,10 +765,26 @@ StringRef normalizeAMDGPUTarget(StringRef target) {
 std::optional<TargetDetails> getAppleTargetDetails() {
   ComputeBitwidths computeBitwdiths =
       allIntComputeBits | ComputeBitwidths::FP32 | ComputeBitwidths::FP16;
+  // nlearn: advertise a cooperative-matrix intrinsic so IREE's SPIRVCooperativeMatrixVectorize
+  // pipeline lowers native matmul to SPIR-V coop-matrix ops (→ MSL simdgroup_matrix via SPIRVToMSL/
+  // spirv-cross). Apple GPUs are 32-wide simdgroups w/ 8x8 simdgroup_matrix; WMMA (NVIDIA, also 32-wide)
+  // F16→F32 is the closest existing coop-matrix intrinsic. f16 first (bf16 filtered in
+  // SPIRVConvertGPUTarget.cpp:215 — relax later once the path is proven).
+  static const MMAIntrinsic appleMMAOps[] = {
+      // NV_WMMA (not AMD WMMAR3): NVIDIA's WMMA routes through the SPIR-V KHR cooperative-matrix path
+      // (the one the vulkan/volta golden test uses), which legalizes on a 32-wide subgroup target.
+      // WMMAR3 (AMD RDNA3) goes through an AMD-specific gpu.subgroup_mma lowering that fails on metal.
+      MMAIntrinsic::NV_WMMA_F32_16x16x16_F16,
+      // bf16 (nlearn trains in bf16). Brand is irrelevant post-config: setCooperativeMatrixConfig
+      // forces the SPIRVCooperativeMatrixVectorize pipeline and that pass is intrinsic-agnostic
+      // (it works off vector types + spirv coop_matrix_properties, never reads the MMAIntrinsic).
+      // WMMAR4_F32_16x16x16_BF16 gives ABC={bf16,bf16,f32} @ 16x16x16 (matches the f16 tiling).
+      MMAIntrinsic::WMMAR4_F32_16x16x16_BF16,
+  };
   // clang-format off
   static const WgpDetails wgp = {
-      computeBitwdiths,   allStorageBits,     allSubgroupOps,  allDotProductOps,
-      /*mmaCount=*/0,     /*mmaOps=*/nullptr, /*scaledMmaCount=*/0,
+      computeBitwdiths,   allStorageBits,       allSubgroupOps,  allDotProductOps,
+      /*mmaCount=*/2,     /*mmaOps=*/appleMMAOps, /*scaledMmaCount=*/0,
       /*scaledMmaOps=*/nullptr,               {32, 32},
       {1024, 1024, 1024}, 1024,               32 * 1024,
       // Note: These values have not been checked and may be higher
@@ -1130,8 +1146,10 @@ std::optional<L1CacheInfo> getL1CacheInfo(TargetAttr target) {
 }
 
 TargetAttr getMetalTargetDetails(MLIRContext *context) {
+  // nlearn: v1.6 (was v1.3) — SPV_KHR_cooperative_matrix ops legalize under SPIR-V 1.6 (every
+  // coop-capable target here uses v1.6). spirv-cross reads 1.6 fine and emits MSL.
   return createTargetAttr(*getAppleTargetDetails(), /*arch=*/"apple",
-                          /*features=*/"spirv:v1.3,cap:Shader", context);
+                          /*features=*/"spirv:v1.6,cap:Shader", context);
 }
 
 TargetAttr getCUDATargetDetails(StringRef target, StringRef features,

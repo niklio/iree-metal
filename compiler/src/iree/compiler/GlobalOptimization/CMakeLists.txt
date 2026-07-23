@@ -52,6 +52,7 @@ iree_cc_library(
     "FuseDequantizationMatmul.cpp"
     "GeneralizeLinalgNamedOps.cpp"
     "GlobalLoopInvariantCodeMotion.cpp"
+    "RaiseContractionAccumulatorToF32.cpp"
     "InferNumericNarrowing.cpp"
     "MaterializeHomogeneousEncodings.cpp"
     "OptimizeNumerics.cpp"

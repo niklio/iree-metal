@@ -49,6 +49,9 @@ void buildStableHLOInputConversionPassPipelineImpl(
   passManager.addNestedPass<func::FuncOp>(mlir::createCanonicalizerPass());
   passManager.addNestedPass<func::FuncOp>(createStableHLOCanonicalize());
   passManager.addNestedPass<func::FuncOp>(mlir::createCSEPass());
+  // Lower @flash_attention_* custom calls to external Metal kernel dispatches
+  // before the generic custom-call legalization (which would reject them).
+  passManager.addPass(createConvertFlashAttentionDispatch());
   passManager.addNestedPass<func::FuncOp>(createLegalizeStableHLOCustomCalls());
   passManager.addNestedPass<func::FuncOp>(
       stablehlo::createLegalizeControlFlow());

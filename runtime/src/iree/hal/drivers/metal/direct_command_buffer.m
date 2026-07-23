@@ -505,6 +505,11 @@ static iree_status_t iree_hal_metal_command_segment_record_barrier(
   // encoders would require its own synchronization; so we don't need extract barriers in the
   // middle.
   if (segment->memory_barrier_count == 0 && segment->buffer_barrier_count == 0) {
+    // NOTE (2026-07-14): tried replacing this with an in-encoder memoryBarrierWithScope (no
+    // encoder end + no MTLEvent) hypothesizing the encoder-restart+event was the per-dispatch
+    // overhead vs MLX. FALSIFIED by A/B (gpt2 12L B4T1024: 387.47 vs 387.74ms; tiny B1T64: 18.03 vs
+    // 17.85ms — identical, both numerically correct). Encoder switch + event is cheap on this HW;
+    // dispatch-barrier overhead is NOT the MLX gap. Kept the original correct path.
     // There is no direct corresponding APIs for execution only barrier in Metal. We just signal and
     // wait on the same value of a MTLEvent here.
     iree_hal_metal_end_blit_encoder(command_buffer);

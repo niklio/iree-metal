@@ -47,6 +47,14 @@ option(IREE_BUILD_SAMPLES "Disable samples for runtime-library build" OFF)
 message(STATUS "Including IREE from ${IREE_ROOT_DIR}")
 add_subdirectory("${IREE_ROOT_DIR}" "iree_core" EXCLUDE_FROM_ALL)
 
+# nlearn §13: with IREE_BUILD_COMPILER=OFF the compiler-only INTERFACE target
+# IREELLVMIncludeSetup (LLVM include-dir setup) is absent, but PJRT dylib targets still
+# reference it. The plugin loads the compiler DYNAMICALLY (iree_compiler_bindings_c_loader),
+# so an empty stub satisfies the link with no LLVM build.
+if(NOT TARGET IREELLVMIncludeSetup)
+  add_library(IREELLVMIncludeSetup INTERFACE)
+endif()
+
 # Include local sources.
 # Handle various global definitions that need to be set at the global
 # toolchain level.

@@ -61,6 +61,11 @@ def SPIRV_CooperativeMatrixVectorize
     : I32EnumAttrCase<"SPIRVCooperativeMatrixVectorize", 205>;
 def SPIRV_WinogradVectorize
     : I32EnumAttrCase<"SPIRVWinogradVectorize", 206>;
+// nlearn: flash-attention on metal-spirv — decompose iree_linalg_ext.attention
+// (online form) within codegen and tile/vectorize the per-tile qk/pv matmuls onto
+// the coop matrix units, keeping the [T,T] scores un-materialized.
+def SPIRV_VectorDistributeAttention
+    : I32EnumAttrCase<"SPIRVVectorDistributeAttention", 207>;
 
 def VMVX_Default : I32EnumAttrCase<"VMVXDefault", 300>;
 
@@ -91,6 +96,7 @@ def DispatchLoweringPassPipelineEnum : I32EnumAttr<
     SPIRV_BaseLowering, SPIRV_BaseDistribute, SPIRV_BaseVectorize,
     SPIRV_SubgroupReduce, SPIRV_MatmulPromoteVectorize,
     SPIRV_CooperativeMatrixVectorize, SPIRV_WinogradVectorize,
+    SPIRV_VectorDistributeAttention,
 
     VMVX_Default,
 

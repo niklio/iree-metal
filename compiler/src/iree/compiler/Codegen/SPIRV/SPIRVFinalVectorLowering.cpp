@@ -78,8 +78,16 @@ public:
                          .setVectorTransposeLowering(
                              vector::VectorTransposeLowering::EltWise);
       vector::populateVectorBroadcastLoweringPatterns(patterns);
-      vector::populateVectorContractLoweringPatterns(
-          patterns, options.vectorContractLowering);
+      // nlearn (cont81): in the coop-flash pipeline, DON'T lower vector.contract to
+      // outerproduct/fma here — that scalarizes the qk/pv coop matmuls before
+      // ConvertToSPIRV can emit spirv.KHR.CooperativeMatrix from them (the standard
+      // coop matmul pipeline never runs this pass; attention needs it only for the
+      // softmax reductions, which carry no contracts). Leaving the coop contracts
+      // intact lets them survive to the coop conversion. Gated so normal codegen is
+      // unchanged.
+      if (!getenv("NLEARN_COOP_ATTN_KEEPCONTRACT"))
+        vector::populateVectorContractLoweringPatterns(
+            patterns, options.vectorContractLowering);
       vector::populateVectorMultiReductionReorderPatterns(
           patterns, vector::VectorMultiReductionLowering::InnerParallel);
       vector::populateVectorMultiReductionFlatteningPatterns(
@@ -91,6 +99,11 @@ public:
       vector::populateVectorGatherToConditionalLoadPatterns(patterns);
       vector::populateVectorGatherLoweringPatterns(patterns);
       vector::populateVectorMaskOpLoweringPatterns(patterns);
+      // Lower vector.step to a constant/arith sequence. The SPIR-V conversion
+      // has no pattern for vector.step (unlike the NVVM/ROCDL/CPU paths, which
+      // call this in their ConvertToLLVM passes), so without this any iota /
+      // jnp.arange that survives into a vectorized kernel fails to legalize.
+      vector::populateVectorStepLoweringPatterns(patterns);
       vector::CreateMaskOp::getCanonicalizationPatterns(patterns, context);
       vector::populateVectorShapeCastLoweringPatterns(patterns);
       if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {

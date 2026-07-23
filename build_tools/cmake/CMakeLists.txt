@@ -14,10 +14,15 @@ iree_generate_export_targets(
 )
 
 # See compiler/bindings/c/CMakeLists.txt
-iree_generate_export_targets(
-  EXPORT_SET Compiler
-  INSTALL_DESTINATION ${_cmake_installdir}
-)
+# nlearn §13: only generate the Compiler export set when the compiler is built. With
+# IREE_BUILD_COMPILER=OFF the c_loader links the (stubbed) IREELLVMIncludeSetup which isn't
+# in any export set, which fails generate. We consume the build-tree dylib, not installs.
+if(IREE_BUILD_COMPILER)
+  iree_generate_export_targets(
+    EXPORT_SET Compiler
+    INSTALL_DESTINATION ${_cmake_installdir}
+  )
+endif()
 
 if(IREE_BUILD_COMPILER)
   configure_file(

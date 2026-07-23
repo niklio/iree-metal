@@ -113,6 +113,11 @@ def SPIRVTileAndPromotePass : InterfacePass<"iree-spirv-tile-and-promote", "mlir
           "Promote C matrix to use shared memory">,
     Option<"skipThreadLevel", "skip-thread", "bool", /*default=*/"false",
           "Skip tiling and distributing to GPU threads">,
+    Option<"skipOperandPromotion", "skip-operand-promote", "bool", /*default=*/"false",
+          "Skip promoting the A/B (LHS/RHS) operands to workgroup memory. For the "
+          "cooperative-matrix path on Metal, simdgroup_load reads directly from device "
+          "memory, so staging A/B in threadgroup memory is unnecessary and can over-allocate "
+          "past the 32KB limit (silently hanging the GPU).">,
   ];
 }
 

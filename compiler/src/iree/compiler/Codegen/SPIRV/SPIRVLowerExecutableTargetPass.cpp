@@ -133,6 +133,9 @@ void SPIRVLowerExecutableTargetPass::runOnOperation() {
     case CodeGenPipeline::SPIRVWinogradVectorize:
       addSPIRVWinogradVectorizePassPipeline(pipeline);
       break;
+    case CodeGenPipeline::SPIRVVectorDistributeAttention:
+      addSPIRVVectorDistributeAttentionPassPipeline(pipeline);
+      break;
     // No pipeline specified, nothing to do.
     case CodeGenPipeline::None:
       return;

@@ -1,0 +1,160 @@
+diff --git a/mlir/include/mlir/Dialect/GPU/IR/GPUBase.td b/mlir/include/mlir/Dialect/GPU/IR/GPUBase.td
+index 1a07d506b..ff7007ca3 100644
+--- a/mlir/include/mlir/Dialect/GPU/IR/GPUBase.td
++++ b/mlir/include/mlir/Dialect/GPU/IR/GPUBase.td
+@@ -116,7 +116,7 @@ def GPU_MMAMatrix : DialectType<
+   GPU_Dialect, IsMMAMatrixTypePred, "MMAMatrix type">;
+ 
+ // Memref type acceptable to gpu.subgroup_mma_{load|store}_matrix ops.
+-def GPU_MMAMemRef : MemRefOf<[I8, I32, F16, F32, F64, VectorOfRankAndType<[1], [I8, I32, F16, F32, F64]>]>;
++def GPU_MMAMemRef : MemRefOf<[I8, I32, F16, BF16, F32, F64, VectorOfRankAndType<[1], [I8, I32, F16, BF16, F32, F64]>]>;
+ 
+ class MMAMatrixOf<list<Type> allowedTypes> :
+   ContainerType<AnyTypeOf<allowedTypes>, IsMMAMatrixTypePred,
+diff --git a/mlir/include/mlir/Dialect/GPU/IR/GPUOps.td b/mlir/include/mlir/Dialect/GPU/IR/GPUOps.td
+index 6b0fd1ed9..b28ef5109 100644
+--- a/mlir/include/mlir/Dialect/GPU/IR/GPUOps.td
++++ b/mlir/include/mlir/Dialect/GPU/IR/GPUOps.td
+@@ -1912,7 +1912,7 @@ def GPU_SubgroupMmaStoreMatrixOp : GPU_Op<"subgroup_mma_store_matrix",
+     ```
+   }];
+ 
+-  let arguments = (ins Arg<MMAMatrixOf<[SI8, UI8, I32, F16, F32, F64]>>:$src,
++  let arguments = (ins Arg<MMAMatrixOf<[SI8, UI8, I32, F16, BF16, F32, F64]>>:$src,
+                   Arg<GPU_MMAMemRef, "",[MemWriteAt<0, FullEffect>]>:$dstMemref,
+                   Variadic<Index>:$indices,
+                   IndexAttr:$leadDimension,
+@@ -1959,9 +1959,9 @@ def GPU_SubgroupMmaComputeOp
+     ```
+   }];
+ 
+-  let arguments = (ins Arg<MMAMatrixOf<[SI8, UI8, F16, F32, F64]>>:$opA,
+-                  Arg<MMAMatrixOf<[SI8, UI8, F16, F32, F64]>>:$opB,
+-                  Arg<MMAMatrixOf<[I32, F16, F32, F64]>>:$opC,
++  let arguments = (ins Arg<MMAMatrixOf<[SI8, UI8, F16, BF16, F32, F64]>>:$opA,
++                  Arg<MMAMatrixOf<[SI8, UI8, F16, BF16, F32, F64]>>:$opB,
++                  Arg<MMAMatrixOf<[I32, F16, BF16, F32, F64]>>:$opC,
+                   OptionalAttr<UnitAttr>:$a_transpose,
+                   OptionalAttr<UnitAttr>:$b_transpose);
+ 
+diff --git a/mlir/lib/Conversion/GPUToSPIRV/GPUToSPIRV.cpp b/mlir/lib/Conversion/GPUToSPIRV/GPUToSPIRV.cpp
+index c33a903d0..1555905c1 100644
+--- a/mlir/lib/Conversion/GPUToSPIRV/GPUToSPIRV.cpp
++++ b/mlir/lib/Conversion/GPUToSPIRV/GPUToSPIRV.cpp
+@@ -693,13 +693,28 @@ public:
+     if (!isa<spirv::ScalarType>(adaptor.getValue().getType()))
+       return rewriter.notifyMatchFailure(op, "reduction type is not a scalar");
+ 
+-    auto result = createGroupReduceOp(
+-        rewriter, op.getLoc(), adaptor.getValue(), adaptor.getOp(),
+-        /*isGroup=*/false, adaptor.getUniform(), op.getClusterSize());
++    // nlearn: spirv.GroupNonUniform{F}Add and friends reject bf16 (SPIR-V group arithmetic allows
++    // only f16/f32/f64). Reduce bf16 in f32 instead: extend -> reduce -> truncate. Keeps bf16
++    // activations legal for RMSNorm/softmax subgroup reductions on Apple metal-spirv (the blocker
++    // that forced COMPUTE_DTYPE=f32 -> per-matmul bf16 cast dispatches).
++    Value value = adaptor.getValue();
++    Type origType = value.getType();
++    bool isBF16 = origType.isBF16();
++    if (isBF16)
++      value = spirv::FConvertOp::create(rewriter, op.getLoc(),
++                                        rewriter.getF32Type(), value);
++
++    auto result = createGroupReduceOp(rewriter, op.getLoc(), value, adaptor.getOp(),
++                                      /*isGroup=*/false, adaptor.getUniform(),
++                                      op.getClusterSize());
+     if (!result)
+       return failure();
+ 
+-    rewriter.replaceOp(op, *result);
++    Value reduced = *result;
++    if (isBF16)
++      reduced = spirv::FConvertOp::create(rewriter, op.getLoc(), origType, reduced);
++
++    rewriter.replaceOp(op, reduced);
+     return success();
+   }
+ };
+diff --git a/mlir/lib/Conversion/MemRefToSPIRV/MemRefToSPIRV.cpp b/mlir/lib/Conversion/MemRefToSPIRV/MemRefToSPIRV.cpp
+index 565dee6f2..86f99cf18 100644
+--- a/mlir/lib/Conversion/MemRefToSPIRV/MemRefToSPIRV.cpp
++++ b/mlir/lib/Conversion/MemRefToSPIRV/MemRefToSPIRV.cpp
+@@ -144,7 +144,12 @@ static bool isAllocationSupported(Operation *allocOp, MemRefType type) {
+     elementType = vecType.getElementType();
+   if (auto compType = dyn_cast<ComplexType>(elementType))
+     elementType = compType.getElementType();
+-  return elementType.isIntOrFloat();
++  // nlearn: also allow `index` element type — the SPIRVTypeConverter (with the
++  // IREE-added index->integer memref conversion) lowers index-element workgroup
++  // allocations to a concrete-width integer buffer. Without this, an
++  // index-typed shared-memory alloc (e.g. a promoted linalg.index causal-mask
++  // epilogue in the jax.nn.dot_product_attention backward) fails to legalize.
++  return elementType.isIntOrFloat() || elementType.isIndex();
+ }
+ 
+ /// Returns the scope to use for atomic operations use for emulating store
+diff --git a/mlir/lib/Conversion/VectorToGPU/VectorToGPU.cpp b/mlir/lib/Conversion/VectorToGPU/VectorToGPU.cpp
+index 975fe2839..d4e367474 100644
+--- a/mlir/lib/Conversion/VectorToGPU/VectorToGPU.cpp
++++ b/mlir/lib/Conversion/VectorToGPU/VectorToGPU.cpp
+@@ -239,7 +239,12 @@ static bool integerExtendSupportsMMAMatrixType(ExtOpTy extOp) {
+ }
+ 
+ static bool fpExtendSupportsMMAMatrixType(arith::ExtFOp extOp) { return true; }
+-static bool fpTruncSupportsMMAMatrixType(arith::TruncFOp extOp) { return true; }
++static bool fpTruncSupportsMMAMatrixType(arith::TruncFOp extOp) {
++  // nlearn: Apple simdgroup_matrix has NO elementwise ops (matmul-only). Opt out of
++  // fusing the truncf store-downcast into coop so it stays a regular op (the coop f32
++  // C is staged to smem by C-promotion, then a regular truncf converts f32->f16).
++  return !getenv("NLEARN_NO_COOP_ELEMENTWISE");
++}
+ 
+ /// Return the MMA elementwise enum associated with `op` if it is supported.
+ /// Return `std::nullopt` otherwise.
+@@ -266,6 +271,30 @@ convertElementwiseOpToMMA(Operation *op) {
+ 
+ /// Return true if the op is supported as elementwise op on MMAMatrix type.
+ static bool elementwiseSupportsMMAMatrixType(Operation *op) {
++  // nlearn: Apple simdgroup_matrix is matmul-only (no elementwise), so a softmax
++  // epilogue fused onto coop types can't compile. Opt out so these stay regular
++  // vector ops off the matrix units (only the matmul contract converts to coop).
++  if (getenv("NLEARN_NO_COOP_ELEMENTWISE"))
++    return false;
++  // nlearn: SPIR-V cooperative-matrix component-wise arithmetic (spirv.FMul etc.)
++  // is only defined for f16/f32/f64 fragments; a bf16 coop matrix supports ONLY
++  // MulAdd (matmul), not elementwise. A bf16 PROLOGUE elementwise (e.g. the SwiGLU
++  // gate feeding w2, or a fused A*A on a matmul input) writes the promoted A/B tile
++  // and, having a transfer_write user (not the contract directly), infers COp and
++  // gets absorbed into an illegal `spirv.FMul` on coopmatrix<...xbf16, MatrixAcc>
++  // (fails metal-spirv legalization). Keep bf16 elementwise as a REGULAR vector op
++  // so it applies to the promoted tile in-kernel (fused, off the matrix units) and
++  // the matmul still coop-loads the modified tile. Epilogues on the f32 accumulator
++  // are unaffected (f32 element type). Opt out: NLEARN_COOP_ALLOW_BF16_ELEMENTWISE.
++  if (!getenv("NLEARN_COOP_ALLOW_BF16_ELEMENTWISE")) {
++    auto isBF16Vec = [](Type t) {
++      auto vt = dyn_cast<VectorType>(t);
++      return vt && vt.getElementType().isBF16();
++    };
++    if (llvm::any_of(op->getResultTypes(), isBF16Vec) ||
++        llvm::any_of(op->getOperandTypes(), isBF16Vec))
++      return false;
++  }
+   return convertElementwiseOpToMMA(op).has_value();
+ }
+ 
+diff --git a/mlir/lib/Dialect/GPU/IR/GPUDialect.cpp b/mlir/lib/Dialect/GPU/IR/GPUDialect.cpp
+index 2680c7311..24dbe8f03 100644
+--- a/mlir/lib/Dialect/GPU/IR/GPUDialect.cpp
++++ b/mlir/lib/Dialect/GPU/IR/GPUDialect.cpp
+@@ -209,9 +209,9 @@ Type MMAMatrixType::getElementType() const { return getImpl()->elementType; }
+ StringRef MMAMatrixType::getOperand() const { return getImpl()->getOperand(); }
+ 
+ bool MMAMatrixType::isValidElementType(Type elementType) {
+-  return elementType.isF16() || elementType.isF32() || elementType.isF64() ||
+-         elementType.isUnsignedInteger(8) || elementType.isSignedInteger(8) ||
+-         elementType.isInteger(32);
++  return elementType.isF16() || elementType.isBF16() || elementType.isF32() ||
++         elementType.isF64() || elementType.isUnsignedInteger(8) ||
++         elementType.isSignedInteger(8) || elementType.isInteger(32);
+ }
+ 
+ LogicalResult

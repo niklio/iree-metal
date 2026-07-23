@@ -31,7 +31,7 @@ static llvm::cl::opt<bool> clEnableEarlyTruncFusion(
     llvm::cl::desc(
         "Enable element-wise fusion of bit-truncate operation with their "
         "consumers before forming dispatch regions"),
-    llvm::cl::init(false));
+    llvm::cl::init(true));  // nlearn: fuse bf16 casts into matmul consumers
 
 static llvm::cl::opt<bool> clEnableFusePaddingIntoLinalgProducerOps(
     "iree-dispatch-creation-enable-fuse-padding-into-linalg-producer-ops",
@@ -42,7 +42,7 @@ static llvm::cl::opt<bool> clEnableFuseHorizontalContractions(
     "iree-dispatch-creation-enable-fuse-horizontal-contractions",
     llvm::cl::desc(
         "Enables horizontal fusion of contractions with one common operand"),
-    llvm::cl::init(false));
+    llvm::cl::init(false));  // nlearn: fusion runs (no wedge, A/B-skip fix) but is slower; off by default
 
 static llvm::cl::opt<bool> clExperimentalMultiUseEncodingFusion(
     "iree-dispatch-creation-experimental-multi-use-encoding-fusion",

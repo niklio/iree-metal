@@ -1,0 +1,310 @@
+diff --git a/spirv_glsl.cpp b/spirv_glsl.cpp
+index 81fdae0..ee9a9e2 100644
+--- a/spirv_glsl.cpp
++++ b/spirv_glsl.cpp
+@@ -5999,6 +5999,13 @@ string CompilerGLSL::constant_op_expression(const SPIRConstantOp &cop)
+ 	}
+ }
+ 
++// nlearn: default (GLSL) behavior for a replicated coop-matrix constant (kept from the original path).
++string CompilerGLSL::cooperative_matrix_replicated_constant(const SPIRConstant &c)
++{
++	auto &type = get<SPIRType>(c.constant_type);
++	return join(type_to_glsl(type), "(", to_expression(c.subconstants[0]), ")");
++}
++
+ string CompilerGLSL::constant_expression(const SPIRConstant &c,
+                                          bool inside_block_like_struct_scope,
+                                          bool inside_struct_scope)
+@@ -6014,6 +6021,12 @@ string CompilerGLSL::constant_expression(const SPIRConstant &c,
+ 		require_extension_internal("GL_EXT_null_initializer");
+ 		return backend.constant_null_initializer;
+ 	}
++	else if (c.replicated && type.op == OpTypeCooperativeMatrixKHR)
++	{
++		// nlearn: replicated (splat) coop-matrix constant. Base would emit an invalid
++		// array<simdgroup_matrix<...>>(scalar); MSL overrides this to make_filled per tile.
++		return cooperative_matrix_replicated_constant(c);
++	}
+ 	else if (c.replicated && type.op != OpTypeArray)
+ 	{
+ 		if (type.op == OpTypeMatrix)
+@@ -6333,7 +6346,16 @@ string CompilerGLSL::convert_float_to_string(const SPIRConstant &c, uint32_t col
+ 	}
+ 
+ 	if (is_bfloat16)
+-		res = join("bfloat16_t(", res, ")");
++	{
++		// Route the bf16 constant-cast type name through type_to_glsl so the MSL backend
++		// emits Metal's "bfloat(...)" rather than the GLSL "bfloat16_t(...)".
++		SPIRType bf16_type { OpTypeFloat };
++		bf16_type.basetype = SPIRType::BFloat16;
++		bf16_type.vecsize = 1;
++		bf16_type.columns = 1;
++		bf16_type.width = 16;
++		res = join(type_to_glsl(bf16_type), "(", res, ")");
++	}
+ 
+ 	return res;
+ }
+diff --git a/spirv_glsl.hpp b/spirv_glsl.hpp
+index 78bff2d..914d066 100644
+--- a/spirv_glsl.hpp
++++ b/spirv_glsl.hpp
+@@ -449,9 +449,10 @@ protected:
+ 	                                const std::string &qualifier = "", uint32_t base_offset = 0);
+ 	virtual void emit_struct_padding_target(const SPIRType &type);
+ 	virtual std::string image_type_glsl(const SPIRType &type, uint32_t id = 0, bool member = false);
+-	std::string constant_expression(const SPIRConstant &c,
++	virtual std::string constant_expression(const SPIRConstant &c, // nlearn: virtual so MSL can override for coop matrix
+ 	                                bool inside_block_like_struct_scope = false,
+ 	                                bool inside_struct_scope = false);
++	virtual std::string cooperative_matrix_replicated_constant(const SPIRConstant &c); // nlearn
+ 	virtual std::string constant_op_expression(const SPIRConstantOp &cop);
+ 	virtual std::string constant_expression_vector(const SPIRConstant &c, uint32_t vector);
+ 	virtual void emit_fixup();
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index a5cf13f..d0e361f 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -5837,6 +5837,21 @@ void CompilerMSL::emit_custom_templates()
+ 	{
+ 		switch (spv_func)
+ 		{
++		case SPVFuncImplCooperativeMatrix:
++			// nlearn: a SPIR-V cooperative matrix as N tiles of Metal's 8x8 simdgroup_matrix.
++			statement("template<typename T, uint N>");
++			statement("struct spvCoopMat");
++			begin_scope();
++			statement("simdgroup_matrix<T, 8, 8> t[N];");
++			statement("spvCoopMat() thread {}");
++			statement("spvCoopMat(T v) thread { for (uint i = 0; i < N; i++) t[i] = "
++			          "make_filled_simdgroup_matrix<T, 8, 8>(v); }");
++			statement("thread simdgroup_matrix<T, 8, 8>& operator[](uint i) thread { return t[i]; }");
++			statement("const thread simdgroup_matrix<T, 8, 8>& operator[](uint i) const thread { return t[i]; }");
++			end_scope_decl();
++			statement("");
++			break;
++
+ 		case SPVFuncImplUnsafeArray:
+ 			statement("template<typename T, size_t Num>");
+ 			statement("struct spvUnsafeArray");
+@@ -9386,6 +9401,116 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 
+ 	switch (opcode)
+ 	{
++	// nlearn: SPIR-V cooperative matrix -> MSL simdgroup_matrix over (R/8)x(C/8) 8x8 tiles.
++	// A coop matrix value is array<simdgroup_matrix<T,8,8>, tr*tc>; tile (r,c) is index r*tc+c.
++	case OpCooperativeMatrixLoadKHR:
++	{
++		uint32_t result_type = ops[0], id = ops[1];
++		auto &mt = get<SPIRType>(result_type);
++		auto &elem = get<SPIRType>(mt.parent_type);
++		uint32_t rows = get<SPIRConstant>(mt.ext.cooperative.rows_id).scalar();
++		uint32_t cols = get<SPIRConstant>(mt.ext.cooperative.columns_id).scalar();
++		uint32_t tr = rows / 8, tc = cols / 8;
++		bool transpose = maybe_get<SPIRConstant>(ops[3]) &&
++		                 get<SPIRConstant>(ops[3]).scalar() == CooperativeMatrixLayoutColumnMajorKHR;
++		auto &ptr_type = expression_type(ops[2]);
++		const char *aspace = ptr_type.storage == StorageClassWorkgroup ? "threadgroup" : "device";
++		string stride = coop_stride_in_elems(ops[2], ops[4], elem);
++		string eptr = join("reinterpret_cast<", aspace, " ", type_to_glsl(elem), " *>(&(", to_expression(ops[2]), "))");
++		emit_uninitialized_temporary_expression(result_type, id);
++		string mat = to_expression(id);
++		// nlearn: for a ColumnMajor (transposed) load the source is physically transposed, so the
++		// per-tile memory origin swaps (x<->y) in addition to Metal's per-8x8 transpose flag. Without
++		// the swap, transposed-layout coop matmuls miscompile (metal relerr ~1.0; CPU correct) — the
++		// bug that forced the nlearn coop backward to materialise explicit .T transposes.
++		for (uint32_t r = 0; r < tr; r++)
++			for (uint32_t c = 0; c < tc; c++)
++				statement("simdgroup_load(", mat, "[", r * tc + c, "], ", eptr, ", ", stride, ", ulong2(",
++				          transpose ? r * 8 : c * 8, ", ", transpose ? c * 8 : r * 8, ")",
++				          transpose ? ", true" : "", ");");
++		register_read(id, ops[2], false);
++		break;
++	}
++
++	case OpCooperativeMatrixStoreKHR:
++	{
++		auto &mt = expression_type(ops[1]);
++		auto &elem = get<SPIRType>(mt.parent_type);
++		uint32_t rows = get<SPIRConstant>(mt.ext.cooperative.rows_id).scalar();
++		uint32_t cols = get<SPIRConstant>(mt.ext.cooperative.columns_id).scalar();
++		uint32_t tr = rows / 8, tc = cols / 8;
++		bool transpose = maybe_get<SPIRConstant>(ops[2]) &&
++		                 get<SPIRConstant>(ops[2]).scalar() == CooperativeMatrixLayoutColumnMajorKHR;
++		auto &ptr_type = expression_type(ops[0]);
++		const char *aspace = ptr_type.storage == StorageClassWorkgroup ? "threadgroup" : "device";
++		string stride = coop_stride_in_elems(ops[0], ops[3], elem);
++		string eptr = join("reinterpret_cast<", aspace, " ", type_to_glsl(elem), " *>(&(", to_expression(ops[0]), "))");
++		string mat = to_expression(ops[1]);
++		// nlearn: `mat` may be a COMPOUND expression (e.g. a fused coop*scalar multiply
++		// from a softmax-scale epilogue). MSL parses subscript `[]` tighter than `*`, so
++		// `mat[i]` would subscript the scalar operand, not the matrix ("subscripted value
++		// is not an array"). Bind to a temp so `[i]` applies to the whole spvCoopMat.
++		if (mat.find_first_of(" *+-/") != string::npos)
++		{
++			string matvar = join("_coopst_", ops[1]);
++			statement("auto ", matvar, " = ", mat, ";");
++			mat = matvar;
++		}
++		for (uint32_t r = 0; r < tr; r++)
++			for (uint32_t c = 0; c < tc; c++)
++				statement("simdgroup_store(", mat, "[", r * tc + c, "], ", eptr, ", ", stride, ", ulong2(",
++				          transpose ? r * 8 : c * 8, ", ", transpose ? c * 8 : r * 8, ")",
++				          transpose ? ", true" : "", ");");
++		break;
++	}
++
++	case OpCooperativeMatrixMulAddKHR:
++	{
++		uint32_t result_type = ops[0], id = ops[1];
++		auto &rt = get<SPIRType>(result_type);
++		uint32_t M = get<SPIRConstant>(rt.ext.cooperative.rows_id).scalar();
++		uint32_t N = get<SPIRConstant>(rt.ext.cooperative.columns_id).scalar();
++		auto &at = expression_type(ops[2]); // A is M x K
++		uint32_t K = get<SPIRConstant>(at.ext.cooperative.columns_id).scalar();
++		uint32_t tm = M / 8, tn = N / 8, tk = K / 8;
++		string A = to_expression(ops[2]), B = to_expression(ops[3]), C = to_expression(ops[4]);
++		emit_uninitialized_temporary_expression(result_type, id);
++		string D = to_expression(id);
++		for (uint32_t i = 0; i < tm; i++)
++			for (uint32_t j = 0; j < tn; j++)
++			{
++				statement(D, "[", i * tn + j, "] = ", C, "[", i * tn + j, "];");
++				for (uint32_t k = 0; k < tk; k++)
++					statement("simdgroup_multiply_accumulate(", D, "[", i * tn + j, "], ", A, "[", i * tk + k,
++					          "], ", B, "[", k * tn + j, "], ", D, "[", i * tn + j, "]);");
++			}
++		break;
++	}
++
++	case OpFConvert:
++	{
++		// nlearn: an f16->f32 (etc.) convert of a COOP MATRIX. Metal has no simdgroup_matrix element
++		// conversion; alias the source and let simdgroup_multiply_accumulate do mixed precision (half
++		// inputs, float accumulate — Metal's native tensor path). Non-coop converts go to the base.
++		auto &rt = get<SPIRType>(ops[0]);
++		if (rt.op == OpTypeCooperativeMatrixKHR)
++		{
++			// nlearn: an f16->f32 (etc.) convert of a COOP MATRIX. Metal has no simdgroup_matrix element
++			// conversion; alias the source and let simdgroup_multiply_accumulate do mixed precision (half
++			// inputs, float accumulate — Metal's native tensor path). Non-coop converts go to the base.
++			// NOTE (2026-07-13): the NARROWING case (f32->bf16 C store-downcast) is INVALID here and must
++			// be prevented on the IREE side (C-promotion), because Metal's simdgroup_store requires the
++			// matrix and pointer element types to MATCH (no cross-type store) — registering the bf16 result
++			// type makes the store emit `bfloat*` for the f32 matrix -> MSL won't compile. See the GQA
++			// hard-blocker notes in ~/nlearn/.coopmatrix_progress.log.
++			emit_op(expression_type_id(ops[2]), ops[1], to_expression(ops[2]), true);
++			inherit_expression_dependencies(ops[1], ops[2]);
++			break;
++		}
++		CompilerGLSL::emit_instruction(instruction);
++		break;
++	}
++
+ 	case OpLoad:
+ 	{
+ 		uint32_t id = ops[1];
+@@ -16490,10 +16615,68 @@ string CompilerMSL::to_qualifiers_glsl(uint32_t id)
+ // The optional id parameter indicates the object whose type we are trying
+ // to find the description for. It is optional. Most type descriptions do not
+ // depend on a specific object's use of that type.
++// nlearn: name for a SPIR-V cooperative matrix rendered as MSL simdgroup_matrix tiles. Metal's
++// simdgroup_matrix is 8x8, so an RxC coop matrix becomes array<simdgroup_matrix<T,8,8>, (R/8)*(C/8)>
++// (a self-contained MSL value type; no custom struct needed). Tile (r,c) is at index r*(C/8)+c.
++// nlearn: a replicated (splat) coop-matrix constant (e.g. the zero-initialized accumulator) -> an
++// array of tiles each built with make_filled_simdgroup_matrix (base GLSL emits an invalid scalar ctor).
++string CompilerMSL::cooperative_matrix_replicated_constant(const SPIRConstant &c)
++{
++	auto &type = get<SPIRType>(c.constant_type);
++	auto &elem = get<SPIRType>(type.parent_type);
++	uint32_t rows = get<SPIRConstant>(type.ext.cooperative.rows_id).scalar();
++	uint32_t cols = get<SPIRConstant>(type.ext.cooperative.columns_id).scalar();
++	uint32_t tiles = (rows / 8) * (cols / 8);
++	if (tiles == 0)
++		tiles = 1;
++	string val = to_expression(c.subconstants[0]);
++	string tile = join("make_filled_simdgroup_matrix<", type_to_glsl(elem), ", 8, 8>(", val, ")");
++	string res = type_to_glsl(type) + "({ ";
++	for (uint32_t i = 0; i < tiles; i++)
++		res += (i ? ", " : "") + tile;
++	res += " })";
++	return res;
++}
++
++// nlearn: SPIR-V coop-matrix Stride is in units of the pointer's pointee type; simdgroup_load/store
++// want elements_per_row in the matrix element (T) units. After we reinterpret the pointer to T*, scale
++// the stride by pointee_bytes / T_bytes (e.g. a vector<4xf32> shared buffer loaded as half -> x8).
++string CompilerMSL::coop_stride_in_elems(uint32_t ptr_op, uint32_t stride_op, const SPIRType &elem)
++{
++	auto &pt = expression_type(ptr_op);
++	auto &ptee = pt.pointer ? get<SPIRType>(pt.parent_type) : pt;
++	uint32_t pbytes = (ptee.width / 8) * (ptee.vecsize ? ptee.vecsize : 1);
++	uint32_t ebytes = elem.width / 8;
++	uint32_t factor = (ebytes && pbytes >= ebytes) ? pbytes / ebytes : 1;
++	if (factor == 0)
++		factor = 1;
++	return factor == 1 ? to_expression(stride_op) : join("(", to_expression(stride_op), " * ", factor, ")");
++}
++
++string CompilerMSL::cooperative_matrix_type_name(const SPIRType &type)
++{
++	auto &elem = get<SPIRType>(type.parent_type);
++	uint32_t rows = get<SPIRConstant>(type.ext.cooperative.rows_id).scalar();
++	uint32_t cols = get<SPIRConstant>(type.ext.cooperative.columns_id).scalar();
++	uint32_t tiles = (rows / 8) * (cols / 8);
++	if (tiles == 0)
++		tiles = 1;
++	// spvCoopMat<T,N> (emitted helper) gives operator[] (so mat[i] tile access works) + a scalar
++	// constructor (so a splat constant like spvCoopMat<float,4>(0.0) is valid MSL).
++	if (spv_function_implementations.count(SPVFuncImplCooperativeMatrix) == 0)
++		add_spv_func_and_recompile(SPVFuncImplCooperativeMatrix);
++	return join("spvCoopMat<", type_to_glsl(elem), ", ", tiles, ">");
++}
++
+ string CompilerMSL::type_to_glsl(const SPIRType &type, uint32_t id, bool member)
+ {
+ 	string type_name;
+ 
++	// nlearn: SPIR-V cooperative matrix -> MSL simdgroup_matrix tiles. Metal's simdgroup_matrix is 8x8,
++	// so an RxC coop matrix is represented as a struct of (R/8)*(C/8) simdgroup_matrix<T,8,8> tiles.
++	if (type.op == OpTypeCooperativeMatrixKHR)
++		return cooperative_matrix_type_name(type);
++
+ 	// Pointer?
+ 	if (is_pointer(type) || type_is_array_of_pointers(type))
+ 	{
+@@ -16649,6 +16832,10 @@ string CompilerMSL::type_to_glsl(const SPIRType &type, uint32_t id, bool member)
+ 	case SPIRType::Half:
+ 		type_name = "half";
+ 		break;
++	case SPIRType::BFloat16:
++		// Metal's native bfloat (MSL 3.1+). nlearn trains in bf16.
++		type_name = "bfloat";
++		break;
+ 	case SPIRType::Float:
+ 		type_name = "float";
+ 		break;
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index 1d17c20..38beef2 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -805,6 +805,7 @@ protected:
+ 		SPVFuncImplQuantizeToF16,
+ 		SPVFuncImplCubemapTo2DArrayFace,
+ 		SPVFuncImplUnsafeArray, // Allow Metal to use the array<T> template to make arrays a value type
++		SPVFuncImplCooperativeMatrix, // nlearn: spvCoopMat<T,N> = tiles of simdgroup_matrix<T,8,8>
+ 		SPVFuncImplStorageMatrix, // Allow threadgroup construction of matrices
+ 		SPVFuncImplInverse4x4,
+ 		SPVFuncImplInverse3x3,
+@@ -922,6 +923,9 @@ protected:
+ 	void emit_struct_padding_target(const SPIRType &type) override;
+ 	std::string type_to_glsl(const SPIRType &type, uint32_t id, bool member);
+ 	std::string type_to_glsl(const SPIRType &type, uint32_t id = 0) override;
++	std::string cooperative_matrix_type_name(const SPIRType &type); // nlearn: coop matrix -> simdgroup tiles
++	std::string coop_stride_in_elems(uint32_t ptr_op, uint32_t stride_op, const SPIRType &elem); // nlearn
++	std::string cooperative_matrix_replicated_constant(const SPIRConstant &c) override; // nlearn
+ 	void emit_block_hints(const SPIRBlock &block) override;
+ 	void emit_mesh_entry_point();
+ 	void emit_mesh_outputs();

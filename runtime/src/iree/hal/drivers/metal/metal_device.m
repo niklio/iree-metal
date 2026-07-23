@@ -6,6 +6,9 @@
 
 #include "iree/hal/drivers/metal/metal_device.h"
 
+#include <stdlib.h>  // getenv, strtol
+#include <unistd.h>  // usleep — headless-DCP submit yield (see queue_execute)
+
 #include "iree/base/api.h"
 #include "iree/base/tracing.h"
 #include "iree/hal/api.h"
@@ -538,6 +541,21 @@ static iree_status_t iree_hal_metal_device_queue_execute(
         iree_hal_device_release(base_device);
       }];
       [signal_command_buffer commit];
+
+      // HEADLESS-DCP MITIGATION (nlearn EXPERIMENT_gpu_yield.md §13): briefly yield the GPU
+      // after each submit so the headless Display Coprocessor / RTBuddy can service its
+      // periodic link re-sync. Without an idle window, sustained submission wedges the DCP and
+      // the userspace watchdog panics the machine (~44-87 min). Env-gated, no-op unless
+      // IREE_HAL_METAL_SUBMIT_YIELD_US is set (e.g. 2000 = 2ms); reintroduces MLX-like gaps.
+      {
+        static long iree_metal_submit_yield_us = -1;  // -1 = uninitialized
+        if (iree_metal_submit_yield_us < 0) {
+          const char* e = getenv("IREE_HAL_METAL_SUBMIT_YIELD_US");
+          iree_metal_submit_yield_us = e ? strtol(e, NULL, 10) : 0;
+        }
+        if (iree_metal_submit_yield_us > 0)
+          usleep((useconds_t)iree_metal_submit_yield_us);
+      }
     }
   } else {
     iree_hal_resource_set_free(resource_set);

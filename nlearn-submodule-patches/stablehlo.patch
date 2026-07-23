@@ -1,0 +1,28 @@
+diff --git a/stablehlo/conversions/linalg/transforms/StablehloToLinalgConvolution.cpp b/stablehlo/conversions/linalg/transforms/StablehloToLinalgConvolution.cpp
+index ccbf43f..4973f00 100644
+--- a/stablehlo/conversions/linalg/transforms/StablehloToLinalgConvolution.cpp
++++ b/stablehlo/conversions/linalg/transforms/StablehloToLinalgConvolution.cpp
+@@ -248,12 +248,21 @@ struct NormalConvolutionOpConversion final
+                                 resultType.getElementType(), dynSizes);
+     Value zeroTensor = fillTensorWithZeros(rewriter, loc, emptyTensor);
+     linalg::LinalgOp res;
++    // nlearn: default strides/dilations must be RANK = numSpatialDims (rank-2),
++    // not a single {1}. jax(0.6) omits window_strides for stride-1 convs, and the
++    // old {1} default produced a rank-1 attr -> linalg.conv_2d_nhwc_hwcf verifier
++    // reject ("strides ... shape [2]"). All-ones over the spatial dims is correct.
++    int64_t numSpatialDims = rank - 2;
+     auto s = op.getWindowStrides();
+     Attribute strides =
+-        s ? rewriter.getI64TensorAttr(*s) : rewriter.getI64TensorAttr({1});
++        s ? rewriter.getI64TensorAttr(*s)
++          : rewriter.getI64TensorAttr(
++                llvm::SmallVector<int64_t>(numSpatialDims, 1));
+     auto d = op.getRhsDilation();
+     Attribute dilations =
+-        d ? rewriter.getI64TensorAttr(*d) : rewriter.getI64TensorAttr({1});
++        d ? rewriter.getI64TensorAttr(*d)
++          : rewriter.getI64TensorAttr(
++                llvm::SmallVector<int64_t>(numSpatialDims, 1));
+ 
+     // Apply padding and input dilation.
+     llvm::SmallVector<int64_t> spatialDimMapping(rank - 2);

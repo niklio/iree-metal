@@ -34,7 +34,8 @@ constexpr unsigned defaultCoopMatrixSoftwarePipelineStoreStage = 0;
 /// Computes the total number of bytes if promoting both matmul LHS and RHS with
 /// the tiven tile sizes.
 int64_t getTileBytes(int64_t mTileSize, int64_t nTileSize, int64_t kTileSize,
-                     int64_t elementBits, bool promoteC);
+                     int64_t elementBits, bool promoteC,
+                     int64_t cElementBits = 0);
 
 /// Adjusts the shared memory usage based on the pipelining depth.
 int64_t getMultiBufferMemoryUsage(int64_t usedBytes, unsigned depth,

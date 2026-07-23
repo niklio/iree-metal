@@ -297,6 +297,42 @@ LogicalResult ScatterOp::generateScalarImplementation(OpBuilder &b,
     starts[dim] = ret;
   }
 
+  // nlearn (NLEARN_SCATTER_ATOMIC): a scatter whose combiner is a single float add (the embedding /
+  // vocab-grad scatter-add) is emitted as a serial load-add-store because unique_indices=false makes
+  // the update dim a reduction. That forces a ~1-workgroup serial kernel (embedding-backward is ~10x
+  // slower than jax-metal). Emit an atomic_rmw addf instead: duplicate indices are handled by the
+  // atomic, so the update dim becomes parallel and the config distributes it across the GPU. (Metal
+  // supports atomic float add; spirv-cross emits OpAtomicFAddEXT.) Falls through to the store below
+  // for any non-add combiner.
+  if (getenv("NLEARN_SCATTER_ATOMIC")) {
+    Block &blk = getRegion().front();
+    auto *term = blk.getTerminator();
+    auto addf = term->getOperand(0).getDefiningOp<arith::AddFOp>();
+    bool isPlainAdd =
+        addf && llvm::hasSingleElement(blk.without_terminator()) &&
+        ((addf.getLhs() == blk.getArgument(0) && addf.getRhs() == blk.getArgument(1)) ||
+         (addf.getLhs() == blk.getArgument(1) && addf.getRhs() == blk.getArgument(0)));
+    auto origTy = dyn_cast<MemRefType>(getOriginal().getType());
+    // memref.atomic_rmw doesn't lower to SPIR-V on a strided rank>1 memref (unlike memref.store, which
+    // flattens the access). So flatten getOriginal() to rank-1 and compute a row-major linear index.
+    // Only for a static contiguous identity-layout original; otherwise fall through to the serial store.
+    if (isPlainAdd && origTy && origTy.hasStaticShape() &&
+        origTy.getLayout().isIdentity()) {
+      SmallVector<ReassociationIndices> reassoc(1);
+      for (int64_t i = 0, e = origTy.getRank(); i < e; ++i) reassoc[0].push_back(i);
+      Value flat = memref::CollapseShapeOp::create(b, loc, getOriginal(), reassoc);
+      Value lin = starts[0];
+      for (int64_t i = 1, e = origTy.getRank(); i < e; ++i) {
+        Value dimSz = arith::ConstantIndexOp::create(b, loc, origTy.getShape()[i]);
+        lin = arith::AddIOp::create(b, loc, arith::MulIOp::create(b, loc, lin, dimSz),
+                                    starts[i]);
+      }
+      memref::AtomicRMWOp::create(b, loc, arith::AtomicRMWKind::addf, update, flat,
+                                  ValueRange{lin});
+      return success();
+    }
+  }
+
   Value init = memref::LoadOp::create(b, loc, getOriginal(), starts);
 
   IRMapping bvm;

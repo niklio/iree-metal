@@ -38,6 +38,12 @@ def DecomposeConcatPass :
   ];
 }
 
+def RaiseContractionAccumulatorToF32Pass
+    : Pass<"iree-global-opt-raise-contraction-accumulator-to-f32", ""> {
+  let summary =
+      "Raises the bf16/f16 accumulator of matmul/batch_matmul to f32 (round once).";
+}
+
 def DemoteContractionInputsToBF16Pass
     : Pass<"iree-global-opt-demote-contraction-inputs-to-bf16", ""> {
   let summary =

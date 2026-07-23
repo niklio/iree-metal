@@ -333,6 +333,40 @@ public:
   }
 };
 
+/// nlearn: promote a bf16/f16-accumulator vector.contract to an f32 accumulator
+/// (+ truncf the result back to the original type) so it can use the
+/// f32-accumulate Apple MMA (WMMAR4_F32_16x16x16_BF16 accumulates f32, stores
+/// bf16). MLIR VectorToGPU lowers the extf/truncf to subgroup_mma_elementwise
+/// (fpExt/fpTruncSupportsMMAMatrixType == true). Paired with the canUpcastAcc
+/// config change (KernelConfig.cpp) — lets NAIVE bf16 models hit the matrix
+/// units. Gated by NLEARN_COOP_UPCAST.
+class PromoteContractAccToF32 final
+    : public OpRewritePattern<vector::ContractionOp> {
+public:
+  using Base::Base;
+
+  LogicalResult matchAndRewrite(vector::ContractionOp op,
+                                PatternRewriter &rewriter) const override {
+    if (!getenv("NLEARN_COOP_UPCAST"))
+      return failure();
+    auto accTy = dyn_cast<VectorType>(op.getAcc().getType());
+    if (!accTy)
+      return failure();
+    Type elem = accTy.getElementType();
+    if (!(elem.isBF16() || elem.isF16()))
+      return failure(); // already f32/other — nothing to promote
+    Location loc = op.getLoc();
+    auto f32AccTy = accTy.clone(rewriter.getF32Type());
+    Value f32Acc = arith::ExtFOp::create(rewriter, loc, f32AccTy, op.getAcc());
+    Value f32Res = vector::ContractionOp::create(
+        rewriter, loc, op.getLhs(), op.getRhs(), f32Acc, op.getIndexingMaps(),
+        op.getIteratorTypes());
+    Value res = arith::TruncFOp::create(rewriter, loc, accTy, f32Res);
+    rewriter.replaceOp(op, res);
+    return success();
+  }
+};
+
 //===----------------------------------------------------------------------===//
 // Main pass
 //===----------------------------------------------------------------------===//

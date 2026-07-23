@@ -113,6 +113,13 @@ int getComputeVectorSize(int64_t size) {
 }
 
 int getMemoryVectorSize(Value source, Type scalarType, int64_t size) {
+  // nlearn: guard non-int/float element types — getIntOrFloatBitWidth() asserts
+  // (and in release SEGFAULTS) on types like `index` or complex, which can show
+  // up in vector.transfer_read of gather/mask index computations (observed in
+  // the jax.nn.dot_product_attention BACKWARD graph). Such vectors can't be
+  // widened to a native memory vector, so read them as scalars (size 1).
+  if (!scalarType.isIntOrFloat())
+    return 1;
   int bitwidth = scalarType.getIntOrFloatBitWidth();
   while (auto sliceOp = source.getDefiningOp<tensor::ExtractSliceOp>()) {
     source = sliceOp.getSource();
@@ -265,8 +272,14 @@ SmallVector<int64_t> getNativeVectorShapeImpl(vector::MultiDimReductionOp op) {
   VectorType srcVectorType = op.getSourceVectorType();
   auto nativeSize = llvm::to_vector(srcVectorType.getShape());
   ArrayRef<int64_t> dims = op.getReductionDims();
-  for (const int64_t dim : dims) {
-    nativeSize[dim] = 1;
+  llvm::SmallDenseSet<int64_t> redSet(dims.begin(), dims.end());
+  for (int64_t i = 0, e = nativeSize.size(); i < e; ++i) {
+    // nlearn (cont80c): also cap the PARALLEL dims to the SPIR-V native compute
+    // vector size (<=4). The original left parallel dims at full width, so an
+    // attention softmax multi_reduction over a mult-16 query-M tile lowered to an
+    // illegal vector<16xf32> (Apple has no Vector16 capability) — the flash-coop
+    // blocker (cont80b). No-op when the parallel dim is already <=4.
+    nativeSize[i] = redSet.contains(i) ? 1 : getComputeVectorSize(nativeSize[i]);
   }
   return nativeSize;
 }
