@@ -13,6 +13,8 @@
 
 #include "iree/compiler/Dialect/LinalgExt/Transforms/Passes.h"
 #include "iree/compiler/Dialect/Util/IR/UtilOps.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vector/Transforms/LoweringPatterns.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -590,6 +592,55 @@ struct CausalHoistTagPass
     });
     if (causal)
       funcOp->setAttr("iree.causal_skip", UnitAttr::get(&getContext()));
+  }
+};
+
+// iree-metal (causal Part 2b): for a func tagged iree.causal_skip, insert a
+// per-workgroup early-return for above-diagonal score blocks (row-block <
+// col-block), whose scores are masked to -inf anyway. Convention for a
+// batch_matmul [B,M,N]: workgroup.id[0]=N-tiles(col), [1]=M-tiles(row).
+struct CausalWorkgroupSkipPass
+    : PassWrapper<CausalWorkgroupSkipPass, OperationPass<>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(CausalWorkgroupSkipPass)
+  StringRef getArgument() const final { return "iree-metal-causal-workgroup-skip"; }
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<cf::ControlFlowDialect, func::FuncDialect,
+                    arith::ArithDialect>();
+  }
+  void runOnOperation() override {
+    Operation *op = getOperation();
+    if (!op->hasAttr("iree.causal_skip"))
+      return;
+    auto func = dyn_cast<mlir::FunctionOpInterface>(op);
+    if (!func || func.getFunctionBody().empty())
+      return;
+    Block &entry = func.getFunctionBody().front();
+    if (!entry.mightHaveTerminator())
+      return;
+    Operation *term = entry.getTerminator();
+    Location loc = op->getLoc();
+    OpBuilder b(&entry, entry.begin());
+    Value row = IREE::HAL::InterfaceWorkgroupIDOp::create(b, loc, 0);
+    Value col = IREE::HAL::InterfaceWorkgroupIDOp::create(b, loc, 1);
+    // keep only lower-triangular blocks: row-block >= col-block.
+    Value keep =
+        arith::CmpIOp::create(b, loc, arith::CmpIPredicate::uge, row, col);
+    // Structured (SPIR-V handles scf.if, not arbitrary cf): wrap the whole body
+    // in scf.if(keep). Above-diagonal workgroups execute an empty region.
+    auto ifOp = scf::IfOp::create(b, loc, keep, /*withElseRegion=*/false);
+    Block *thenBlk = &ifOp.getThenRegion().front();
+    Operation *yield = thenBlk->getTerminator();
+    // Move every op after the guard (the original body, excluding the func
+    // terminator) into the then-region.
+    SmallVector<Operation *> toMove;
+    for (Operation &o : entry) {
+      if (&o == col.getDefiningOp() || &o == row.getDefiningOp() ||
+          &o == keep.getDefiningOp() || &o == ifOp.getOperation() || &o == term)
+        continue;
+      toMove.push_back(&o);
+    }
+    for (Operation *o : toMove)
+      o->moveBefore(yield);
   }
 };
 
@@ -1425,6 +1476,13 @@ void buildSPIRVCodegenPassPipeline(OpPassManager &variantPassManager) {
         .addPass(createSPIRVLowerExecutableTargetPass)
         .addPass(createVerifyWorkgroupDistributionPass);
     addMemRefLoweringPasses(modulePassManager);
+    // iree-metal (causal Part 2b): after the func codegen (workgroup.id now
+    // materialized) and before the SPIR-V conversion, insert the per-workgroup
+    // causal early-return.
+    FunctionLikeNest(modulePassManager)
+        .addPredicatedPass(
+            std::getenv("IREE_METAL_CAUSAL_SKIP") != nullptr,
+            []() { return std::make_unique<CausalWorkgroupSkipPass>(); });
     FunctionLikeNest(modulePassManager).addPass(createGpuEliminateBarriers);
   }
   variantPassManager.addPass(createReconcileTranslationInfoPass());
