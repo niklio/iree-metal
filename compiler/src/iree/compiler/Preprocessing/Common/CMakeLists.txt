@@ -34,6 +34,7 @@ iree_cc_library(
     "FoldAttentionWithTranspose.cpp"
     "GeneralizeLinalgMatMul.cpp"
     "InterpreterPass.cpp"
+    "CausalAttentionTileSkip.cpp"
     "IsolateTransposedReads.cpp"
     "MakeSingleDispatchForFunction.cpp"
     "PadLinalgOps.cpp"
@@ -49,6 +50,8 @@ iree_cc_library(
     MLIRFuncDialect
     MLIRFunctionInterfaces
     MLIRIR
+    MLIRSCFDialect
+    MLIRArithDialect
     MLIRLinalgDialect
     MLIRLinalgTransforms
     MLIRMemRefDialect

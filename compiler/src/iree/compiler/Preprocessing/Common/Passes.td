@@ -111,6 +111,17 @@ def MakeSingleDispatchForFunctionPass :
   ];
 }
 
+def CausalAttentionTileSkipPass :
+    InterfacePass<"iree-preprocessing-causal-attention-tile-skip", "mlir::FunctionOpInterface"> {
+  let summary = "Skip above-diagonal blocks of a causally-masked QK^T score matmul";
+  let dependentDialects = [
+    "::mlir::linalg::LinalgDialect",
+    "::mlir::tensor::TensorDialect",
+    "::mlir::scf::SCFDialect",
+    "::mlir::arith::ArithDialect",
+  ];
+}
+
 def IsolateTransposedReadsPass :
     InterfacePass<"iree-preprocessing-isolate-transposed-reads", "mlir::FunctionOpInterface"> {
   let summary = "Hoist a large parallel generic's permuted (transposed) input read into a standalone coalesced transpose behind a barrier";
