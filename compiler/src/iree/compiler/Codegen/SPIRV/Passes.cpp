@@ -470,11 +470,18 @@ struct ConfigSoftmaxThreadsPass
     : PassWrapper<ConfigSoftmaxThreadsPass, OperationPass<>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ConfigSoftmaxThreadsPass)
   int64_t mBlock = 1;
+  // iree-metal: when coexisting with the COOP matmul path (IREE_METAL_COOP_ATTN_DECOMP),
+  // the qk/pv matmuls already carry a coop lowering_config and must NOT be thread-tiled
+  // (that would clobber coop). Skip any op that already has a lowering_config so only the
+  // config-less softmax generics get thread-distributed.
+  bool skipConfigured = false;
   StringRef getArgument() const final { return "iree-metal-config-softmax-threads"; }
   void runOnOperation() override {
     int64_t m = getenv("IREE_METAL_COOP_ATTN_M") ? atoi(getenv("IREE_METAL_COOP_ATTN_M"))
                                              : mBlock;
     getOperation()->walk([&](linalg::LinalgOp op) {
+      if (skipConfigured && getLoweringConfig(op))
+        return;
       SmallVector<int64_t> ranges = op.getStaticLoopRanges();
       SmallVector<utils::IteratorType> iters = op.getIteratorTypesArray();
       SmallVector<int64_t> threadTile(ranges.size(), 0);
@@ -942,6 +949,26 @@ void addSPIRVVectorDistributeAttentionPassPipeline(
     // preserving their coop lowering_config, so SPIRVVectorizeToCooperativeOps
     // vectorizes them to a coop vector.contract instead of scalar fma.
     funcPassManager.addPass(std::make_unique<SpecializeAttnMatmulPass>());
+    // iree-metal (P2, IREE_METAL_COOP_ATTN_SOFTMAX_DIST): thread-distribute the
+    // config-less online-softmax generics across the subgroup lanes (one query-row
+    // per thread) while the qk/pv matmuls stay COOP. Done pre-bufferize (tensor
+    // level) so GPUApplyTilingLevel(Thread) emits scf.forall(thread); the coop
+    // matmuls carry a lowering_config so skipConfigured leaves them untouched. The
+    // per-row split means rowmax/rowsum are IN-thread (no cross-lane reduction, no
+    // coop-layout dependence — the scores are staged in row-major smem). GPUDistribute
+    // in the tail resolves the forall post-bufferize. Fixes the redundant-on-32-lanes
+    // scalar softmax that made coop attention ~5x slower than the scalar baseline.
+    if (getenv("IREE_METAL_COOP_ATTN_SOFTMAX_DIST")) {
+      auto p = std::make_unique<ConfigSoftmaxThreadsPass>();
+      p->skipConfigured = true;
+      funcPassManager.addPass(std::move(p));
+      GPUApplyTilingLevelPassOptions topts;
+      topts.tilingLevel = IREE::GPU::TilingLevel::Thread;
+      topts.allowZeroSlices = true;
+      funcPassManager.addPass(createGPUApplyTilingLevelPass(topts));
+      funcPassManager.addPass(createConfigTrackingCanonicalizerPass());
+      funcPassManager.addPass(createCSEPass());
+    }
     // iree-metal (attention coop-port P1): bufferize BEFORE the coop passes so the
     // whole sequence (tile-to-coop -> GV -> vectorize-to-coop -> MMA) runs on memrefs,
     // matching the FFN coop pipeline. convertVectorToMMAOps requires memref
@@ -1015,6 +1042,14 @@ void addSPIRVVectorDistributeAttentionPassPipeline(
   funcPassManager.addPass(createCSEPass());
 
   addSPIRVBufferizePasses(funcPassManager, gpuAllocateFunctionMemoryFn);
+  // iree-metal (P2): resolve the softmax scf.forall(thread) into gpu.thread_id-indexed
+  // code now that it is bufferized (GPUDistribute requires memref-level foralls). The
+  // coop matmuls are not in a thread forall so they are untouched.
+  if (getenv("IREE_METAL_COOP_ATTN_SOFTMAX_DIST")) {
+    funcPassManager.addPass(createGPUDistributePass());
+    funcPassManager.addPass(createConfigTrackingCanonicalizerPass());
+    funcPassManager.addPass(createCSEPass());
+  }
   addLoopMaterializationPasses(funcPassManager);
   funcPassManager.addPass(createOptimizeVectorTransferPass());
 }
