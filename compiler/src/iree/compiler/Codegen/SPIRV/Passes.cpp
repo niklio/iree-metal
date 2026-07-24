@@ -475,6 +475,12 @@ struct ConfigSoftmaxThreadsPass
   // (that would clobber coop). Skip any op that already has a lowering_config so only the
   // config-less softmax generics get thread-distributed.
   bool skipConfigured = false;
+  // iree-metal (P2): when distributing the softmax inside a multi-iteration flash
+  // loop, skip the cheap 1-D ops (the per-row running max/sum) — those feed the
+  // flash scf.for iter_args and thread-distributing them breaks the bufferization
+  // aliasing ("yield operand not equivalent to iter bbArg"). Only the 2-D (score
+  // tile) elementwise ops carry the redundant-on-32-lanes cost worth distributing.
+  bool only2D = false;
   StringRef getArgument() const final { return "iree-metal-config-softmax-threads"; }
   void runOnOperation() override {
     int64_t m = getenv("IREE_METAL_COOP_ATTN_M") ? atoi(getenv("IREE_METAL_COOP_ATTN_M"))
@@ -484,6 +490,11 @@ struct ConfigSoftmaxThreadsPass
         return;
       SmallVector<int64_t> ranges = op.getStaticLoopRanges();
       SmallVector<utils::IteratorType> iters = op.getIteratorTypesArray();
+      if (only2D) {
+        int64_t nParallel = llvm::count(iters, utils::IteratorType::parallel);
+        if (nParallel < 2)
+          return;
+      }
       SmallVector<int64_t> threadTile(ranges.size(), 0);
       bool found = false;
       for (auto [i, r] : llvm::enumerate(ranges)) {
@@ -968,6 +979,7 @@ void addSPIRVVectorDistributeAttentionPassPipeline(
       funcPassManager.addPass(createConfigTrackingCanonicalizerPass());
       auto p = std::make_unique<ConfigSoftmaxThreadsPass>();
       p->skipConfigured = true;
+      p->only2D = true;
       funcPassManager.addPass(std::move(p));
       GPUApplyTilingLevelPassOptions topts;
       topts.tilingLevel = IREE::GPU::TilingLevel::Thread;
