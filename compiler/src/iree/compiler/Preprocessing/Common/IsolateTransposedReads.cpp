@@ -41,6 +41,14 @@ namespace {
 // small permuted reads are cheap and materializing them just adds a dispatch.
 static constexpr int64_t kMinIterationElements = 1 << 20; // ~1M
 
+// AND only when the permuted operand itself is at least this large. The
+// uncoalesced-read penalty scales with the operand's size; hoisting small
+// transposed reads just adds a transpose dispatch + barrier for no benefit
+// (measured: firing on every transposed read regressed the full model -4.5%,
+// while restricting to large operands keeps only the wins like the 96x512x512
+// softmax-backward read).
+static constexpr int64_t kMinOperandElements = 1 << 22; // ~4M
+
 struct IsolateTransposedReadsPass
     : iree_compiler::Preprocessing::impl::IsolateTransposedReadsPassBase<
           IsolateTransposedReadsPass> {
@@ -95,6 +103,11 @@ struct IsolateTransposedReadsPass
       // left alone.
       if (map.getNumResults() != numLoops || !map.isPermutation() ||
           map.isIdentity())
+        continue;
+
+      // Only worth a standalone transpose dispatch if the operand is large.
+      if (!tensorType.hasStaticShape() ||
+          tensorType.getNumElements() < kMinOperandElements)
         continue;
 
       // Build the permutation that reorders the operand's dims into iteration
