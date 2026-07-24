@@ -34,6 +34,7 @@ iree_cc_library(
     "FoldAttentionWithTranspose.cpp"
     "GeneralizeLinalgMatMul.cpp"
     "InterpreterPass.cpp"
+    "IsolateTransposedReads.cpp"
     "MakeSingleDispatchForFunction.cpp"
     "PadLinalgOps.cpp"
     "PadToIntrinsics.cpp"

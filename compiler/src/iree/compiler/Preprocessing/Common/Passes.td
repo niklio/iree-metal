@@ -111,6 +111,16 @@ def MakeSingleDispatchForFunctionPass :
   ];
 }
 
+def IsolateTransposedReadsPass :
+    InterfacePass<"iree-preprocessing-isolate-transposed-reads", "mlir::FunctionOpInterface"> {
+  let summary = "Hoist a large parallel generic's permuted (transposed) input read into a standalone coalesced transpose behind a barrier";
+  let dependentDialects = [
+    "::mlir::linalg::LinalgDialect",
+    "::mlir::tensor::TensorDialect",
+    "iree_compiler::IREE::Util::UtilDialect",
+  ];
+}
+
 def PadToIntrinsicsPass :
     Pass<"iree-preprocessing-pad-to-intrinsics", "ModuleOp"> {
   let summary = "Pad linalg ops such that we can use target's intrinsics.";
