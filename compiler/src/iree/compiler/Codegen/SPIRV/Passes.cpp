@@ -573,6 +573,26 @@ static bool vectorFeedsReduction(Value v, int depth) {
 // won't propagate the COp mma type across the barrier, so the softmax stays as
 // regular vector ops (off the matrix units) while qk/pv convert to coop separately —
 // avoiding the invalid f16-accumulator coop op (cont81e/82b) without C-promotion.
+// iree-metal (causal Part 2a): the causal score matmul carries iree.causal_skip
+// (set pre-dispatch by CausalAttentionTileSkip). Hoist that tag onto the enclosing
+// function BEFORE tiling replaces the matmul (which drops the op attr), so the
+// post-distribution workgroup-skip pass can still see it.
+struct CausalHoistTagPass
+    : PassWrapper<CausalHoistTagPass, OperationPass<>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(CausalHoistTagPass)
+  StringRef getArgument() const final { return "iree-metal-causal-hoist-tag"; }
+  void runOnOperation() override {
+    Operation *funcOp = getOperation();
+    bool causal = false;
+    funcOp->walk([&](Operation *op) {
+      if (op->hasAttr("iree.causal_skip"))
+        causal = true;
+    });
+    if (causal)
+      funcOp->setAttr("iree.causal_skip", UnitAttr::get(&getContext()));
+  }
+};
+
 struct VectorContractBarrierPass
     : PassWrapper<VectorContractBarrierPass, OperationPass<>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(VectorContractBarrierPass)
@@ -1395,7 +1415,13 @@ void buildSPIRVCodegenPassPipeline(OpPassManager &variantPassManager) {
     OpPassManager &modulePassManager = variantPassManager.nest<ModuleOp>();
     modulePassManager.addPass(
         createSPIRVLowerExecutableUsingTransformDialectPass());
+    // iree-metal (causal Part 2a): hoist the causal_skip tag to the func before
+    // tiling drops the matmul op attr. Gated; inert unless CausalAttentionTileSkip
+    // tagged the score matmul.
     FunctionLikeNest(modulePassManager)
+        .addPredicatedPass(
+            std::getenv("IREE_METAL_CAUSAL_SKIP") != nullptr,
+            []() { return std::make_unique<CausalHoistTagPass>(); })
         .addPass(createSPIRVLowerExecutableTargetPass)
         .addPass(createVerifyWorkgroupDistributionPass);
     addMemRefLoweringPasses(modulePassManager);
