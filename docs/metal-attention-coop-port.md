@@ -144,3 +144,25 @@ multi-week heart of the port). Metric `CooperativeMatrixMulAdd` still 0, blocked
 ## Validation harness
 `make ab` (correctness-gated, full 10-model), NOT a subset A/B (subset traps: `COOP_BMM_BOOST` looked
 +1.5% on 5 models but was full-suite-neutral). Backup + `make ship` only on a full-suite win.
+
+## P2 (next): SIMD-parallel softmax epilogue — the forward-attention perf win
+
+Real-shape coop attention now COMPILES + is numerically exact (P1, commit 870c9ac), but is
+**~5× slower than the scalar SMEM baseline** (268ms vs ~53ms on 96×512×64). Root cause, confirmed
+by SPIR-V probe (workgroup_size=[32,1,1], **zero** LocalInvocationId/SubgroupLocalInvocationId
+refs) and M-sweep (M=16→268, 32→392, 64→629ms — bigger tiles WORSE): the de-coop'd softmax runs
+**redundantly on all 32 subgroup lanes** (no thread distribution), 32× wasted work that scales with M.
+
+Precise target (post-`iree-linalg-ext-decompose-attention` dump): the softmax epilogue between the
+two coop matmuls is 8 `linalg.generic` ops in the workgroup-mapped `scf.forall` — rowmax-reduce
+(`maximumf`), exp2-of-running-max, exp2-of-scores (16×16), rowsum-reduce (`addf`), acc-rescale
+(`mulf`), final `recip*·/truncf`, +2 truncf/copies. **Only the 2 matmuls carry a `lowering_config`;
+the softmax generics carry none** → never thread-tiled → vectorized then scalarized redundantly.
+
+Design: attach a Thread/subgroup tiling config to the softmax generics (distribute the 16 rows
+across lanes; subgroup-reduce for rowmax/rowsum) while KEEPING the coop matmuls — a
+SpecializeAttnMatmul-analog for the softmax. Hard part (known research blocker): reconciling the
+coop-matmul output simdgroup layout with the softmax vector-distribution layout on Apple. The
+native `SPIRVVectorDistributeAttention` pipeline already distributes these vector<16×16> ops but
+does NOT coop-ify the matmuls on Metal (the original scalar wall) — the P2 win is to combine the two.
+Prereq: `IREE_METAL_COOP_ATTN_THREAD` is a SCALAR (M→1) alternative, NOT this — don't reuse it.
