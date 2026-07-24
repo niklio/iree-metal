@@ -899,8 +899,13 @@ struct FlattenMemRefSubspanPass final
     });
     target.addDynamicallyLegalOp<memref::ReinterpretCastOp>(
         [](memref::ReinterpretCastOp castOp) {
+          // A reinterpret_cast does not lower in ConvertToSPIRV, so it is only
+          // "legal" here when it is a trivial rank<=1 zero-offset view (the
+          // 0-D void-pointer form); anything with a real (non-zero/dynamic)
+          // offset must be rewritten into a foldable subview by the pattern.
           return isRankZeroOrOneMemRef(castOp.getSource().getType()) &&
-                 isRankZeroOrOneMemRef(castOp.getType());
+                 isRankZeroOrOneMemRef(castOp.getType()) &&
+                 isZeroInteger(castOp.getConstifiedMixedOffset());
         });
     target.addDynamicallyLegalOp<gpu::SubgroupMmaLoadMatrixOp>(
         [](gpu::SubgroupMmaLoadMatrixOp loadOp) {

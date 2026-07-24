@@ -959,13 +959,24 @@ void addSPIRVVectorDistributeAttentionPassPipeline(
     // in the tail resolves the forall post-bufferize. Fixes the redundant-on-32-lanes
     // scalar softmax that made coop attention ~5x slower than the scalar baseline.
     if (getenv("IREE_METAL_COOP_ATTN_SOFTMAX_DIST")) {
+      // Isolate the qk/pv coop matmuls from the softmax with an optimization
+      // barrier on the qk score result, so GPUApplyTilingLevel(Thread) tiling the
+      // softmax cannot tile-and-FUSE the matmuls into the thread forall (which
+      // would strip their coop lowering_config). fuseConsumers=false likewise
+      // keeps the pv matmul (a softmax consumer) out of the thread loop.
+      funcPassManager.addPass(std::make_unique<QkScoreBarrierPass>());
+      funcPassManager.addPass(createConfigTrackingCanonicalizerPass());
       auto p = std::make_unique<ConfigSoftmaxThreadsPass>();
       p->skipConfigured = true;
       funcPassManager.addPass(std::move(p));
       GPUApplyTilingLevelPassOptions topts;
       topts.tilingLevel = IREE::GPU::TilingLevel::Thread;
       topts.allowZeroSlices = true;
+      topts.fuseConsumers = false;
       funcPassManager.addPass(createGPUApplyTilingLevelPass(topts));
+      // The barrier has served its purpose (fusion is decided); drop it before
+      // bufferize, which cannot bufferize a tensor optimization_barrier here.
+      funcPassManager.addPass(IREE::Util::createDropCompilerHintsPass());
       funcPassManager.addPass(createConfigTrackingCanonicalizerPass());
       funcPassManager.addPass(createCSEPass());
     }
