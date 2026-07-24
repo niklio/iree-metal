@@ -5,6 +5,7 @@
 
 #include "iree/compiler/GlobalOptimization/Passes.h"
 #include "iree/compiler/Dialect/Flow/Transforms/Passes.h"
+#include "iree/compiler/Preprocessing/Common/Passes.h"
 #include "iree/compiler/Dialect/TensorExt/IR/TensorExtDialect.h"
 #include "iree/compiler/Dialect/Util/Transforms/Passes.h"
 #include "iree/compiler/DispatchCreation/Passes.h"
@@ -194,6 +195,17 @@ void buildGlobalOptimizationPassPipeline(
                                clEnableEdgeReshapePropagation;
                            return createPropagateLinalgTransposePass(options);
                          })
+      // iree-metal (IREE_METAL_ISOLATE_TRANSPOSED_READS): after transposes have
+      // been propagated (and possibly baked into large elementwise consumers as
+      // permuted indexing maps), hoist those permuted reads back out into
+      // standalone coalesced transposes on the Metal backend, where an inlined
+      // transposed read lowers to uncoalesced strided loads (measured 2x on the
+      // softmax-backward dispatch). Off by default.
+      .addPredicatedPass(
+          std::getenv("IREE_METAL_ISOLATE_TRANSPOSED_READS") != nullptr,
+          []() {
+            return Preprocessing::createIsolateTransposedReadsPass();
+          })
       .addPass(IREE::Flow::createCanonicalizePass)
       .addPass(mlir::createCSEPass);
   mainPassManager.addPass(
