@@ -206,6 +206,14 @@ void buildGlobalOptimizationPassPipeline(
           []() {
             return Preprocessing::createIsolateTransposedReadsPass();
           })
+      // iree-metal (IREE_METAL_CAUSAL_SKIP): tag the QK^T score matmul that feeds
+      // a triangular causal mask so the SPIR-V backend can skip above-diagonal
+      // workgroups. Off by default.
+      .addPredicatedPass(
+          std::getenv("IREE_METAL_CAUSAL_SKIP") != nullptr,
+          []() {
+            return Preprocessing::createCausalAttentionTileSkipPass();
+          })
       .addPass(IREE::Flow::createCanonicalizePass)
       .addPass(mlir::createCSEPass);
   mainPassManager.addPass(

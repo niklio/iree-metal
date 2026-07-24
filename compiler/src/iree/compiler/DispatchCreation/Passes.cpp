@@ -6,6 +6,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/compiler/DispatchCreation/Passes.h"
+#include "iree/compiler/Preprocessing/Common/Passes.h"
 
 #include "iree/compiler/Dialect/Flow/Transforms/Passes.h"
 #include "iree/compiler/Dialect/TensorExt/IR/TensorExtDialect.h"
@@ -212,6 +213,13 @@ static void addDispatchRegionCreationPasses(OpPassManager &passManager,
   FunctionLikeNest(passManager)
       // Create dispatches for scalar operations as roots.
       .addPass(DispatchCreation::createFormScalarDispatchesPass)
+      // iree-metal (IREE_METAL_CAUSAL_SKIP): tag the causal QK^T score matmul
+      // here, just before dispatch formation splits the matmul from its
+      // triangular mask (the mask is in row/col linalg.index-compare form at this
+      // point, and still connected to the matmul). Off by default.
+      .addPredicatedPass(
+          std::getenv("IREE_METAL_CAUSAL_SKIP") != nullptr,
+          []() { return Preprocessing::createCausalAttentionTileSkipPass(); })
       // Create `flow.dispatch.region` centered around a root and fuse with
       // producers and consumers.
       .addPass([&] {
