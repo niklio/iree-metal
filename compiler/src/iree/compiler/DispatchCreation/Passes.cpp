@@ -216,7 +216,11 @@ static void addDispatchRegionCreationPasses(OpPassManager &passManager,
       // iree-metal (IREE_METAL_CAUSAL_SKIP): tag the causal QK^T score matmul
       // here, just before dispatch formation splits the matmul from its
       // triangular mask (the mask is in row/col linalg.index-compare form at this
-      // point, and still connected to the matmul). Off by default.
+      // point, and still connected to the matmul). Off by default: the
+      // workgroup-early-return form is a measured -4% net regression (the
+      // scf.if does not reduce launched workgroups), so this is retained only
+      // for the triangular-workgroup-COUNT experiment; set
+      // IREE_METAL_CAUSAL_SKIP=1 to enable.
       .addPredicatedPass(
           std::getenv("IREE_METAL_CAUSAL_SKIP") != nullptr,
           []() { return Preprocessing::createCausalAttentionTileSkipPass(); })
