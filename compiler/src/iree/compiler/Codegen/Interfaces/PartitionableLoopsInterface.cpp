@@ -10,6 +10,7 @@
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenOps.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtDialect.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/SmallVectorExtras.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -225,6 +226,46 @@ struct AllParallelAsPartitionableLoops
   }
 };
 
+/// Attention with an LSE result can only be partitioned along dimensions shared
+/// by both outputs. In particular, partitioning the value/output N dimension
+/// would make every N tile write the same complete batch/M LSE slice.
+struct AttentionOpPartitionableLoops
+    : PartitionableLoopsInterface::ExternalModel<AttentionOpPartitionableLoops,
+                                                 IREE::LinalgExt::AttentionOp> {
+  llvm::SmallVector<unsigned>
+  getPartitionableLoops(Operation *op,
+                        std::optional<unsigned> maxNumPartitionedLoops) const {
+    auto attentionOp = cast<IREE::LinalgExt::AttentionOp>(op);
+    bool hasLogsumexp = static_cast<bool>(attentionOp.getLogsumexp());
+    llvm::SmallDenseSet<unsigned> logsumexpDims;
+    if (std::optional<AffineMap> logsumexpMap = attentionOp.getLogsumexpMap()) {
+      for (AffineExpr expr : logsumexpMap->getResults()) {
+        logsumexpDims.insert(cast<AffineDimExpr>(expr).getPosition());
+      }
+    }
+
+    SmallVector<unsigned> partitionableLoops;
+    for (auto [index, iteratorType] :
+         llvm::enumerate(attentionOp.getLoopIteratorTypes())) {
+      if (iteratorType != utils::IteratorType::parallel) {
+        continue;
+      }
+      if (hasLogsumexp && !logsumexpDims.contains(index)) {
+        continue;
+      }
+      partitionableLoops.push_back(index);
+    }
+    if (maxNumPartitionedLoops.has_value() &&
+        partitionableLoops.size() > maxNumPartitionedLoops.value()) {
+      partitionableLoops.erase(partitionableLoops.begin(),
+                               std::next(partitionableLoops.begin(),
+                                         partitionableLoops.size() -
+                                             maxNumPartitionedLoops.value()));
+    }
+    return partitionableLoops;
+  }
+};
+
 /// Registers the `LinalgOpPartitionableLoops` model for all Linalg ops. This
 /// needs to be done on a op-by-op basis since registration is on an op-by-op
 /// basis.
@@ -295,7 +336,7 @@ void registerPartitionableLoopsInterfaceModels(DialectRegistry &registry) {
     IREE::LinalgExt::Im2colOp::attachInterface<
         AllParallelAsPartitionableLoops<IREE::LinalgExt::Im2colOp>>(*ctx);
     IREE::LinalgExt::AttentionOp::attachInterface<
-        AllParallelAsPartitionableLoops<IREE::LinalgExt::AttentionOp>>(*ctx);
+        AttentionOpPartitionableLoops>(*ctx);
     IREE::LinalgExt::OnlineAttentionOp::attachInterface<
         AllParallelAsPartitionableLoops<IREE::LinalgExt::OnlineAttentionOp>>(
         *ctx);

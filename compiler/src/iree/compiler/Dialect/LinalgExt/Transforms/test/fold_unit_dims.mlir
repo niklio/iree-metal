@@ -196,3 +196,85 @@ util.func public @map_store_all_unit(%input: tensor<1x1xf16>) -> tensor<2x2xf16>
 //       SLICE:   iree_linalg_ext.map_store %[[INPUT_SLICE]] into %[[DEST]]
 //       SLICE:       %[[C0:.+]] = arith.constant 0 : index
 //       SLICE:       iree_linalg_ext.yield  %[[C0]], %[[C0]]
+
+// -----
+
+#q = affine_map<(b, m, k1, k2, n) -> (b, m, k1)>
+#k = affine_map<(b, m, k1, k2, n) -> (b, k2, k1)>
+#v = affine_map<(b, m, k1, k2, n) -> (b, k2, n)>
+#s = affine_map<(b, m, k1, k2, n) -> ()>
+#o = affine_map<(b, m, k1, k2, n) -> (b, m, n)>
+
+func.func @attention_preserves_exp_mode(
+    %query: tensor<1x2x2xf32>,
+    %key: tensor<1x3x2xf32>,
+    %value: tensor<1x3x4xf32>)
+    -> tensor<1x2x4xf32> {
+  %scale = arith.constant 1.0 : f32
+  %output = tensor.empty() : tensor<1x2x4xf32>
+  %result = iree_linalg_ext.attention {
+      decomposition_config = {use_exp2 = false},
+      indexing_maps = [#q, #k, #v, #s, #o]}
+      ins(%query, %key, %value, %scale :
+          tensor<1x2x2xf32>, tensor<1x3x2xf32>,
+          tensor<1x3x4xf32>, f32)
+      outs(%output : tensor<1x2x4xf32>) {
+    ^bb0(%score: f32):
+      iree_linalg_ext.yield %score : f32
+  } -> tensor<1x2x4xf32>
+  return %result : tensor<1x2x4xf32>
+}
+
+// SLICE-LABEL: func.func @attention_preserves_exp_mode
+// SLICE: iree_linalg_ext.attention
+// SLICE-SAME: decomposition_config = {use_exp2 = false}
+// SLICE: } -> tensor<2x4xf32>
+
+// RESHAPE-LABEL: func.func @attention_preserves_exp_mode
+// RESHAPE: iree_linalg_ext.attention
+// RESHAPE-SAME: decomposition_config = {use_exp2 = false}
+// RESHAPE: } -> tensor<2x4xf32>
+
+// -----
+
+#q = affine_map<(b, m, k1, k2, n) -> (b, m, k1)>
+#k = affine_map<(b, m, k1, k2, n) -> (b, k2, k1)>
+#v = affine_map<(b, m, k1, k2, n) -> (b, k2, n)>
+#s = affine_map<(b, m, k1, k2, n) -> ()>
+#o = affine_map<(b, m, k1, k2, n) -> (b, m, n)>
+#lse = affine_map<(b, m, k1, k2, n) -> (b, m)>
+
+func.func @attention_two_results_drop_batch_and_query(
+    %query: tensor<1x1x8xf32>,
+    %key: tensor<1x6x8xf32>,
+    %value: tensor<1x6x16xf32>)
+    -> (tensor<1x1x16xf32>, tensor<1x1xf32>) {
+  %scale = arith.constant 1.0 : f32
+  %output = tensor.empty() : tensor<1x1x16xf32>
+  %logsumexp = tensor.empty() : tensor<1x1xf32>
+  %result:2 = iree_linalg_ext.attention {
+      decomposition_config = {use_exp2 = false},
+      indexing_maps = [#q, #k, #v, #s, #o, #lse]}
+      ins(%query, %key, %value, %scale :
+          tensor<1x1x8xf32>, tensor<1x6x8xf32>,
+          tensor<1x6x16xf32>, f32)
+      outs(%output, %logsumexp :
+          tensor<1x1x16xf32>, tensor<1x1xf32>) {
+    ^bb0(%score: f32):
+      iree_linalg_ext.yield %score : f32
+  } -> tensor<1x1x16xf32>, tensor<1x1xf32>
+  return %result#0, %result#1 :
+      tensor<1x1x16xf32>, tensor<1x1xf32>
+}
+
+// SLICE-LABEL: func.func @attention_two_results_drop_batch_and_query
+// SLICE: %[[ATTN:.+]]:2 = iree_linalg_ext.attention
+// SLICE-SAME: decomposition_config = {use_exp2 = false}
+// SLICE: outs({{.*}} : tensor<16xf32>, tensor<f32>)
+// SLICE: } -> tensor<16xf32>, tensor<f32>
+
+// RESHAPE-LABEL: func.func @attention_two_results_drop_batch_and_query
+// RESHAPE: %[[ATTN:.+]]:2 = iree_linalg_ext.attention
+// RESHAPE-SAME: decomposition_config = {use_exp2 = false}
+// RESHAPE: outs({{.*}} : tensor<16xf32>, tensor<f32>)
+// RESHAPE: } -> tensor<16xf32>, tensor<f32>

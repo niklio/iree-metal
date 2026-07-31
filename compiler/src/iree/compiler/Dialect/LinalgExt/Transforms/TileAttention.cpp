@@ -8,8 +8,10 @@
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/LinalgExt/Transforms/Passes.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/IndexingUtils.h"
+#include "llvm/ADT/APFloat.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Utils/Utils.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Pass/Pass.h"
 
@@ -24,13 +26,62 @@ struct ConvertAttentionToOnlineAttentionPass final
     : impl::ConvertAttentionToOnlineAttentionPassBase<
           ConvertAttentionToOnlineAttentionPass> {
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<IREE::LinalgExt::IREELinalgExtDialect,
-                    linalg::LinalgDialect, tensor::TensorDialect>();
+    registry.insert<IREE::LinalgExt::IREELinalgExtDialect, arith::ArithDialect,
+                    linalg::LinalgDialect, math::MathDialect,
+                    tensor::TensorDialect>();
   }
   void runOnOperation() override;
 };
 
 } // namespace
+
+static Value createLogsumexp(RewriterBase &rewriter, Location loc,
+                             AffineMap maxMap, AffineMap sumMap,
+                             AffineMap logsumexpMap, Value max, Value sum,
+                             Value logsumexpInit, bool useExp2,
+                             bool negativeInfForZeroSum) {
+  SmallVector<AffineMap> compressedMaps =
+      compressUnusedDims(SmallVector<AffineMap>{maxMap, sumMap, logsumexpMap});
+  maxMap = compressedMaps[0];
+  sumMap = compressedMaps[1];
+  logsumexpMap = compressedMaps[2];
+
+  SmallVector<utils::IteratorType> iteratorTypes(maxMap.getNumDims(),
+                                                 utils::IteratorType::parallel);
+  auto genericOp = linalg::GenericOp::create(
+      rewriter, loc, logsumexpInit.getType(), ValueRange{max, sum},
+      logsumexpInit, SmallVector<AffineMap>{maxMap, sumMap, logsumexpMap},
+      iteratorTypes, [&](OpBuilder &b, Location loc, ValueRange args) {
+        auto resultType = cast<FloatType>(args[2].getType());
+        Value max = convertScalarToDtype(b, loc, args[0], resultType,
+                                         /*isUnsignedCast=*/false);
+        Value sum = convertScalarToDtype(b, loc, args[1], resultType,
+                                         /*isUnsignedCast=*/false);
+        Value logSum = useExp2 ? math::Log2Op::create(b, loc, sum).getResult()
+                               : math::LogOp::create(b, loc, sum).getResult();
+        Value result = arith::AddFOp::create(b, loc, max, logSum);
+        if (useExp2) {
+          Value ln2 = arith::ConstantOp::create(
+              b, loc, b.getFloatAttr(resultType, 0.6931471805599453));
+          result = arith::MulFOp::create(b, loc, result, ln2);
+        }
+        if (negativeInfForZeroSum) {
+          Value zero = arith::ConstantOp::create(
+              b, loc, b.getFloatAttr(resultType, 0.0));
+          Value sumIsZero = arith::CmpFOp::create(
+              b, loc, arith::CmpFPredicate::OEQ, sum, zero);
+          Value negativeInf = arith::ConstantOp::create(
+              b, loc,
+              b.getFloatAttr(resultType,
+                             APFloat::getInf(resultType.getFloatSemantics(),
+                                             /*Negative=*/true)));
+          result =
+              arith::SelectOp::create(b, loc, sumIsZero, negativeInf, result);
+        }
+        linalg::YieldOp::create(b, loc, result);
+      });
+  return genericOp.getResult(0);
+}
 
 void convertToOnlineAttention(IREE::LinalgExt::AttentionOp attnOp,
                               SmallVectorImpl<Operation *> &ops,
@@ -57,6 +108,13 @@ void convertToOnlineAttention(IREE::LinalgExt::AttentionOp attnOp,
   AffineMap sumMap = maxMap;
 
   AffineMap accMap = attnOp.getOutputMap();
+  bool useExp2 = true;
+  if (DictionaryAttr config = attnOp.getDecompositionConfigAttr()) {
+    if (auto useExp2Attr =
+            config.getAs<BoolAttr>(AttentionOp::getUseExp2AttrStr())) {
+      useExp2 = useExp2Attr.getValue();
+    }
+  }
 
   SmallVector<Range> domain = attnOp.getIterationDomain(rewriter);
 
@@ -96,7 +154,8 @@ void convertToOnlineAttention(IREE::LinalgExt::AttentionOp attnOp,
           .getResult(0);
 
   // Create online attention op.
-  SmallVector<AffineMap> indexingMaps = attnOp.getIndexingMapsArray();
+  SmallVector<AffineMap> indexingMaps = attnOp.getIndexingMapsForOperands();
+  indexingMaps.push_back(accMap);
   indexingMaps.push_back(maxMap);
   indexingMaps.push_back(sumMap);
 
@@ -118,6 +177,7 @@ void convertToOnlineAttention(IREE::LinalgExt::AttentionOp attnOp,
   ops.push_back(onlineAttn);
 
   Value x = onlineAttn.getResult(0);
+  Value max = onlineAttn.getResult(1);
   Value sum = onlineAttn.getResult(2);
 
   // Merge the outputs of online attention:
@@ -162,7 +222,16 @@ void convertToOnlineAttention(IREE::LinalgExt::AttentionOp attnOp,
       });
   ops.push_back(genericOp);
 
-  rewriter.replaceOp(attnOp, genericOp);
+  SmallVector<Value> replacements{genericOp.getResult(0)};
+  if (Value logsumexpInit = attnOp.getLogsumexp()) {
+    Value logsumexp = createLogsumexp(rewriter, loc, maxMap, sumMap,
+                                      *attnOp.getLogsumexpMap(), max, sum,
+                                      logsumexpInit, useExp2,
+                                      /*negativeInfForZeroSum=*/hasIntegerMask);
+    ops.push_back(logsumexp.getDefiningOp());
+    replacements.push_back(logsumexp);
+  }
+  rewriter.replaceOp(attnOp, replacements);
 }
 
 void ConvertAttentionToOnlineAttentionPass::runOnOperation() {

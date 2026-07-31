@@ -372,6 +372,57 @@ static Value normalizeAttentionWeights(OpBuilder &builder, Location loc,
   return genericOp.getResult(0);
 }
 
+// Compute the row-wise log-sum-exp from the maximum and exponential sum used
+// by softmax. When exp2 is used, both the maximum and logarithm are in base-2
+// units and must be converted back to natural-log units.
+static Value computeLogsumexp(OpBuilder &builder, Location loc,
+                              AffineMap maxMap, AffineMap sumMap,
+                              AffineMap logsumexpMap, Value max, Value sum,
+                              Value logsumexp, bool useExp2,
+                              bool negativeInfForZeroSum) {
+  SmallVector<AffineMap> compressedMaps =
+      compressUnusedDims(SmallVector<AffineMap>{maxMap, sumMap, logsumexpMap});
+  maxMap = compressedMaps[0];
+  sumMap = compressedMaps[1];
+  logsumexpMap = compressedMaps[2];
+
+  SmallVector<utils::IteratorType> iteratorTypes(maxMap.getNumDims(),
+                                                 utils::IteratorType::parallel);
+  auto genericOp = linalg::GenericOp::create(
+      builder, loc, logsumexp.getType(), ValueRange{max, sum}, logsumexp,
+      SmallVector<AffineMap>{maxMap, sumMap, logsumexpMap}, iteratorTypes,
+      [&](OpBuilder &b, Location loc, ValueRange args) {
+        auto resultType = cast<FloatType>(args[2].getType());
+        Value max = convertScalarToDtype(b, loc, args[0], resultType,
+                                         /*isUnsignedCast=*/false);
+        Value sum = convertScalarToDtype(b, loc, args[1], resultType,
+                                         /*isUnsignedCast=*/false);
+        Value logSum = useExp2 ? math::Log2Op::create(b, loc, sum).getResult()
+                               : math::LogOp::create(b, loc, sum).getResult();
+        Value result = arith::AddFOp::create(b, loc, max, logSum);
+        if (useExp2) {
+          Value ln2 = arith::ConstantOp::create(
+              b, loc, b.getFloatAttr(resultType, 0.6931471805599453));
+          result = arith::MulFOp::create(b, loc, result, ln2);
+        }
+        if (negativeInfForZeroSum) {
+          Value zero = arith::ConstantOp::create(
+              b, loc, b.getFloatAttr(resultType, 0.0));
+          Value sumIsZero = arith::CmpFOp::create(
+              b, loc, arith::CmpFPredicate::OEQ, sum, zero);
+          Value negativeInf = arith::ConstantOp::create(
+              b, loc,
+              b.getFloatAttr(resultType,
+                             APFloat::getInf(resultType.getFloatSemantics(),
+                                             /*Negative=*/true)));
+          result =
+              arith::SelectOp::create(b, loc, sumIsZero, negativeInf, result);
+        }
+        linalg::YieldOp::create(b, loc, result);
+      });
+  return genericOp.getResult(0);
+}
+
 // Helper method to check if a slice will be contiguous given the offset,
 // slice size. This checks that `inputSize` and `offset` are both evenly
 // divisible by `tileSize`.
@@ -501,9 +552,13 @@ FailureOr<SmallVector<Value>> AttentionOp::decomposeOperation(OpBuilder &b) {
   DictionaryAttr config = getDecompositionConfigAttr();
 
   DictionaryAttr qkAttrs, pvAttrs;
+  bool useExp2 = true;
   if (config) {
     qkAttrs = config.getAs<DictionaryAttr>(getQKAttrStr());
     pvAttrs = config.getAs<DictionaryAttr>(getPVAttrStr());
+    if (auto useExp2Attr = config.getAs<BoolAttr>(getUseExp2AttrStr())) {
+      useExp2 = useExp2Attr.getValue();
+    }
   }
   Value output = getOutput();
 
@@ -528,7 +583,7 @@ FailureOr<SmallVector<Value>> AttentionOp::decomposeOperation(OpBuilder &b) {
   // ---- QK Matmul + elementwise math ----
   Value s = computeQKAndElementwise(
       loc, b, query, key, getScale(), mask, qMap, kMap, sMap, getMaskMap(),
-      sizes, f32Type, getRegion(), qkAttrs, lowPrecision, /*useExp2=*/true);
+      sizes, f32Type, getRegion(), qkAttrs, lowPrecision, useExp2);
 
   // ---- Softmax ----
 
@@ -568,9 +623,9 @@ FailureOr<SmallVector<Value>> AttentionOp::decomposeOperation(OpBuilder &b) {
   // max = rowMax(S)
   Value max = reduce<arith::MaximumFOp>(b, loc, sMap, maxMap, s, maxFill);
 
-  // P = exp2(S - max)
+  // P = exp2(S - max) or exp(S - max), depending on useExp2.
   AffineMap pMap = sMap;
-  Value p = computeSubAndExp(b, loc, maxMap, sMap, max, s, /*useExp2=*/true);
+  Value p = computeSubAndExp(b, loc, maxMap, sMap, max, s, useExp2);
   // Optional operands are represented as an engaged optional containing a
   // null Value when absent, so test the Value rather than optional engagement.
   bool hasIntegerMask = mask != nullptr && isIntegerMask(*mask);
@@ -580,6 +635,13 @@ FailureOr<SmallVector<Value>> AttentionOp::decomposeOperation(OpBuilder &b) {
 
   // sum = rowSum(P)
   Value sum = reduce<arith::AddFOp>(b, loc, pMap, sumMap, p, sumFill);
+
+  Value logsumexp;
+  if (Value logsumexpInit = getLogsumexp()) {
+    logsumexp = computeLogsumexp(b, loc, maxMap, sumMap, *getLogsumexpMap(),
+                                 max, sum, logsumexpInit, useExp2,
+                                 /*negativeInfForZeroSum=*/hasIntegerMask);
+  }
 
   // P = P / sum
   p = normalizeAttentionWeights(b, loc, pMap, sumMap, p, sum,
@@ -606,7 +668,11 @@ FailureOr<SmallVector<Value>> AttentionOp::decomposeOperation(OpBuilder &b) {
     result.getDefiningOp()->setAttrs(pvAttrs);
   }
 
-  return SmallVector<Value>{result};
+  SmallVector<Value> results{result};
+  if (logsumexp) {
+    results.push_back(logsumexp);
+  }
+  return results;
 }
 
 //===----------------------------------------------------------------------===//

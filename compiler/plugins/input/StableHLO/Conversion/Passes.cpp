@@ -21,6 +21,8 @@
 #include "mlir/Transforms/Passes.h"
 #include "stablehlo/transforms/Passes.h"
 
+#include <cstdlib>
+
 namespace mlir::iree_compiler::stablehlo {
 namespace {
 #define GEN_PASS_REGISTRATION
@@ -59,6 +61,25 @@ void buildStableHLOInputConversionPassPipelineImpl(
   passManager.addPass(createFlattenTuplesInSCF());
   if (detuple) {
     passManager.addPass(createFlattenTuplesInCFG());
+  }
+
+  if (std::getenv("IREE_STABLEHLO_RAISE_ATTENTION")) {
+    // The paired native attention raiser needs the outlined JAX mask helpers
+    // inlined and the forward/VJP graph canonicalized, but it must run before
+    // StableHLO preprocessing collapses the rank-4 batched attention dots
+    // through flattened batch/head dimensions. Keep the earlier invocation
+    // for explicit flash custom calls and use this distinct, phase-gated
+    // invocation for the transactional native raise.
+    passManager.addPass(mlir::createInlinerPass());
+    passManager.addNestedPass<func::FuncOp>(mlir::createCanonicalizerPass());
+    passManager.addNestedPass<func::FuncOp>(createStableHLOCanonicalize());
+    passManager.addNestedPass<func::FuncOp>(mlir::createCSEPass());
+    ConvertFlashAttentionDispatchOptions attentionOptions;
+    attentionOptions.raiseNativeAttention = true;
+    passManager.addPass(createConvertFlashAttentionDispatch(attentionOptions));
+    passManager.addNestedPass<func::FuncOp>(mlir::createCanonicalizerPass());
+    passManager.addNestedPass<func::FuncOp>(createStableHLOCanonicalize());
+    passManager.addNestedPass<func::FuncOp>(mlir::createCSEPass());
   }
 
   passManager.addPass(createStableHLOToStableHLOPreprocessing());

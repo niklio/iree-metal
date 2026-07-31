@@ -2794,6 +2794,10 @@ AttentionOp::getTiledImplementation(OpBuilder &builder,
       getPermutedRange(getValueMap(), offsets, sizes);
   SmallVector<Range> outputSlice =
       getPermutedRange(getOutputMap(), offsets, sizes);
+  SmallVector<Range> logsumexpSlice;
+  if (auto logsumexpMap = getLogsumexpMap()) {
+    logsumexpSlice = getPermutedRange(*logsumexpMap, offsets, sizes);
+  }
 
   Value scale = getScale();
 
@@ -2841,10 +2845,21 @@ AttentionOp::getTiledImplementation(OpBuilder &builder,
     slices.push_back(outputSliceOp);
   }
 
+  // Logsumexp
+  if (Value logsumexp = getLogsumexp()) {
+    Operation *logsumexpSliceOp =
+        getSlice(builder, loc, logsumexp, logsumexpSlice);
+    tiledOperands.emplace_back(logsumexpSliceOp->getResult(0));
+    slices.push_back(logsumexpSliceOp);
+  }
+
   SmallVector<Type> resultTypes;
   if (hasPureTensorSemantics()) {
     int64_t baseIdx = attnMask ? 5 : 4;
     resultTypes.push_back(tiledOperands[baseIdx].getType());
+    if (getLogsumexp()) {
+      resultTypes.push_back(tiledOperands[baseIdx + 1].getType());
+    }
   }
 
   Operation *tiledOp =
@@ -2865,6 +2880,12 @@ LogicalResult AttentionOp::getResultTilePosition(
   switch (resultNumber) {
   case 0:
     resultIndexingMap = getOutputMap();
+    break;
+  case 1:
+    if (!getLogsumexpMap()) {
+      return failure();
+    }
+    resultIndexingMap = *getLogsumexpMap();
     break;
   default:
     return failure();
@@ -2892,7 +2913,21 @@ AttentionOp::generateResultTileValue(OpBuilder &builder, unsigned resultNumber,
       llvm::map_to_vector(iterationDomain, [](Range x) { return x.size; });
   SmallVector<OpFoldResult> normalizedOffsets(getIterationDomainRank(),
                                               builder.getIndexAttr(0));
-  ArrayRef<AffineExpr> outputDims = getOutputMap().getResults();
+  AffineMap resultMap;
+  switch (resultNumber) {
+  case 0:
+    resultMap = getOutputMap();
+    break;
+  case 1:
+    if (!getLogsumexpMap()) {
+      return failure();
+    }
+    resultMap = *getLogsumexpMap();
+    break;
+  default:
+    return failure();
+  }
+  ArrayRef<AffineExpr> outputDims = resultMap.getResults();
   for (int i = 0; i < outputDims.size(); i++) {
     int dim = cast<AffineDimExpr>(outputDims[i]).getPosition();
     normalizedOffsets[dim] = offsets[i];
@@ -3241,10 +3276,10 @@ static Value elementwiseValueInPlace(OpBuilder &builder, Location loc,
   return genericOp.getResult(0);
 }
 
-// Compute output = exp2(output - input)
-static Value computeSubAndExp2(OpBuilder &builder, Location loc,
-                               AffineMap inputMap, AffineMap outputMap,
-                               Value input, Value output) {
+// Compute output = exp2(output - input) or exp(output - input).
+static Value computeSubAndExp(OpBuilder &builder, Location loc,
+                              AffineMap inputMap, AffineMap outputMap,
+                              Value input, Value output, bool useExp2) {
   SmallVector<AffineMap> compressedMaps =
       compressUnusedDims(SmallVector<AffineMap>{inputMap, outputMap});
   inputMap = compressedMaps[0];
@@ -3260,7 +3295,8 @@ static Value computeSubAndExp2(OpBuilder &builder, Location loc,
         Value in = convertScalarToDtype(b, loc, args[0], args[1].getType(),
                                         /*isUnsignedCast=*/false);
         Value diff = arith::SubFOp::create(b, loc, args[1], in);
-        Value weight = math::Exp2Op::create(b, loc, diff);
+        Value weight = useExp2 ? math::Exp2Op::create(b, loc, diff).getResult()
+                               : math::ExpOp::create(b, loc, diff).getResult();
         linalg::YieldOp::create(b, loc, weight);
       });
   return genericOp.getResult(0);
@@ -3279,14 +3315,21 @@ FailureOr<MergeResult> OnlineAttentionOp::mergeReductions(
   AffineMap partialAccMap = getPartialResultMap(getOutputMap(), opInfo);
   AffineMap partialMaxMap = getPartialResultMap(getMaxMap(), opInfo);
   AffineMap partialSumMap = getPartialResultMap(getSumMap(), opInfo);
+  bool useExp2 = true;
+  if (DictionaryAttr config = getDecompositionConfigAttr()) {
+    if (auto useExp2Attr = config.getAs<BoolAttr>(getUseExp2AttrStr())) {
+      useExp2 = useExp2Attr.getValue();
+    }
+  }
 
   // newMax = max(maxInit, rowMax(partialMax))
   linalg::ReduceOp reducedMax = reduceOnK2<arith::MaximumFOp>(
       *this, partialMaxMap, opInfo, b, loc, partialReduce[1], getMax());
 
-  // norm = exp2(partialMax - newMax)
-  Value norm = computeSubAndExp2(b, loc, getMaxMap(), partialMaxMap,
-                                 reducedMax.getResult(0), partialReduce[1]);
+  // norm = exp2(partialMax - newMax) or exp(partialMax - newMax).
+  Value norm =
+      computeSubAndExp(b, loc, getMaxMap(), partialMaxMap,
+                       reducedMax.getResult(0), partialReduce[1], useExp2);
 
   // normSum = norm * partialSum
   Value normSum = elementwiseValueInPlace<arith::MulFOp>(

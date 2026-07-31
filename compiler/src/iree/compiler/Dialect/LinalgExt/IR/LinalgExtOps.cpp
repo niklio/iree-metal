@@ -9,6 +9,7 @@
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtInterfaces.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/IndexingUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
@@ -43,6 +44,7 @@
 #include "mlir/Support/LogicalResult.h"
 
 #include <cstdint>
+#include <initializer_list>
 #include <optional>
 
 namespace mlir::iree_compiler::IREE::LinalgExt {
@@ -1755,32 +1757,106 @@ void AttentionOp::build(OpBuilder &odsBuilder, OperationState &odsState,
                         std::optional<Value> mask) {
   Value maskIn = mask.value_or(Value());
   build(odsBuilder, odsState, results, query, key, value, scale, maskIn, output,
-        indexingMaps, DictionaryAttr());
+        Value(), indexingMaps, DictionaryAttr());
+}
+
+void AttentionOp::build(OpBuilder &odsBuilder, OperationState &odsState,
+                        TypeRange results, Value query, Value key, Value value,
+                        Value scale, Value output, Value logsumexp,
+                        ArrayAttr indexingMaps, std::optional<Value> mask) {
+  Value maskIn = mask.value_or(Value());
+  build(odsBuilder, odsState, results, query, key, value, scale, maskIn, output,
+        logsumexp, indexingMaps, DictionaryAttr());
 }
 
 void AttentionOp::build(OpBuilder &odsBuilder, OperationState &odsState,
                         TypeRange results, ValueRange inputOperands,
                         ValueRange initOperands, ArrayAttr indexingMaps) {
   assert(inputOperands.size() < 6);
-  assert(initOperands.size() == 1);
+  assert(initOperands.size() == 1 || initOperands.size() == 2);
   Value mask = inputOperands.size() > 4 ? inputOperands[4] : Value();
+  Value logsumexp = initOperands.size() > 1 ? initOperands[1] : Value();
   build(odsBuilder, odsState, results, inputOperands[0], inputOperands[1],
-        inputOperands[2], inputOperands[3], mask, initOperands[0], indexingMaps,
-        DictionaryAttr());
+        inputOperands[2], inputOperands[3], mask, initOperands[0], logsumexp,
+        indexingMaps, DictionaryAttr());
 }
 
 LogicalResult AttentionOp::verify() {
   AttentionOp attnOp = *this;
+
+  if (DictionaryAttr config = getDecompositionConfigAttr()) {
+    if (Attribute useExp2 = config.get("use_exp2");
+        useExp2 && !isa<BoolAttr>(useExp2)) {
+      return emitOpError(
+          "expected decomposition_config entry 'use_exp2' to be a boolean");
+    }
+    if (Attribute qkAttrs = config.get("qk_attrs");
+        qkAttrs && !isa<DictionaryAttr>(qkAttrs)) {
+      return emitOpError(
+          "expected decomposition_config entry 'qk_attrs' to be a dictionary");
+    }
+    if (Attribute pvAttrs = config.get("pv_attrs");
+        pvAttrs && !isa<DictionaryAttr>(pvAttrs)) {
+      return emitOpError(
+          "expected decomposition_config entry 'pv_attrs' to be a dictionary");
+    }
+  }
 
   // Check if indexing maps can represent attention.
   SmallVector<AffineMap> indexingMaps = attnOp.getIndexingMapsArray();
   if (indexingMaps.size() != getOperation()->getNumOperands()) {
     return attnOp->emitOpError("expected an indexing map for each operand");
   }
+  for (auto [index, map] : llvm::enumerate(indexingMaps)) {
+    if (map.getNumSymbols() != 0 || !map.isProjectedPermutation()) {
+      return attnOp->emitOpError(
+                 "expected all indexing maps to be symbol-free projected "
+                 "permutations; map ")
+             << index << " is not";
+    }
+  }
+  int64_t domainRank = getQueryMap().getNumDims();
+  SmallVector<std::pair<StringRef, AffineMap>> primaryMaps = {
+      {"key", getKeyMap()},
+      {"value", getValueMap()},
+      {"output", getOutputMap()},
+  };
+  for (auto [name, map] : primaryMaps) {
+    if (map.getNumDims() != domainRank) {
+      return attnOp->emitOpError()
+             << name << " indexing map has a domain inconsistent with query";
+    }
+  }
   FailureOr<AttentionOpDetail> maybeOpInfo = AttentionOpDetail::get(
       getQueryMap(), getKeyMap(), getValueMap(), getOutputMap());
   if (failed(maybeOpInfo)) {
     return attnOp->emitOpError("failed to verify op's indexing maps");
+  }
+  AttentionOpDetail opInfo = maybeOpInfo.value();
+
+  if (Value logsumexp = getLogsumexp()) {
+    if (!getElementTypeOrSelf(logsumexp.getType()).isF32()) {
+      return attnOp->emitOpError("expected logsumexp element type to be f32");
+    }
+
+    AffineMap logsumexpMap = *getLogsumexpMap();
+    SmallVector<int64_t> expectedDims;
+    llvm::append_range(expectedDims, opInfo.getBatchDims());
+    llvm::append_range(expectedDims, opInfo.getMDims());
+    SmallVector<int64_t> actualDims;
+    for (AffineExpr expr : logsumexpMap.getResults()) {
+      auto dimExpr = dyn_cast<AffineDimExpr>(expr);
+      if (!dimExpr) {
+        return attnOp->emitOpError(
+            "expected logsumexp indexing map to be a projected permutation");
+      }
+      actualDims.push_back(dimExpr.getPosition());
+    }
+    if (actualDims != expectedDims) {
+      return attnOp->emitOpError(
+          "expected logsumexp indexing map to contain the batch dimensions "
+          "followed by the query dimensions");
+    }
   }
 
   FloatType scaleElementType = dyn_cast<FloatType>(getScale().getType());
@@ -1827,6 +1903,13 @@ LogicalResult AttentionOp::verify() {
                         getOutputMap()))) {
     return failure();
   }
+  if (Value logsumexp = getLogsumexp()) {
+    if (failed(checkShape("Logsumexp",
+                          cast<ShapedType>(logsumexp.getType()).getShape(),
+                          *getLogsumexpMap()))) {
+      return failure();
+    }
+  }
 
   // Additional check case if mask exists
   if (auto maskMap = getMaskMap()) {
@@ -1854,11 +1937,102 @@ LogicalResult AttentionOp::verify() {
       failed(checkDomain("Output", getOutputMap()))) {
     return failure();
   }
+  if (auto logsumexpMap = getLogsumexpMap()) {
+    if (failed(checkDomain("Logsumexp", *logsumexpMap))) {
+      return failure();
+    }
+  }
 
   // Additional check case if mask exists
   if (auto maskMap = getMaskMap()) {
     if (failed(checkDomain("Mask", *maskMap))) {
       return failure();
+    }
+  }
+  if (getScaleMap().getNumResults() != 0) {
+    return attnOp->emitOpError(
+        "expected scale indexing map to have no results");
+  }
+
+  // The two-result form is the canonical semantic attention representation
+  // consumed by the backward op. Enforce its exact dimension categories while
+  // preserving the more permissive one-result form accepted by existing
+  // transformation pipelines.
+  if (getLogsumexp()) {
+    using DimSet = llvm::SmallDenseSet<int64_t>;
+    auto getDims = [](AffineMap map) {
+      DimSet dims;
+      for (AffineExpr expr : map.getResults()) {
+        dims.insert(cast<AffineDimExpr>(expr).getPosition());
+      }
+      return dims;
+    };
+    auto equalSets = [](const DimSet &lhs, const DimSet &rhs) {
+      return lhs.size() == rhs.size() &&
+             llvm::all_of(lhs, [&](int64_t dim) { return rhs.contains(dim); });
+    };
+    auto unionInto = [](DimSet &result, const DimSet &other) {
+      result.insert(other.begin(), other.end());
+    };
+
+    DimSet batchDims(opInfo.getBatchDims().begin(),
+                     opInfo.getBatchDims().end());
+    DimSet mDims(opInfo.getMDims().begin(), opInfo.getMDims().end());
+    DimSet k1Dims(opInfo.getK1Dims().begin(), opInfo.getK1Dims().end());
+    DimSet k2Dims(opInfo.getK2Dims().begin(), opInfo.getK2Dims().end());
+    DimSet nDims(opInfo.getNDims().begin(), opInfo.getNDims().end());
+    SmallVector<const DimSet *> categories = {&batchDims, &mDims, &k1Dims,
+                                              &k2Dims, &nDims};
+    for (auto [index, lhs] : llvm::enumerate(categories)) {
+      for (const DimSet *rhs : llvm::drop_begin(categories, index + 1)) {
+        if (llvm::any_of(*lhs,
+                         [&](int64_t dim) { return rhs->contains(dim); })) {
+          return attnOp->emitOpError(
+              "attention batch/M/K1/K2/N dimension categories must be "
+              "pairwise disjoint");
+        }
+      }
+    }
+    DimSet allDims;
+    for (const DimSet *category : categories) {
+      unionInto(allDims, *category);
+    }
+    if (allDims.size() != domainRank) {
+      return attnOp->emitOpError(
+          "attention batch/M/K1/K2/N dimensions must cover the map domain");
+    }
+    auto checkMapCategories =
+        [&](StringRef name, AffineMap actual,
+            std::initializer_list<const DimSet *> expectedCategories)
+        -> LogicalResult {
+      DimSet expected;
+      for (const DimSet *category : expectedCategories) {
+        unionInto(expected, *category);
+      }
+      if (!equalSets(getDims(actual), expected)) {
+        return attnOp->emitOpError()
+               << name << " map has dimensions inconsistent with attention";
+      }
+      return success();
+    };
+    if (failed(checkMapCategories("query", getQueryMap(),
+                                  {&batchDims, &mDims, &k1Dims})) ||
+        failed(checkMapCategories("key", getKeyMap(),
+                                  {&batchDims, &k2Dims, &k1Dims})) ||
+        failed(checkMapCategories("value", getValueMap(),
+                                  {&batchDims, &k2Dims, &nDims})) ||
+        failed(checkMapCategories("output", getOutputMap(),
+                                  {&batchDims, &mDims, &nDims}))) {
+      return failure();
+    }
+    if (std::optional<AffineMap> maskMap = getMaskMap()) {
+      DimSet scoreDims = getDims(opInfo.getSMap());
+      for (AffineExpr expr : maskMap->getResults()) {
+        if (!scoreDims.contains(cast<AffineDimExpr>(expr).getPosition())) {
+          return attnOp->emitOpError(
+              "mask indexing map must use only attention score dimensions");
+        }
+      }
     }
   }
 
@@ -1882,7 +2056,7 @@ LogicalResult AttentionOp::verify() {
 
 MutableOperandRange AttentionOp::getDpsInitsMutable() {
   return MutableOperandRange(*this, /*numInputs=*/getMask() ? 5 : 4,
-                             /*numInits=*/1);
+                             /*numInits=*/getLogsumexp() ? 2 : 1);
 }
 
 LogicalResult AttentionOp::reifyResultShapes(
@@ -1959,6 +2133,24 @@ void OnlineAttentionOp::build(OpBuilder &odsBuilder, OperationState &odsState,
 
 LogicalResult OnlineAttentionOp::verify() {
   OnlineAttentionOp attnOp = *this;
+
+  if (DictionaryAttr config = getDecompositionConfigAttr()) {
+    if (Attribute useExp2 = config.get("use_exp2");
+        useExp2 && !isa<BoolAttr>(useExp2)) {
+      return emitOpError(
+          "expected decomposition_config entry 'use_exp2' to be a boolean");
+    }
+    if (Attribute qkAttrs = config.get("qk_attrs");
+        qkAttrs && !isa<DictionaryAttr>(qkAttrs)) {
+      return emitOpError(
+          "expected decomposition_config entry 'qk_attrs' to be a dictionary");
+    }
+    if (Attribute pvAttrs = config.get("pv_attrs");
+        pvAttrs && !isa<DictionaryAttr>(pvAttrs)) {
+      return emitOpError(
+          "expected decomposition_config entry 'pv_attrs' to be a dictionary");
+    }
+  }
 
   SmallVector<AffineMap> indexingMaps = attnOp.getIndexingMapsArray();
 
@@ -2650,6 +2842,7 @@ DEFINE_OP_GET_EFFECTS(WinogradInputTransformOp)
 DEFINE_OP_GET_EFFECTS(WinogradFilterTransformOp)
 DEFINE_OP_GET_EFFECTS(WinogradOutputTransformOp)
 DEFINE_OP_GET_EFFECTS(AttentionOp)
+DEFINE_OP_GET_EFFECTS(AttentionBackwardOp)
 DEFINE_OP_GET_EFFECTS(OnlineAttentionOp)
 DEFINE_OP_GET_EFFECTS(ExpReductionOp)
 DEFINE_OP_GET_EFFECTS(Im2colOp)

@@ -5,11 +5,12 @@
 
 #include "iree/compiler/GlobalOptimization/Passes.h"
 #include "iree/compiler/Dialect/Flow/Transforms/Passes.h"
-#include "iree/compiler/Preprocessing/Common/Passes.h"
+#include "iree/compiler/Dialect/LinalgExt/Transforms/Passes.h"
 #include "iree/compiler/Dialect/TensorExt/IR/TensorExtDialect.h"
 #include "iree/compiler/Dialect/Util/Transforms/Passes.h"
 #include "iree/compiler/DispatchCreation/Passes.h"
 #include "iree/compiler/Modules/IO/Parameters/Transforms/Passes.h"
+#include "iree/compiler/Preprocessing/Common/Passes.h"
 #include "iree/compiler/Utils/PassUtils.h"
 #include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
@@ -281,7 +282,18 @@ void buildGlobalOptimizationPassPipeline(
       .addPass(mlir::createCSEPass)
       // After running const-eval to a fixed point and folding unit extent dims,
       // try any new raising opportunities.
-      .addPass(createRaiseSpecialOpsPass);
+      .addPass(createRaiseSpecialOpsPass)
+      // Attention backward's three gradient results require incompatible
+      // iterator classifications, so the aggregate intentionally has no single
+      // tiling interface. Decompose it into independently tileable linalg
+      // operations before dispatch formation attempts to select roots.
+      .addPass([]() {
+        IREE::LinalgExt::DecomposeAggregatedOpPassOptions options;
+        options.filterOps = "iree_linalg_ext.attention_backward";
+        return IREE::LinalgExt::createDecomposeAggregatedOpPass(options);
+      })
+      .addPass(IREE::Flow::createCanonicalizePass)
+      .addPass(mlir::createCSEPass);
 
   // Export after const-eval. If the user wants to keep the input constants
   // as is in the final parameter archive, they will probably want to disable

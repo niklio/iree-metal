@@ -2252,6 +2252,66 @@ module attributes { transform.with_named_sequence } {
 
 // -----
 
+func.func @attention_with_logsumexp(
+    %query: tensor<8x16x4xf32>,
+    %key: tensor<8x16x4xf32>,
+    %value: tensor<8x16x4xf32>)
+    -> (tensor<8x16x4xf32>, tensor<8x16xf32>) {
+  %output = tensor.empty() : tensor<8x16x4xf32>
+  %logsumexp = tensor.empty() : tensor<8x16xf32>
+  %scale = arith.constant 1.0 : f32
+  %result:2 = iree_linalg_ext.attention {
+      indexing_maps = [
+        affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2)>,
+        affine_map<(d0, d1, d2, d3, d4) -> (d0, d3, d2)>,
+        affine_map<(d0, d1, d2, d3, d4) -> (d0, d3, d4)>,
+        affine_map<(d0, d1, d2, d3, d4) -> ()>,
+        affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d4)>,
+        affine_map<(d0, d1, d2, d3, d4) -> (d0, d1)>
+      ]}
+      ins(%query, %key, %value, %scale :
+          tensor<8x16x4xf32>, tensor<8x16x4xf32>,
+          tensor<8x16x4xf32>, f32)
+      outs(%output, %logsumexp :
+          tensor<8x16x4xf32>, tensor<8x16xf32>) {
+    ^bb0(%score: f32):
+      iree_linalg_ext.yield %score : f32
+  } -> tensor<8x16x4xf32>, tensor<8x16xf32>
+  return %result#0, %result#1 : tensor<8x16x4xf32>, tensor<8x16xf32>
+}
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(
+      %module_op: !transform.any_op {transform.readonly}) {
+    %0 = transform.structured.match
+        ops{["iree_linalg_ext.attention"]} in %module_op
+        : (!transform.any_op) -> !transform.any_op
+    %1, %loops:2 = transform.structured.tile_using_for %0
+        tile_sizes [2, 4]
+        : (!transform.any_op)
+          -> (!transform.any_op, !transform.any_op, !transform.any_op)
+    transform.yield
+  }
+}
+
+// CHECK-LABEL: func.func @attention_with_logsumexp(
+// CHECK:       scf.for
+// CHECK-SAME:    iter_args(%{{.+}} = %{{.+}}, %{{.+}} = %{{.+}})
+// CHECK:         scf.for
+// CHECK-SAME:      iter_args(%[[OUTPUT_ITER:.+]] = %{{.+}}, %[[LSE_ITER:.+]] = %{{.+}})
+// CHECK:           %[[OUTPUT_SLICE:.+]] = tensor.extract_slice %[[OUTPUT_ITER]]
+// CHECK-SAME:        to tensor<2x4x4xf32>
+// CHECK:           %[[LSE_SLICE:.+]] = tensor.extract_slice %[[LSE_ITER]]
+// CHECK-SAME:        to tensor<2x4xf32>
+// CHECK:           %[[TILED:.+]]:2 = iree_linalg_ext.attention
+// CHECK-SAME:        outs(%[[OUTPUT_SLICE]], %[[LSE_SLICE]] :
+// CHECK-SAME:        tensor<2x4x4xf32>, tensor<2x4xf32>)
+// CHECK:           %[[OUTPUT_NEXT:.+]] = tensor.insert_slice %[[TILED]]#0
+// CHECK:           %[[LSE_NEXT:.+]] = tensor.insert_slice %[[TILED]]#1
+// CHECK:           scf.yield %[[OUTPUT_NEXT]], %[[LSE_NEXT]]
+// CHECK:       return %{{.+}}#0, %{{.+}}#1
+
+// -----
+
 func.func @attention_float_mask(%query: tensor<192x1024x64xf32>, %key: tensor<192x1024x64xf32>, %value: tensor<192x1024x64xf32>, %mask: tensor<192x1024x1024xf32>) -> tensor<192x1024x64xf32> {
   %0 = tensor.empty() : tensor<192x1024x64xf32>
   %scale = arith.constant 1.0 : f32
@@ -2617,7 +2677,8 @@ func.func @online_attention_partial_reduction(%query: tensor<192x?x64xf32>, %key
   %sum_fill = linalg.fill ins(%sum_ident : f32) outs(%row_red_empty : tensor<192x?xf32>) -> tensor<192x?xf32>
 
   %out:3 = iree_linalg_ext.online_attention
-        { indexing_maps = [#mapQ, #mapK, #mapV, #mapS, #mapO, #mapR, #mapR] }
+        { decomposition_config = {use_exp2 = false},
+          indexing_maps = [#mapQ, #mapK, #mapV, #mapS, #mapO, #mapR, #mapR] }
         ins(%query, %key, %value, %scale : tensor<192x?x64xf32>, tensor<192x?x64xf32>, tensor<192x?x64xf32>, f32)
         outs(%output_fill, %acc_fill, %sum_fill : tensor<192x?x64xf32>, tensor<192x?xf32>, tensor<192x?xf32>) {
                       ^bb0(%score: f32):
@@ -2679,7 +2740,7 @@ func.func @online_attention_partial_reduction(%query: tensor<192x?x64xf32>, %key
 
 // CHECK: %[[NORM:.+]] = linalg.generic
 // CHECK:     arith.subf
-// CHECK:     math.exp2
+// CHECK:     math.exp
 // CHECK:     linalg.yield
 
 // CHECK: %[[NORM_SUM:.+]] = linalg.generic

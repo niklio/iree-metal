@@ -262,3 +262,57 @@ util.func public @no_attention_producer(%arg0: tensor<4x8x4x?x32x2x64xf32>, %arg
 }
 // CHECK-LABEL: @no_attention_producer(
 //   CHECK-NOT: #iree_encoding.pad_encoding_layout
+
+// -----
+
+// Check that an attention producer with an auxiliary result isn't padded.
+
+util.func public @no_multi_result_attention_producer(
+    %query: tensor<8x16xf32>,
+    %key: tensor<2048x16xf32>,
+    %value: tensor<2048x2048xf32>,
+    %rhs: tensor<2048x8xf32>,
+    %scale: f32) -> (tensor<8x8xf32>, tensor<8xf32>) {
+  %c0 = arith.constant 0.0 : f32
+  %producer:2 = flow.dispatch.region
+      -> (tensor<8x2048xf32>, tensor<8xf32>) {
+    %output = tensor.empty() : tensor<8x2048xf32>
+    %logsumexp = tensor.empty() : tensor<8xf32>
+    %attention:2 = iree_linalg_ext.attention {
+        indexing_maps = [
+          affine_map<(d0, d1, d2, d3) -> (d0, d2)>,
+          affine_map<(d0, d1, d2, d3) -> (d3, d2)>,
+          affine_map<(d0, d1, d2, d3) -> (d3, d1)>,
+          affine_map<(d0, d1, d2, d3) -> ()>,
+          affine_map<(d0, d1, d2, d3) -> (d0, d1)>,
+          affine_map<(d0, d1, d2, d3) -> (d0)>
+        ]}
+        ins(%query, %key, %value, %scale :
+            tensor<8x16xf32>, tensor<2048x16xf32>,
+            tensor<2048x2048xf32>, f32)
+        outs(%output, %logsumexp :
+            tensor<8x2048xf32>, tensor<8xf32>) {
+      ^bb0(%score: f32):
+        iree_linalg_ext.yield %score : f32
+    } -> tensor<8x2048xf32>, tensor<8xf32>
+    flow.return %attention#0, %attention#1 :
+        tensor<8x2048xf32>, tensor<8xf32>
+  }
+  %consumer = flow.dispatch.region -> (tensor<8x8xf32>) {
+    %empty = tensor.empty() : tensor<8x8xf32>
+    %fill = linalg.fill ins(%c0 : f32)
+        outs(%empty : tensor<8x8xf32>) -> tensor<8x8xf32>
+    %matmul = linalg.matmul
+        ins(%producer#0, %rhs : tensor<8x2048xf32>, tensor<2048x8xf32>)
+        outs(%fill : tensor<8x8xf32>) -> tensor<8x8xf32>
+    flow.return %matmul : tensor<8x8xf32>
+  }
+  util.return %consumer, %producer#1 :
+      tensor<8x8xf32>, tensor<8xf32>
+}
+
+// CHECK-LABEL: @no_multi_result_attention_producer(
+//   CHECK-NOT: iree_encoding.set_encoding
+//   CHECK-NOT: iree_encoding.unset_encoding
+//   CHECK-NOT: #iree_encoding.padding
+//       CHECK: util.return

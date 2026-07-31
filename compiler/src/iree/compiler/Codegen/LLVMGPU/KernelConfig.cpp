@@ -769,7 +769,10 @@ LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
   if (ShapedType::isDynamic(bounds[opInfo.getK1Dims().back()]) ||
       ShapedType::isDynamic(bounds[opInfo.getK2Dims().back()]) ||
       ShapedType::isDynamic(bounds[opInfo.getNDims().back()]) ||
-      ShapedType::isDynamic(bounds[opInfo.getMDims().back()])) {
+      ShapedType::isDynamic(bounds[opInfo.getMDims().back()]) ||
+      (op.getLogsumexp() && llvm::any_of(opInfo.getNDims(), [&](int64_t dim) {
+         return ShapedType::isDynamic(bounds[dim]);
+       }))) {
     return failure();
   }
 
@@ -959,6 +962,13 @@ LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
     }
     subgroupBasis.counts[nDim] = pvSchedule.nSubgroupCounts[i];
   }
+  if (op.getLogsumexp()) {
+    // LSE has no N dimension. Use one workgroup tile across the complete N
+    // extent so only one workgroup writes each batch/M LSE element.
+    for (int64_t nDim : nDims) {
+      workgroupTileSizes[nDim] = bounds[nDim];
+    }
+  }
   for (auto [i, k2Dim] : llvm::enumerate(k2Dims)) {
     reductionTileSizes[k2Dim] = pvSchedule.kTileSizes[i];
     // Multiply by the intrinsic shape for the inner most dim.
@@ -1058,14 +1068,14 @@ LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
   auto qkAttrDict = b.getDictionaryAttr(qkAttrs);
   auto pvAttrDict = b.getDictionaryAttr(pvAttrs);
 
-  SmallVector<NamedAttribute, 2> decompositionConfig;
-  decompositionConfig.emplace_back(IREE::LinalgExt::AttentionOp::getQKAttrStr(),
-                                   qkAttrDict);
-  decompositionConfig.emplace_back(IREE::LinalgExt::AttentionOp::getPVAttrStr(),
-                                   pvAttrDict);
+  NamedAttrList decompositionConfig(op.getDecompositionConfigAttr());
+  decompositionConfig.set(IREE::LinalgExt::AttentionOp::getQKAttrStr(),
+                          qkAttrDict);
+  decompositionConfig.set(IREE::LinalgExt::AttentionOp::getPVAttrStr(),
+                          pvAttrDict);
 
   DictionaryAttr decompositionConfigDict =
-      b.getDictionaryAttr(decompositionConfig);
+      decompositionConfig.getDictionary(context);
 
   auto configDict = b.getDictionaryAttr(attrs);
   auto loweringConfig = IREE::GPU::LoweringConfigAttr::get(context, configDict);
@@ -1110,6 +1120,7 @@ static LogicalResult setAttentionReductionConfig(
   }
 
   SmallVector<int64_t> bounds = maybeBounds.value();
+  SmallVector<int64_t> originalBounds = bounds;
 
   auto opInfo =
       IREE::LinalgExt::AttentionOpDetail::get(
@@ -1279,6 +1290,17 @@ static LogicalResult setAttentionReductionConfig(
     }
     workgroupTileSizes[dim] = dimSize;
   }
+  if (op.getLogsumexp()) {
+    // LSE does not carry N, so serially iterating multiple N workgroup tiles
+    // would recompute the complete score reduction for every output tile.
+    // Keep N whole, matching the intrinsic schedule's single-writer rule.
+    for (int64_t dim : opInfo.getNDims()) {
+      if (ShapedType::isDynamic(originalBounds[dim])) {
+        return failure();
+      }
+      workgroupTileSizes[dim] = originalBounds[dim];
+    }
+  }
 
   // Tile remaining reduction dimensions to serial loops.
   SmallVector<int64_t> reductionTileSizes(opInfo.getDomainRank(), 0);
@@ -1346,17 +1368,17 @@ static LogicalResult setAttentionReductionConfig(
   auto qkAttrDict = b.getDictionaryAttr(qkAttrs);
   auto pvAttrDict = b.getDictionaryAttr(pvAttrs);
 
-  SmallVector<NamedAttribute, 2> decompositionConfig;
-  decompositionConfig.emplace_back(IREE::LinalgExt::AttentionOp::getQKAttrStr(),
-                                   qkAttrDict);
-  decompositionConfig.emplace_back(IREE::LinalgExt::AttentionOp::getPVAttrStr(),
-                                   pvAttrDict);
+  NamedAttrList decompositionConfig(op.getDecompositionConfigAttr());
+  decompositionConfig.set(IREE::LinalgExt::AttentionOp::getQKAttrStr(),
+                          qkAttrDict);
+  decompositionConfig.set(IREE::LinalgExt::AttentionOp::getPVAttrStr(),
+                          pvAttrDict);
 
   SmallVector<NamedAttribute, 1> pipelineAttrs;
   setAttentionPipelineAttributes(target, pipelineAttrs);
 
   // Set attention decomposition control config.
-  op.setDecompositionConfigAttr(b.getDictionaryAttr(decompositionConfig));
+  op.setDecompositionConfigAttr(decompositionConfig.getDictionary(context));
 
   auto configDict = b.getDictionaryAttr(attrs);
   auto loweringConfig = IREE::GPU::LoweringConfigAttr::get(context, configDict);

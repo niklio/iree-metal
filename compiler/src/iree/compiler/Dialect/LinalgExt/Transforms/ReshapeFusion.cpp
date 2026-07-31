@@ -465,6 +465,13 @@ static std::optional<Value>
 fuseWithReshapeByExpansion(OpTy op, Operation *reshapeOp,
                            OpOperand *fusableOpOperand,
                            PatternRewriter &rewriter) {
+  // This helper currently rewrites and returns only result 0. Fail before
+  // moving any SSA definitions or cloning the operation when an aggregate has
+  // multiple destinations (for example attention with an LSE result).
+  if (op.getNumDpsInits() != 1) {
+    return std::nullopt;
+  }
+
   Location loc = op.getLoc();
   // Check if reshape is expanding or collapsing.
   auto expandingReshapeOp = dyn_cast<tensor::ExpandShapeOp>(*reshapeOp);
@@ -504,7 +511,6 @@ fuseWithReshapeByExpansion(OpTy op, Operation *reshapeOp,
     mapping.map(operand.get(), maybeNewOperand.value());
   }
 
-  assert(op.getNumDpsInits() == 1);
   OpOperand *original = op.getDpsInitOperand(0);
   auto newOp = cast<OpTy>(rewriter.clone(*op, mapping));
   newOp->getResult(0).setType(mapping.lookup(original->get()).getType());
@@ -1066,10 +1072,21 @@ static Operation *createCollapsedOp(AttentionOp origOp,
     maskOperand = inputOperands[4];
   }
 
-  auto collapsedOp = AttentionOp::create(
-      rewriter, origOp.getLoc(), resultTypes, inputOperands[0],
-      inputOperands[1], inputOperands[2], inputOperands[3], outputOperands[0],
-      rewriter.getAffineMapArrayAttr(indexingMaps), maskOperand);
+  AttentionOp collapsedOp;
+  if (outputOperands.size() == 2) {
+    collapsedOp = AttentionOp::create(
+        rewriter, origOp.getLoc(), resultTypes, inputOperands[0],
+        inputOperands[1], inputOperands[2], inputOperands[3], outputOperands[0],
+        outputOperands[1], rewriter.getAffineMapArrayAttr(indexingMaps),
+        maskOperand);
+  } else {
+    collapsedOp = AttentionOp::create(
+        rewriter, origOp.getLoc(), resultTypes, inputOperands[0],
+        inputOperands[1], inputOperands[2], inputOperands[3], outputOperands[0],
+        rewriter.getAffineMapArrayAttr(indexingMaps), maskOperand);
+  }
+  collapsedOp.setDecompositionConfigAttr(origOp.getDecompositionConfigAttr());
+  collapsedOp->setDiscardableAttrs(origOp->getDiscardableAttrDictionary());
   rewriter.inlineRegionBefore(origOp.getRegion(), collapsedOp.getRegion(),
                               collapsedOp.getRegion().begin());
   return collapsedOp;
@@ -1168,6 +1185,10 @@ struct DropAttentionUnitDims final
           newOperands.take_front(attentionOp.getNumDpsInputs()),
           newOperands.take_back(attentionOp.getNumDpsInits()),
           b.getAffineMapArrayAttr(newIndexingMaps));
+      if (DictionaryAttr config = attentionOp.getDecompositionConfigAttr()) {
+        newOp.setDecompositionConfigAttr(config);
+      }
+      newOp->setDiscardableAttrs(attentionOp->getDiscardableAttrDictionary());
       b.cloneRegionBefore(attentionOp.getRegion(), newOp.getRegion(),
                           newOp.getRegion().begin());
       return newOp;

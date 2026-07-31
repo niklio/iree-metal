@@ -189,3 +189,95 @@ func.func @concat_along_first(%arg0 : tensor<?x?xf32>, %arg1 : tensor<?x?xf32>) 
 }
 // CHECK-LABEL: func.func @concat_along_first(
 //       CHECK:   util.unfoldable_constant dense<1> : tensor<1xi32>
+
+// -----
+
+#q = affine_map<(b, m, k1, k2, n) -> (b, m, k1)>
+#k = affine_map<(b, m, k1, k2, n) -> (b, k2, k1)>
+#v = affine_map<(b, m, k1, k2, n) -> (b, k2, n)>
+#s = affine_map<(b, m, k1, k2, n) -> ()>
+#o = affine_map<(b, m, k1, k2, n) -> (b, m, n)>
+
+func.func @attention_single_result(
+    %query: tensor<2x4x8xf32>, %key: tensor<2x6x8xf32>,
+    %value: tensor<2x6x16xf32>) -> tensor<2x4x16xf32> {
+  %scale = arith.constant 1.0 : f32
+  %output = tensor.empty() : tensor<2x4x16xf32>
+  %result = iree_linalg_ext.attention {
+      __test_interface__ = true,
+      indexing_maps = [#q, #k, #v, #s, #o]}
+      ins(%query, %key, %value, %scale :
+          tensor<2x4x8xf32>, tensor<2x6x8xf32>,
+          tensor<2x6x16xf32>, f32)
+      outs(%output : tensor<2x4x16xf32>) {
+    ^bb0(%score: f32):
+      iree_linalg_ext.yield %score : f32
+  } -> tensor<2x4x16xf32>
+  return %result : tensor<2x4x16xf32>
+}
+// CHECK-LABEL: func.func @attention_single_result(
+//       CHECK:   util.unfoldable_constant dense<[0, 1, 4]> : tensor<3xi32>
+
+// -----
+
+#q = affine_map<(b, m, k1, k2, n) -> (b, m, k1)>
+#k = affine_map<(b, m, k1, k2, n) -> (b, k2, k1)>
+#v = affine_map<(b, m, k1, k2, n) -> (b, k2, n)>
+#s = affine_map<(b, m, k1, k2, n) -> ()>
+#o = affine_map<(b, m, k1, k2, n) -> (b, m, n)>
+#lse = affine_map<(b, m, k1, k2, n) -> (b, m)>
+
+func.func @attention_with_logsumexp(
+    %query: tensor<2x4x8xf32>, %key: tensor<2x6x8xf32>,
+    %value: tensor<2x6x16xf32>)
+    -> (tensor<2x4x16xf32>, tensor<2x4xf32>) {
+  %scale = arith.constant 1.0 : f32
+  %output = tensor.empty() : tensor<2x4x16xf32>
+  %logsumexp = tensor.empty() : tensor<2x4xf32>
+  %result:2 = iree_linalg_ext.attention {
+      __test_interface__ = true,
+      indexing_maps = [#q, #k, #v, #s, #o, #lse]}
+      ins(%query, %key, %value, %scale :
+          tensor<2x4x8xf32>, tensor<2x6x8xf32>,
+          tensor<2x6x16xf32>, f32)
+      outs(%output, %logsumexp :
+          tensor<2x4x16xf32>, tensor<2x4xf32>) {
+    ^bb0(%score: f32):
+      iree_linalg_ext.yield %score : f32
+  } -> tensor<2x4x16xf32>, tensor<2x4xf32>
+  return %result#0, %result#1 :
+      tensor<2x4x16xf32>, tensor<2x4xf32>
+}
+// CHECK-LABEL: func.func @attention_with_logsumexp(
+//       CHECK:   util.unfoldable_constant dense<[0, 1]> : tensor<2xi32>
+
+// -----
+
+#q = affine_map<(k1, k2, n) -> (k1)>
+#k = affine_map<(k1, k2, n) -> (k2, k1)>
+#v = affine_map<(k1, k2, n) -> (k2, n)>
+#s = affine_map<(k1, k2, n) -> ()>
+#o = affine_map<(k1, k2, n) -> (n)>
+#lse = affine_map<(k1, k2, n) -> ()>
+
+// A scalar LSE has no safe partitioning dimension: even partitioning the
+// output-only N dimension would make every tile write the same scalar.
+func.func @attention_with_scalar_logsumexp(
+    %query: tensor<8xf32>, %key: tensor<6x8xf32>,
+    %value: tensor<6x16xf32>) -> (tensor<16xf32>, tensor<f32>) {
+  %scale = arith.constant 1.0 : f32
+  %output = tensor.empty() : tensor<16xf32>
+  %logsumexp = tensor.empty() : tensor<f32>
+  %result:2 = iree_linalg_ext.attention {
+      __test_interface__ = true,
+      indexing_maps = [#q, #k, #v, #s, #o, #lse]}
+      ins(%query, %key, %value, %scale :
+          tensor<8xf32>, tensor<6x8xf32>, tensor<6x16xf32>, f32)
+      outs(%output, %logsumexp : tensor<16xf32>, tensor<f32>) {
+    ^bb0(%score: f32):
+      iree_linalg_ext.yield %score : f32
+  } -> tensor<16xf32>, tensor<f32>
+  return %result#0, %result#1 : tensor<16xf32>, tensor<f32>
+}
+// CHECK-LABEL: func.func @attention_with_scalar_logsumexp(
+//       CHECK:   util.unfoldable_constant dense<> : tensor<0xi32>

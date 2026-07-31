@@ -54,6 +54,12 @@ def ConvertFlashAttentionDispatch :
     template specialized to the call's (n_heads, seq_len, d_head) shape, so no
     HAL C++ dependency is needed in this library.
   }];
+  let options = [
+    Option<"raiseNativeAttention", "raise-native-attention", "bool",
+           /*default=*/"false",
+           "Allow the late pipeline invocation to raise a matched StableHLO "
+           "forward/VJP pair to native attention operations">
+  ];
 }
 
 def LegalizeShapeComputations :

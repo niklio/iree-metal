@@ -10,7 +10,10 @@
 #include "compiler/plugins/input/StableHLO/Conversion/Passes.h"
 #include "compiler/plugins/input/StableHLO/Conversion/Preprocessing/Rewriters.h"
 #include "compiler/plugins/input/StableHLO/Conversion/Rewriters.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
+#include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Support/FormatVariadic.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -18,18 +21,20 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-#include "llvm/Support/FormatVariadic.h"
 #include "stablehlo/dialect/BroadcastUtils.h"
 #include "stablehlo/dialect/StablehloOps.h"
 
 #include <algorithm>
 #include <cstdlib>
+#include <initializer_list>
+#include <iterator>
 
 namespace mlir::iree_compiler::stablehlo {
 
@@ -451,6 +456,740 @@ static std::string buildCeWrapper(StringRef target, StringRef exe, StringRef fn,
       .str();
 }
 
+// Raises the exact canonical StableHLO spelling emitted by JAX for causal
+// attention and its VJP as one transaction. This deliberately does not share
+// the legacy external-Metal flash gate below: these ops stay in IREE and use
+// the normal Attention/AttentionBackward lowering paths.
+static constexpr StringLiteral kRaiseAttentionEnv =
+    "IREE_STABLEHLO_RAISE_ATTENTION";
+
+static bool hasI64Values(ArrayRef<int64_t> actual,
+                         std::initializer_list<int64_t> expected) {
+  return actual.size() == expected.size() &&
+         std::equal(actual.begin(), actual.end(), expected.begin());
+}
+
+static bool hasStaticTensorType(Value value,
+                                std::initializer_list<int64_t> shape,
+                                Type elementType = {}) {
+  auto type = dyn_cast<RankedTensorType>(value.getType());
+  return type && type.hasStaticShape() && type.getRank() == shape.size() &&
+         std::equal(type.getShape().begin(), type.getShape().end(),
+                    shape.begin()) &&
+         (!elementType || type.getElementType() == elementType);
+}
+
+static bool hasBroadcastDimensions(mlir::stablehlo::BroadcastInDimOp op,
+                                   std::initializer_list<int64_t> expected) {
+  return op && hasI64Values(op.getBroadcastDimensions(), expected);
+}
+
+static bool hasTransposePermutation(mlir::stablehlo::TransposeOp op,
+                                    std::initializer_list<int64_t> expected) {
+  return op && hasI64Values(op.getPermutation(), expected);
+}
+
+static bool hasDefaultDotSemantics(mlir::stablehlo::DotGeneralOp op) {
+  if (op.getAlgorithm()) {
+    return false;
+  }
+  auto precision = op.getPrecisionConfig();
+  if (!precision || precision->empty()) {
+    return true;
+  }
+  return llvm::all_of(*precision, [](Attribute attr) {
+    auto precisionAttr = dyn_cast<mlir::stablehlo::PrecisionAttr>(attr);
+    return precisionAttr &&
+           precisionAttr.getValue() == mlir::stablehlo::Precision::DEFAULT;
+  });
+}
+
+static bool hasDotDimensions(mlir::stablehlo::DotGeneralOp op,
+                             std::initializer_list<int64_t> lhsBatch,
+                             std::initializer_list<int64_t> rhsBatch,
+                             std::initializer_list<int64_t> lhsContract,
+                             std::initializer_list<int64_t> rhsContract) {
+  if (!op || !hasDefaultDotSemantics(op)) {
+    return false;
+  }
+  auto dims = op.getDotDimensionNumbers();
+  return hasI64Values(dims.getLhsBatchingDimensions(), lhsBatch) &&
+         hasI64Values(dims.getRhsBatchingDimensions(), rhsBatch) &&
+         hasI64Values(dims.getLhsContractingDimensions(), lhsContract) &&
+         hasI64Values(dims.getRhsContractingDimensions(), rhsContract);
+}
+
+static FloatAttr getSplatFloatAttr(Value value) {
+  Attribute constant;
+  if (!matchPattern(value, m_Constant(&constant))) {
+    return {};
+  }
+  if (auto scalar = dyn_cast<FloatAttr>(constant)) {
+    return scalar;
+  }
+  auto splat = dyn_cast<SplatElementsAttr>(constant);
+  if (!splat) {
+    return {};
+  }
+  return dyn_cast<FloatAttr>(splat.getSplatValue<Attribute>());
+}
+
+static BoolAttr getSplatBoolAttr(Value value) {
+  Attribute constant;
+  if (!matchPattern(value, m_Constant(&constant))) {
+    return {};
+  }
+  if (auto scalar = dyn_cast<BoolAttr>(constant)) {
+    return scalar;
+  }
+  auto splat = dyn_cast<SplatElementsAttr>(constant);
+  if (!splat) {
+    return {};
+  }
+  return dyn_cast<BoolAttr>(splat.getSplatValue<Attribute>());
+}
+
+static bool isFloatSplat(Value value, double expected) {
+  FloatAttr attr = getSplatFloatAttr(value);
+  return attr && attr.getValueAsDouble() == expected;
+}
+
+static bool isNegativeInfinitySplat(Value value) {
+  FloatAttr attr = getSplatFloatAttr(value);
+  return attr && attr.getValue().isInfinity() && attr.getValue().isNegative();
+}
+
+static bool isLowestFiniteSplat(Value value) {
+  FloatAttr attr = getSplatFloatAttr(value);
+  if (!attr) {
+    return false;
+  }
+  llvm::APFloat expected = llvm::APFloat::getLargest(
+      attr.getValue().getSemantics(), /*Negative=*/true);
+  return attr.getValue().bitwiseIsEqual(expected);
+}
+
+enum class ReduceCombiner { kAdd, kMaximum };
+
+static bool matchesUnaryReduce(mlir::stablehlo::ReduceOp reduce, Value input,
+                               Value init,
+                               std::initializer_list<int64_t> dimensions,
+                               ReduceCombiner combinerKind) {
+  if (!reduce || reduce.getInputs().size() != 1 ||
+      reduce.getInitValues().size() != 1 ||
+      reduce.getInputs().front() != input ||
+      reduce.getInitValues().front() != init ||
+      !hasI64Values(reduce.getDimensions(), dimensions) ||
+      !llvm::hasSingleElement(reduce.getBody())) {
+    return false;
+  }
+  Block &block = reduce.getBody().front();
+  if (block.getNumArguments() != 2 ||
+      std::distance(block.begin(), block.end()) != 2) {
+    return false;
+  }
+  Operation &combiner = block.front();
+  bool rightCombiner = combinerKind == ReduceCombiner::kAdd
+                           ? isa<mlir::stablehlo::AddOp>(combiner)
+                           : isa<mlir::stablehlo::MaxOp>(combiner);
+  if (!rightCombiner || combiner.getNumOperands() != 2 ||
+      combiner.getNumResults() != 1) {
+    return false;
+  }
+  bool consumesArgs = (combiner.getOperand(0) == block.getArgument(0) &&
+                       combiner.getOperand(1) == block.getArgument(1)) ||
+                      (combiner.getOperand(0) == block.getArgument(1) &&
+                       combiner.getOperand(1) == block.getArgument(0));
+  auto returnOp = dyn_cast<mlir::stablehlo::ReturnOp>(block.back());
+  return consumesArgs && returnOp && returnOp.getNumOperands() == 1 &&
+         returnOp.getOperand(0) == combiner.getResult(0);
+}
+
+template <typename OpTy>
+static Value getOtherBinaryOperand(OpTy op, Value known) {
+  if (!op) {
+    return {};
+  }
+  if (op.getLhs() == known) {
+    return op.getRhs();
+  }
+  if (op.getRhs() == known) {
+    return op.getLhs();
+  }
+  return {};
+}
+
+struct PairedAttentionMatch {
+  mlir::stablehlo::DotGeneralOp outputDot;
+  mlir::stablehlo::DotGeneralOp outputGradRoot;
+  mlir::stablehlo::TransposeOp valueGradLeaf;
+  mlir::stablehlo::DotGeneralOp queryGradLeaf;
+  mlir::stablehlo::TransposeOp keyGradLeaf;
+  Value query;
+  Value key;
+  Value value;
+  Value outputGrad;
+  Value causalMask;
+  FloatAttr scale;
+};
+
+static std::optional<PairedAttentionMatch>
+matchPairedAttention(mlir::stablehlo::DotGeneralOp outputDot) {
+  auto outputType = dyn_cast<RankedTensorType>(outputDot.getType());
+  if (!outputType || outputType.getRank() != 4 ||
+      !isa<BFloat16Type>(outputType.getElementType()) ||
+      !hasDotDimensions(outputDot, {0, 1}, {0, 1}, {3}, {2})) {
+    return std::nullopt;
+  }
+
+  auto probabilityDiv =
+      outputDot.getLhs().getDefiningOp<mlir::stablehlo::DivOp>();
+  Value value = outputDot.getRhs();
+  auto valueType = dyn_cast<RankedTensorType>(value.getType());
+  auto probabilityType =
+      probabilityDiv ? dyn_cast<RankedTensorType>(probabilityDiv.getType())
+                     : RankedTensorType();
+  if (!probabilityDiv || !valueType || !probabilityType ||
+      valueType.getRank() != 4 || probabilityType.getRank() != 4) {
+    return std::nullopt;
+  }
+
+  auto exponential =
+      probabilityDiv.getLhs().getDefiningOp<mlir::stablehlo::ExpOp>();
+  auto centered = exponential
+                      ? exponential.getOperand()
+                            .getDefiningOp<mlir::stablehlo::SubtractOp>()
+                      : mlir::stablehlo::SubtractOp();
+  auto denominatorBroadcast =
+      probabilityDiv.getRhs()
+          .getDefiningOp<mlir::stablehlo::BroadcastInDimOp>();
+  auto denominatorReshape =
+      denominatorBroadcast ? denominatorBroadcast.getOperand()
+                                 .getDefiningOp<mlir::stablehlo::ReshapeOp>()
+                           : mlir::stablehlo::ReshapeOp();
+  auto denominatorConvert =
+      denominatorReshape ? denominatorReshape.getOperand()
+                               .getDefiningOp<mlir::stablehlo::ConvertOp>()
+                         : mlir::stablehlo::ConvertOp();
+  auto denominatorReduce = denominatorConvert
+                               ? denominatorConvert.getOperand()
+                                     .getDefiningOp<mlir::stablehlo::ReduceOp>()
+                               : mlir::stablehlo::ReduceOp();
+  auto exponentialConvert =
+      denominatorReduce ? denominatorReduce.getInputs()
+                              .front()
+                              .getDefiningOp<mlir::stablehlo::ConvertOp>()
+                        : mlir::stablehlo::ConvertOp();
+  if (!centered || !denominatorReduce || !exponentialConvert ||
+      exponentialConvert.getOperand() != exponential.getResult() ||
+      !isFloatSplat(denominatorReduce.getInitValues().front(), 0.0) ||
+      !matchesUnaryReduce(denominatorReduce, exponentialConvert.getResult(),
+                          denominatorReduce.getInitValues().front(), {3},
+                          ReduceCombiner::kAdd) ||
+      !hasBroadcastDimensions(denominatorBroadcast, {0, 1, 2, 3})) {
+    return std::nullopt;
+  }
+
+  Value maskedScores = centered.getLhs();
+  auto rowMaxBroadcast =
+      centered.getRhs().getDefiningOp<mlir::stablehlo::BroadcastInDimOp>();
+  auto clampedRowMax =
+      rowMaxBroadcast
+          ? rowMaxBroadcast.getOperand().getDefiningOp<mlir::stablehlo::MaxOp>()
+          : mlir::stablehlo::MaxOp();
+  if (!clampedRowMax || !hasBroadcastDimensions(rowMaxBroadcast, {0, 1, 2})) {
+    return std::nullopt;
+  }
+  auto rowMaxReduce =
+      clampedRowMax.getLhs().getDefiningOp<mlir::stablehlo::ReduceOp>();
+  Value rowMaxClamp = clampedRowMax.getRhs();
+  if (!rowMaxReduce) {
+    rowMaxReduce =
+        clampedRowMax.getRhs().getDefiningOp<mlir::stablehlo::ReduceOp>();
+    rowMaxClamp = clampedRowMax.getLhs();
+  }
+  if (!rowMaxReduce || !isNegativeInfinitySplat(rowMaxClamp) ||
+      !isNegativeInfinitySplat(rowMaxReduce.getInitValues().front()) ||
+      !matchesUnaryReduce(rowMaxReduce, maskedScores,
+                          rowMaxReduce.getInitValues().front(), {3},
+                          ReduceCombiner::kMaximum)) {
+    return std::nullopt;
+  }
+
+  auto maskedSelect = maskedScores.getDefiningOp<mlir::stablehlo::SelectOp>();
+  auto maskBroadcast =
+      maskedSelect ? maskedSelect.getPred()
+                         .getDefiningOp<mlir::stablehlo::BroadcastInDimOp>()
+                   : mlir::stablehlo::BroadcastInDimOp();
+  auto causalMask = maskBroadcast
+                        ? maskBroadcast.getOperand()
+                              .getDefiningOp<mlir::stablehlo::SelectOp>()
+                        : mlir::stablehlo::SelectOp();
+  auto causalCompare =
+      causalMask
+          ? causalMask.getPred().getDefiningOp<mlir::stablehlo::CompareOp>()
+          : mlir::stablehlo::CompareOp();
+  auto rowIota =
+      causalCompare
+          ? causalCompare.getLhs().getDefiningOp<mlir::stablehlo::IotaOp>()
+          : mlir::stablehlo::IotaOp();
+  auto columnIota =
+      causalCompare
+          ? causalCompare.getRhs().getDefiningOp<mlir::stablehlo::IotaOp>()
+          : mlir::stablehlo::IotaOp();
+  if (!maskedSelect || !maskBroadcast || !causalMask || !causalCompare ||
+      !rowIota || !columnIota ||
+      !hasBroadcastDimensions(maskBroadcast, {2, 3}) ||
+      causalCompare.getComparisonDirection() !=
+          mlir::stablehlo::ComparisonDirection::GE ||
+      causalCompare.getCompareType().value_or(
+          mlir::stablehlo::ComparisonType::NOTYPE) !=
+          mlir::stablehlo::ComparisonType::SIGNED ||
+      rowIota.getIotaDimension() != 0 || columnIota.getIotaDimension() != 1) {
+    return std::nullopt;
+  }
+  BoolAttr causalTrue = getSplatBoolAttr(causalMask.getOnTrue());
+  BoolAttr causalFalse = getSplatBoolAttr(causalMask.getOnFalse());
+  if (!causalTrue || !causalTrue.getValue() || !causalFalse ||
+      causalFalse.getValue() ||
+      !isLowestFiniteSplat(maskedSelect.getOnFalse())) {
+    return std::nullopt;
+  }
+
+  auto scaledScores =
+      maskedSelect.getOnTrue().getDefiningOp<mlir::stablehlo::MulOp>();
+  auto queryKeyDot =
+      scaledScores
+          ? scaledScores.getLhs().getDefiningOp<mlir::stablehlo::DotGeneralOp>()
+          : mlir::stablehlo::DotGeneralOp();
+  Value forwardScale = scaledScores ? scaledScores.getRhs() : Value();
+  if (!queryKeyDot && scaledScores) {
+    queryKeyDot =
+        scaledScores.getRhs().getDefiningOp<mlir::stablehlo::DotGeneralOp>();
+    forwardScale = scaledScores.getLhs();
+  }
+  FloatAttr scale = getSplatFloatAttr(forwardScale);
+  auto keyTranspose =
+      queryKeyDot
+          ? queryKeyDot.getRhs().getDefiningOp<mlir::stablehlo::TransposeOp>()
+          : mlir::stablehlo::TransposeOp();
+  Value query = queryKeyDot ? queryKeyDot.getLhs() : Value();
+  Value key = keyTranspose ? keyTranspose.getOperand() : Value();
+  auto queryType =
+      query ? dyn_cast<RankedTensorType>(query.getType()) : RankedTensorType();
+  auto keyType =
+      key ? dyn_cast<RankedTensorType>(key.getType()) : RankedTensorType();
+  if (!queryKeyDot || !keyTranspose || !scale ||
+      !hasDotDimensions(queryKeyDot, {0, 1}, {0, 1}, {3}, {2}) ||
+      !hasTransposePermutation(keyTranspose, {0, 1, 3, 2}) || !queryType ||
+      !keyType || queryType != keyType || queryType != valueType ||
+      queryType != outputType) {
+    return std::nullopt;
+  }
+
+  int64_t batch = queryType.getDimSize(0);
+  int64_t heads = queryType.getDimSize(1);
+  int64_t sequence = queryType.getDimSize(2);
+  int64_t headDim = queryType.getDimSize(3);
+  Type bf16 = queryType.getElementType();
+  Type f32 = Float32Type::get(outputDot.getContext());
+  Type i1 = IntegerType::get(outputDot.getContext(), 1);
+  // Broadcast dimensions alone do not prove that the denominator is a row
+  // value: e.g. [B,H,1,S] can also broadcast to the score shape. Pin every
+  // conversion and reshape so the reduction remains row-wise.
+  if (!queryType.hasStaticShape() ||
+      !hasStaticTensorType(probabilityDiv.getResult(),
+                           {batch, heads, sequence, sequence}, bf16) ||
+      !hasStaticTensorType(exponentialConvert.getResult(),
+                           {batch, heads, sequence, sequence}, f32) ||
+      !hasStaticTensorType(denominatorReduce.getResult(0),
+                           {batch, heads, sequence}, f32) ||
+      !hasStaticTensorType(denominatorConvert.getResult(),
+                           {batch, heads, sequence}, bf16) ||
+      !hasStaticTensorType(denominatorReshape.getResult(),
+                           {batch, heads, sequence, 1}, bf16) ||
+      !hasStaticTensorType(denominatorBroadcast.getResult(),
+                           {batch, heads, sequence, sequence}, bf16) ||
+      !hasStaticTensorType(maskBroadcast.getResult(),
+                           {batch, heads, sequence, sequence}, i1) ||
+      !hasStaticTensorType(causalMask.getResult(), {sequence, sequence}, i1) ||
+      !hasStaticTensorType(value, {batch, heads, sequence, headDim}, bf16) ||
+      !hasStaticTensorType(outputDot.getResult(),
+                           {batch, heads, sequence, headDim}, bf16)) {
+    return std::nullopt;
+  }
+
+  // Find dV = transpose(dot(dO, P)). P may only have this gradient dot in
+  // addition to the forward output dot for this exact spelling.
+  SmallVector<mlir::stablehlo::DotGeneralOp> valueGradRoots;
+  for (Operation *user : probabilityDiv.getResult().getUsers()) {
+    auto dot = dyn_cast<mlir::stablehlo::DotGeneralOp>(user);
+    if (dot && dot.getRhs() == probabilityDiv.getResult() &&
+        hasDotDimensions(dot, {0, 1}, {0, 1}, {2}, {2})) {
+      valueGradRoots.push_back(dot);
+    }
+  }
+  if (valueGradRoots.size() != 1) {
+    return std::nullopt;
+  }
+  mlir::stablehlo::DotGeneralOp valueGradRoot = valueGradRoots.front();
+  Value outputGrad = valueGradRoot.getLhs();
+  if (!hasStaticTensorType(outputGrad, {batch, heads, sequence, headDim},
+                           bf16) ||
+      !valueGradRoot.getResult().hasOneUse()) {
+    return std::nullopt;
+  }
+  auto valueGradLeaf =
+      dyn_cast<mlir::stablehlo::TransposeOp>(*valueGradRoot->user_begin());
+  if (!hasTransposePermutation(valueGradLeaf, {0, 1, 3, 2}) ||
+      !hasStaticTensorType(valueGradLeaf.getResult(),
+                           {batch, heads, sequence, headDim}, bf16)) {
+    return std::nullopt;
+  }
+  if (!probabilityDiv.getResult().hasNUses(2) ||
+      !llvm::all_of(probabilityDiv.getResult().getUsers(),
+                    [&](Operation *user) {
+                      return user == outputDot.getOperation() ||
+                             user == valueGradRoot.getOperation();
+                    })) {
+    return std::nullopt;
+  }
+
+  // Find dP = dot(dO, V).
+  SmallVector<mlir::stablehlo::DotGeneralOp> probabilityGradDots;
+  for (Operation *user : outputGrad.getUsers()) {
+    auto dot = dyn_cast<mlir::stablehlo::DotGeneralOp>(user);
+    if (dot && dot.getLhs() == outputGrad && dot.getRhs() == value &&
+        hasDotDimensions(dot, {0, 1}, {0, 1}, {3}, {3})) {
+      probabilityGradDots.push_back(dot);
+    }
+  }
+  if (probabilityGradDots.size() != 1) {
+    return std::nullopt;
+  }
+  mlir::stablehlo::DotGeneralOp probabilityGradDot =
+      probabilityGradDots.front();
+
+  // Locate dQ from the shared K transpose, then prove its dS and the complete
+  // dK double-transpose leaf.
+  SmallVector<mlir::stablehlo::DotGeneralOp> queryGradDots;
+  for (Operation *user : keyTranspose.getResult().getUsers()) {
+    auto dot = dyn_cast<mlir::stablehlo::DotGeneralOp>(user);
+    if (dot && dot != queryKeyDot && dot.getRhs() == keyTranspose.getResult() &&
+        hasDotDimensions(dot, {0, 1}, {0, 1}, {3}, {3})) {
+      queryGradDots.push_back(dot);
+    }
+  }
+  if (queryGradDots.size() != 1) {
+    return std::nullopt;
+  }
+  mlir::stablehlo::DotGeneralOp queryGradLeaf = queryGradDots.front();
+  Value scoreGrad = queryGradLeaf.getLhs();
+  if (!hasStaticTensorType(queryGradLeaf.getResult(),
+                           {batch, heads, sequence, headDim}, bf16)) {
+    return std::nullopt;
+  }
+  SmallVector<mlir::stablehlo::DotGeneralOp> keyGradDots;
+  for (Operation *user : scoreGrad.getUsers()) {
+    auto dot = dyn_cast<mlir::stablehlo::DotGeneralOp>(user);
+    if (dot && dot.getLhs() == scoreGrad && dot.getRhs() == query &&
+        hasDotDimensions(dot, {0, 1}, {0, 1}, {2}, {2})) {
+      keyGradDots.push_back(dot);
+    }
+  }
+  if (keyGradDots.size() != 1 || !keyGradDots.front().getResult().hasOneUse()) {
+    return std::nullopt;
+  }
+  auto keyGradInnerTranspose = dyn_cast<mlir::stablehlo::TransposeOp>(
+      *keyGradDots.front()->user_begin());
+  if (!hasTransposePermutation(keyGradInnerTranspose, {0, 1, 3, 2}) ||
+      !keyGradInnerTranspose.getResult().hasOneUse()) {
+    return std::nullopt;
+  }
+  auto keyGradLeaf = dyn_cast<mlir::stablehlo::TransposeOp>(
+      *keyGradInnerTranspose->user_begin());
+  if (!hasTransposePermutation(keyGradLeaf, {0, 1, 3, 2}) ||
+      !hasStaticTensorType(keyGradLeaf.getResult(),
+                           {batch, heads, sequence, headDim}, bf16)) {
+    return std::nullopt;
+  }
+
+  // dS = where(mask, softmax-vjp, 0) * the exact same scale splat.
+  auto scoreScaleMul = scoreGrad.getDefiningOp<mlir::stablehlo::MulOp>();
+  Value maskedScoreGrad = scoreScaleMul ? scoreScaleMul.getLhs() : Value();
+  Value backwardScale = scoreScaleMul ? scoreScaleMul.getRhs() : Value();
+  if (!getSplatFloatAttr(backwardScale)) {
+    std::swap(maskedScoreGrad, backwardScale);
+  }
+  FloatAttr backwardScaleAttr = getSplatFloatAttr(backwardScale);
+  auto scoreMaskSelect =
+      maskedScoreGrad
+          ? maskedScoreGrad.getDefiningOp<mlir::stablehlo::SelectOp>()
+          : mlir::stablehlo::SelectOp();
+  if (!scoreScaleMul || !backwardScaleAttr ||
+      !scale.getValue().bitwiseIsEqual(backwardScaleAttr.getValue()) ||
+      !scoreMaskSelect ||
+      scoreMaskSelect.getPred() != maskBroadcast.getResult() ||
+      !isFloatSplat(scoreMaskSelect.getOnFalse(), 0.0)) {
+    return std::nullopt;
+  }
+  auto unmaskedScoreGrad =
+      scoreMaskSelect.getOnTrue().getDefiningOp<mlir::stablehlo::MulOp>();
+  Value softmaxVjp =
+      getOtherBinaryOperand(unmaskedScoreGrad, exponential.getResult());
+  auto softmaxVjpAdd = softmaxVjp
+                           ? softmaxVjp.getDefiningOp<mlir::stablehlo::AddOp>()
+                           : mlir::stablehlo::AddOp();
+  if (!unmaskedScoreGrad || !softmaxVjpAdd) {
+    return std::nullopt;
+  }
+
+  // One add operand is dP / denominator. The other is the correction term.
+  auto directTerm =
+      softmaxVjpAdd.getLhs().getDefiningOp<mlir::stablehlo::DivOp>();
+  Value correction = softmaxVjpAdd.getRhs();
+  if (!directTerm || directTerm.getLhs() != probabilityGradDot.getResult() ||
+      directTerm.getRhs() != denominatorBroadcast.getResult()) {
+    directTerm = softmaxVjpAdd.getRhs().getDefiningOp<mlir::stablehlo::DivOp>();
+    correction = softmaxVjpAdd.getLhs();
+  }
+  if (!directTerm || directTerm.getLhs() != probabilityGradDot.getResult() ||
+      directTerm.getRhs() != denominatorBroadcast.getResult()) {
+    return std::nullopt;
+  }
+
+  auto correctionConvert =
+      correction.getDefiningOp<mlir::stablehlo::ConvertOp>();
+  auto correctionBroadcast =
+      correctionConvert
+          ? correctionConvert.getOperand()
+                .getDefiningOp<mlir::stablehlo::BroadcastInDimOp>()
+          : mlir::stablehlo::BroadcastInDimOp();
+  auto singletonReduce = correctionBroadcast
+                             ? correctionBroadcast.getOperand()
+                                   .getDefiningOp<mlir::stablehlo::ReduceOp>()
+                             : mlir::stablehlo::ReduceOp();
+  auto correctionReshape =
+      singletonReduce ? singletonReduce.getInputs()
+                            .front()
+                            .getDefiningOp<mlir::stablehlo::ReshapeOp>()
+                      : mlir::stablehlo::ReshapeOp();
+  auto correctionToF32 = correctionReshape
+                             ? correctionReshape.getOperand()
+                                   .getDefiningOp<mlir::stablehlo::ConvertOp>()
+                             : mlir::stablehlo::ConvertOp();
+  auto correctionNegate =
+      correctionToF32
+          ? correctionToF32.getOperand().getDefiningOp<mlir::stablehlo::NegOp>()
+          : mlir::stablehlo::NegOp();
+  auto weightedReduce = correctionNegate
+                            ? correctionNegate.getOperand()
+                                  .getDefiningOp<mlir::stablehlo::ReduceOp>()
+                            : mlir::stablehlo::ReduceOp();
+  // As above, prove the singleton is the trailing softmax dimension rather
+  // than accepting a shape-compatible reshape that mixes query rows.
+  if (!correctionConvert || !correctionBroadcast || !singletonReduce ||
+      !correctionReshape || !correctionToF32 || !correctionNegate ||
+      !weightedReduce ||
+      !hasStaticTensorType(weightedReduce.getInputs().front(),
+                           {batch, heads, sequence, sequence}, bf16) ||
+      !hasStaticTensorType(weightedReduce.getResult(0),
+                           {batch, heads, sequence}, bf16) ||
+      !hasStaticTensorType(correctionNegate.getResult(),
+                           {batch, heads, sequence}, bf16) ||
+      !hasStaticTensorType(correctionToF32.getResult(),
+                           {batch, heads, sequence}, f32) ||
+      !hasStaticTensorType(correctionReshape.getResult(),
+                           {batch, heads, sequence, 1}, f32) ||
+      !hasStaticTensorType(singletonReduce.getResult(0),
+                           {batch, heads, sequence}, f32) ||
+      !hasStaticTensorType(correctionBroadcast.getResult(),
+                           {batch, heads, sequence, sequence}, f32) ||
+      !hasStaticTensorType(correctionConvert.getResult(),
+                           {batch, heads, sequence, sequence}, bf16) ||
+      !hasBroadcastDimensions(correctionBroadcast, {0, 1, 2}) ||
+      !isFloatSplat(singletonReduce.getInitValues().front(), 0.0) ||
+      !matchesUnaryReduce(singletonReduce, correctionReshape.getResult(),
+                          singletonReduce.getInitValues().front(), {3},
+                          ReduceCombiner::kAdd) ||
+      !isFloatSplat(weightedReduce.getInitValues().front(), 0.0) ||
+      !matchesUnaryReduce(weightedReduce, weightedReduce.getInputs().front(),
+                          weightedReduce.getInitValues().front(), {3},
+                          ReduceCombiner::kAdd)) {
+    return std::nullopt;
+  }
+  auto weightedExp = weightedReduce.getInputs()
+                         .front()
+                         .getDefiningOp<mlir::stablehlo::MulOp>();
+  Value weightedProbabilityGrad =
+      getOtherBinaryOperand(weightedExp, exponential.getResult());
+  auto probabilityGradTimesInverse =
+      weightedProbabilityGrad
+          ? weightedProbabilityGrad.getDefiningOp<mlir::stablehlo::MulOp>()
+          : mlir::stablehlo::MulOp();
+  Value inverseBroadcast = getOtherBinaryOperand(
+      probabilityGradTimesInverse, probabilityGradDot.getResult());
+  auto inverseBroadcastOp =
+      inverseBroadcast
+          ? inverseBroadcast.getDefiningOp<mlir::stablehlo::BroadcastInDimOp>()
+          : mlir::stablehlo::BroadcastInDimOp();
+  auto inverseDiv = inverseBroadcastOp
+                        ? inverseBroadcastOp.getOperand()
+                              .getDefiningOp<mlir::stablehlo::DivOp>()
+                        : mlir::stablehlo::DivOp();
+  auto denominatorSquared =
+      inverseDiv ? inverseDiv.getRhs().getDefiningOp<mlir::stablehlo::MulOp>()
+                 : mlir::stablehlo::MulOp();
+  if (!weightedExp || !probabilityGradTimesInverse || !inverseBroadcastOp ||
+      !inverseDiv || !denominatorSquared ||
+      !hasBroadcastDimensions(inverseBroadcastOp, {0, 1, 2, 3}) ||
+      !isFloatSplat(inverseDiv.getLhs(), 1.0) ||
+      denominatorSquared.getLhs() != denominatorReshape.getResult() ||
+      denominatorSquared.getRhs() != denominatorReshape.getResult()) {
+    return std::nullopt;
+  }
+
+  // The backward must be insertable after dO and before the first old gradient
+  // root. Keeping all roots in one block rejects accidental cyclic placement.
+  Block *block = outputDot->getBlock();
+  SmallVector<Operation *> orderedOps = {outputDot,
+                                         valueGradRoot,
+                                         valueGradLeaf,
+                                         probabilityGradDot,
+                                         queryGradLeaf,
+                                         keyGradDots.front(),
+                                         keyGradInnerTranspose,
+                                         keyGradLeaf};
+  if (llvm::any_of(
+          orderedOps,
+          [block](Operation *op) { return op->getBlock() != block; }) ||
+      !outputDot->isBeforeInBlock(valueGradRoot) ||
+      !valueGradRoot->isBeforeInBlock(probabilityGradDot) ||
+      !valueGradRoot->isBeforeInBlock(queryGradLeaf) ||
+      !valueGradRoot->isBeforeInBlock(keyGradDots.front())) {
+    return std::nullopt;
+  }
+  if (Operation *outputGradDef = outputGrad.getDefiningOp()) {
+    if (outputGradDef->getBlock() != block ||
+        !outputGradDef->isBeforeInBlock(valueGradRoot)) {
+      return std::nullopt;
+    }
+  }
+
+  return PairedAttentionMatch{outputDot,     valueGradRoot,
+                              valueGradLeaf, queryGradLeaf,
+                              keyGradLeaf,   query,
+                              key,           value,
+                              outputGrad,    causalMask.getResult(),
+                              scale};
+}
+
+static void rewritePairedAttention(PairedAttentionMatch match) {
+  Location loc = match.outputDot.getLoc();
+  MLIRContext *context = match.outputDot.getContext();
+  auto queryType = cast<RankedTensorType>(match.query.getType());
+  auto keyType = cast<RankedTensorType>(match.key.getType());
+  auto valueType = cast<RankedTensorType>(match.value.getType());
+  auto outputType = cast<RankedTensorType>(match.outputDot.getType());
+  int64_t batch = queryType.getDimSize(0);
+  int64_t heads = queryType.getDimSize(1);
+  int64_t sequence = queryType.getDimSize(2);
+
+  OpBuilder forwardBuilder(match.outputDot);
+  Value scale = arith::ConstantOp::create(forwardBuilder, loc, match.scale);
+  Value outputInit = tensor::EmptyOp::create(
+      forwardBuilder, loc, outputType.getShape(), outputType.getElementType());
+  auto logsumexpType = RankedTensorType::get({batch, heads, sequence},
+                                             forwardBuilder.getF32Type());
+  Value logsumexpInit =
+      tensor::EmptyOp::create(forwardBuilder, loc, logsumexpType.getShape(),
+                              logsumexpType.getElementType());
+
+  AffineExpr b = forwardBuilder.getAffineDimExpr(0);
+  AffineExpr h = forwardBuilder.getAffineDimExpr(1);
+  AffineExpr m = forwardBuilder.getAffineDimExpr(2);
+  AffineExpr n = forwardBuilder.getAffineDimExpr(3);
+  AffineExpr k1 = forwardBuilder.getAffineDimExpr(4);
+  AffineExpr k2 = forwardBuilder.getAffineDimExpr(5);
+  auto map = [&](std::initializer_list<AffineExpr> results) {
+    SmallVector<AffineExpr> resultVector(results);
+    return AffineMap::get(/*dimCount=*/6, /*symbolCount=*/0, resultVector,
+                          context);
+  };
+  AffineMap queryMap = map({b, h, m, k1});
+  AffineMap keyMap = map({b, h, k2, k1});
+  AffineMap valueMap = map({b, h, k2, n});
+  AffineMap outputMap = map({b, h, m, n});
+  AffineMap logsumexpMap = map({b, h, m});
+  AffineMap scaleMap = map({});
+  AffineMap maskMap = map({m, k2});
+  SmallVector<AffineMap> forwardMaps = {
+      queryMap, keyMap, valueMap, scaleMap, maskMap, outputMap, logsumexpMap};
+  DictionaryAttr decompositionConfig =
+      forwardBuilder.getDictionaryAttr({forwardBuilder.getNamedAttr(
+          IREE::LinalgExt::AttentionOp::getUseExp2AttrStr(),
+          forwardBuilder.getBoolAttr(false))});
+  SmallVector<Type> forwardResultTypes = {outputType, logsumexpType};
+  auto attention = IREE::LinalgExt::AttentionOp::create(
+      forwardBuilder, loc, forwardResultTypes, match.query, match.key,
+      match.value, scale, match.causalMask, outputInit, logsumexpInit,
+      forwardBuilder.getAffineMapArrayAttr(forwardMaps), decompositionConfig);
+  {
+    OpBuilder::InsertionGuard guard(forwardBuilder);
+    Block *body = forwardBuilder.createBlock(&attention.getRegion());
+    body->addArgument(forwardBuilder.getF32Type(), loc);
+    forwardBuilder.setInsertionPointToEnd(body);
+    IREE::LinalgExt::YieldOp::create(forwardBuilder, loc, body->getArgument(0));
+  }
+
+  // Insert after dO is available and before the earliest old gradient root.
+  OpBuilder backwardBuilder(match.outputGradRoot);
+  Value queryGradInit = tensor::EmptyOp::create(
+      backwardBuilder, loc, queryType.getShape(), queryType.getElementType());
+  Value keyGradInit = tensor::EmptyOp::create(
+      backwardBuilder, loc, keyType.getShape(), keyType.getElementType());
+  Value valueGradInit = tensor::EmptyOp::create(
+      backwardBuilder, loc, valueType.getShape(), valueType.getElementType());
+  SmallVector<AffineMap> backwardMaps = {
+      queryMap, keyMap,  valueMap, outputMap, outputMap, logsumexpMap,
+      scaleMap, maskMap, queryMap, keyMap,    valueMap};
+  SmallVector<Type> backwardResultTypes = {queryType, keyType, valueType};
+  auto attentionBackward = IREE::LinalgExt::AttentionBackwardOp::create(
+      backwardBuilder, loc, backwardResultTypes, match.query, match.key,
+      match.value, attention.getResult(0), match.outputGrad,
+      attention.getResult(1), scale, match.causalMask, queryGradInit,
+      keyGradInit, valueGradInit,
+      backwardBuilder.getAffineMapArrayAttr(backwardMaps), decompositionConfig);
+
+  // Mutate only the externally visible leaves, and only after both operations
+  // have been constructed. Replace the forward result last.
+  match.queryGradLeaf.getResult().replaceAllUsesWith(
+      attentionBackward.getResult(0));
+  match.keyGradLeaf.getResult().replaceAllUsesWith(
+      attentionBackward.getResult(1));
+  match.valueGradLeaf.getResult().replaceAllUsesWith(
+      attentionBackward.getResult(2));
+  match.outputDot.getResult().replaceAllUsesWith(attention.getResult(0));
+}
+
+static void raisePairedAttention(ModuleOp module) {
+  if (!std::getenv(kRaiseAttentionEnv.data())) {
+    return;
+  }
+  SmallVector<mlir::stablehlo::DotGeneralOp> candidates;
+  module.walk(
+      [&](mlir::stablehlo::DotGeneralOp dot) { candidates.push_back(dot); });
+  for (mlir::stablehlo::DotGeneralOp candidate : candidates) {
+    if (candidate->use_empty()) {
+      continue;
+    }
+    std::optional<PairedAttentionMatch> match = matchPairedAttention(candidate);
+    if (match) {
+      rewritePairedAttention(*match);
+    }
+  }
+}
+
 // Compiler-native flash (Layer 1, FORWARD). Recognize the attention subgraph
 //   dot_general(softmax(scale * dot_general(Q, Kᵀ) [+ causal select]), V)
 // and rewrite it to a `flash_attention_fwd` custom_call (which the loop below
@@ -463,6 +1202,9 @@ static void raiseFlashAttentionFwd(ModuleOp module) {
   SmallVector<mlir::stablehlo::DotGeneralOp> cands;
   module.walk([&](mlir::stablehlo::DotGeneralOp dg) { cands.push_back(dg); });
   for (auto av : cands) {
+    if (av->use_empty()) {
+      continue;
+    }
     auto avTy = dyn_cast<RankedTensorType>(av.getType());
     if (!avTy || avTy.getRank() != 4)
       continue;
@@ -682,24 +1424,39 @@ static void raiseFlashAttentionFwd(ModuleOp module) {
 
 struct ConvertFlashAttentionDispatch final
     : impl::ConvertFlashAttentionDispatchBase<ConvertFlashAttentionDispatch> {
+  using Base::Base;
+
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<arith::ArithDialect, IREE::LinalgExt::IREELinalgExtDialect,
+                    mlir::stablehlo::StablehloDialect, tensor::TensorDialect>();
+  }
+
   void runOnOperation() override {
     ModuleOp module = getOperation();
     MLIRContext *ctx = &getContext();
 
-    // Layer-1 compiler-native flash: raise attention patterns to flash custom_calls
-    // BEFORE collecting/lowering custom_calls below (opt-in IREE_METAL_COOP_RAISE_FLASH).
-    raiseFlashAttentionFwd(module);
+    // The native paired raise and the legacy external-Metal forward raise are
+    // intentionally mutually exclusive. Both explicit flash custom calls and
+    // any custom calls created by the legacy path are still lowered below.
+    if (raiseNativeAttention) {
+      raisePairedAttention(module);
+    }
+    if (!std::getenv(kRaiseAttentionEnv.data())) {
+      raiseFlashAttentionFwd(module);
+    }
 
     SmallVector<mlir::stablehlo::CustomCallOp> calls;
     module.walk([&](mlir::stablehlo::CustomCallOp op) {
       StringRef t = op.getCallTargetName();
       if (t == "flash_attention_fwd" || t == "flash_attention_bwd_dq" ||
-          t == "flash_attention_bwd_dkdv" || t == "gemm" ||
-          t == "ce_fwd" || t == "ce_bwd")
+          t == "flash_attention_bwd_dkdv" || t == "gemm" || t == "ce_fwd" ||
+          t == "ce_bwd") {
         calls.push_back(op);
+      }
     });
-    if (calls.empty())
+    if (calls.empty()) {
       return;
+    }
 
     SymbolTable symbolTable(module);
     for (auto op : calls) {

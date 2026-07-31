@@ -35,6 +35,7 @@ struct FoldUnitExtentDimsPass final
 void FoldUnitExtentDimsPass::runOnOperation() {
   RewritePatternSet patterns(&getContext());
   linalg::ControlDropUnitDims options;
+  options.controlFn = IREE::LinalgExt::defaultControlDropUnitDims;
   if (useReshapes) {
     options.rankReductionStrategy = linalg::ControlDropUnitDims::
         RankReductionStrategy::ReassociativeReshape;

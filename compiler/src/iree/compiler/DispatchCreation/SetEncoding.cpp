@@ -353,19 +353,19 @@ static SmallVector<unsigned> getOperandsToPad(Operation *op) {
     }
     auto producerDispatch = cast<IREE::Flow::DispatchRegionOp>(
         dispatchAndOpChain->first.getOwner());
-    // TODO(MaheshRavishankar): Multi-result producer dispatches can be
-    // supported. Will require to move the consumer dispatch immediately after
-    // the producer instead of what is done below and move other operands of the
-    // consumer dispatch before the producer dispatch.
-    if (producerDispatch->getNumResults() != 1) {
-      continue;
-    }
     WalkResult res =
         producerDispatch->walk([&](IREE::LinalgExt::AttentionOp op) {
           return WalkResult::interrupt();
         });
     if (res.wasInterrupted()) {
       return {};
+    }
+    // TODO(MaheshRavishankar): Multi-result producer dispatches can be
+    // supported. Will require to move the consumer dispatch immediately after
+    // the producer instead of what is done below and move other operands of the
+    // consumer dispatch before the producer dispatch.
+    if (producerDispatch->getNumResults() != 1) {
+      continue;
     }
   }
 

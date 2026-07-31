@@ -1526,6 +1526,70 @@ func.func @attention_missing_affine_map(%query: tensor<192x1024x64xf32>, %key: t
 
 // -----
 
+func.func @attention_logsumexp_wrong_element_type(
+    %query: tensor<192x1024x64xf32>,
+    %key: tensor<192x1024x64xf32>,
+    %value: tensor<192x1024x64xf32>)
+    -> (tensor<192x1024x64xf32>, tensor<192x1024xf16>) {
+  %output = tensor.empty() : tensor<192x1024x64xf32>
+  %logsumexp = tensor.empty() : tensor<192x1024xf16>
+  %scale = arith.constant 1.0 : f32
+  // expected-error @+1 {{expected logsumexp element type to be f32}}
+  %result:2 = iree_linalg_ext.attention {
+      indexing_maps = [
+        affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2)>,
+        affine_map<(d0, d1, d2, d3, d4) -> (d0, d3, d2)>,
+        affine_map<(d0, d1, d2, d3, d4) -> (d0, d3, d4)>,
+        affine_map<(d0, d1, d2, d3, d4) -> ()>,
+        affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d4)>,
+        affine_map<(d0, d1, d2, d3, d4) -> (d0, d1)>
+      ]}
+      ins(%query, %key, %value, %scale :
+          tensor<192x1024x64xf32>, tensor<192x1024x64xf32>,
+          tensor<192x1024x64xf32>, f32)
+      outs(%output, %logsumexp :
+          tensor<192x1024x64xf32>, tensor<192x1024xf16>) {
+    ^bb0(%score: f32):
+      iree_linalg_ext.yield %score : f32
+  } -> tensor<192x1024x64xf32>, tensor<192x1024xf16>
+  return %result#0, %result#1 :
+      tensor<192x1024x64xf32>, tensor<192x1024xf16>
+}
+
+// -----
+
+func.func @attention_logsumexp_reversed_indexing_map(
+    %query: tensor<192x1024x64xf32>,
+    %key: tensor<192x1024x64xf32>,
+    %value: tensor<192x1024x64xf32>)
+    -> (tensor<192x1024x64xf32>, tensor<1024x192xf32>) {
+  %output = tensor.empty() : tensor<192x1024x64xf32>
+  %logsumexp = tensor.empty() : tensor<1024x192xf32>
+  %scale = arith.constant 1.0 : f32
+  // expected-error @+1 {{expected logsumexp indexing map to contain the batch dimensions followed by the query dimensions}}
+  %result:2 = iree_linalg_ext.attention {
+      indexing_maps = [
+        affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2)>,
+        affine_map<(d0, d1, d2, d3, d4) -> (d0, d3, d2)>,
+        affine_map<(d0, d1, d2, d3, d4) -> (d0, d3, d4)>,
+        affine_map<(d0, d1, d2, d3, d4) -> ()>,
+        affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d4)>,
+        affine_map<(d0, d1, d2, d3, d4) -> (d1, d0)>
+      ]}
+      ins(%query, %key, %value, %scale :
+          tensor<192x1024x64xf32>, tensor<192x1024x64xf32>,
+          tensor<192x1024x64xf32>, f32)
+      outs(%output, %logsumexp :
+          tensor<192x1024x64xf32>, tensor<1024x192xf32>) {
+    ^bb0(%score: f32):
+      iree_linalg_ext.yield %score : f32
+  } -> tensor<192x1024x64xf32>, tensor<1024x192xf32>
+  return %result#0, %result#1 :
+      tensor<192x1024x64xf32>, tensor<1024x192xf32>
+}
+
+// -----
+
 func.func @attention_affine_map_domain_mismatch(%query: tensor<192x1024x64xf32>, %key: tensor<192x1024x64xf32>, %value: tensor<192x1024x64xf32>) -> tensor<192x1024x64xf32> {
   %0 = tensor.empty() : tensor<192x1024x64xf32>
   %scale = arith.constant 1.0 : f32
@@ -1540,6 +1604,86 @@ func.func @attention_affine_map_domain_mismatch(%query: tensor<192x1024x64xf32>,
                         iree_linalg_ext.yield %score : f32
                      } -> tensor<192x1024x64xf32>
   return %1 : tensor<192x1024x64xf32>
+}
+
+// -----
+
+func.func @attention_non_projected_permutation(
+    %query: tensor<2x4x8xf32>, %key: tensor<2x6x8xf32>,
+    %value: tensor<2x6x16xf32>) -> tensor<2x4x16xf32> {
+  %scale = arith.constant 1.0 : f32
+  %output = tensor.empty() : tensor<2x4x16xf32>
+  // expected-error @+1 {{expected all indexing maps to be symbol-free projected permutations; map 0 is not}}
+  %result = iree_linalg_ext.attention {
+      indexing_maps = [
+        affine_map<(b, m, k1, k2, n) -> (b + m, m, k1)>,
+        affine_map<(b, m, k1, k2, n) -> (b, k2, k1)>,
+        affine_map<(b, m, k1, k2, n) -> (b, k2, n)>,
+        affine_map<(b, m, k1, k2, n) -> ()>,
+        affine_map<(b, m, k1, k2, n) -> (b, m, n)>]}
+      ins(%query, %key, %value, %scale :
+          tensor<2x4x8xf32>, tensor<2x6x8xf32>,
+          tensor<2x6x16xf32>, f32)
+      outs(%output : tensor<2x4x16xf32>) {
+    ^bb0(%score: f32):
+      iree_linalg_ext.yield %score : f32
+  } -> tensor<2x4x16xf32>
+  return %result : tensor<2x4x16xf32>
+}
+
+// -----
+
+func.func @attention_non_scalar_scale_map(
+    %query: tensor<2x4x8xf32>, %key: tensor<2x6x8xf32>,
+    %value: tensor<2x6x16xf32>) -> tensor<2x4x16xf32> {
+  %scale = arith.constant 1.0 : f32
+  %output = tensor.empty() : tensor<2x4x16xf32>
+  // expected-error @+1 {{expected scale indexing map to have no results}}
+  %result = iree_linalg_ext.attention {
+      indexing_maps = [
+        affine_map<(b, m, k1, k2, n) -> (b, m, k1)>,
+        affine_map<(b, m, k1, k2, n) -> (b, k2, k1)>,
+        affine_map<(b, m, k1, k2, n) -> (b, k2, n)>,
+        affine_map<(b, m, k1, k2, n) -> (b)>,
+        affine_map<(b, m, k1, k2, n) -> (b, m, n)>]}
+      ins(%query, %key, %value, %scale :
+          tensor<2x4x8xf32>, tensor<2x6x8xf32>,
+          tensor<2x6x16xf32>, f32)
+      outs(%output : tensor<2x4x16xf32>) {
+    ^bb0(%score: f32):
+      iree_linalg_ext.yield %score : f32
+  } -> tensor<2x4x16xf32>
+  return %result : tensor<2x4x16xf32>
+}
+
+// -----
+
+func.func @attention_mask_uses_output_dimension(
+    %query: tensor<2x4x8xf32>, %key: tensor<2x6x8xf32>,
+    %value: tensor<2x6x16xf32>,
+    %mask: tensor<2x4x16xi1>)
+    -> (tensor<2x4x16xf32>, tensor<2x4xf32>) {
+  %scale = arith.constant 1.0 : f32
+  %output = tensor.empty() : tensor<2x4x16xf32>
+  %logsumexp = tensor.empty() : tensor<2x4xf32>
+  // expected-error @+1 {{mask indexing map must use only attention score dimensions}}
+  %result:2 = iree_linalg_ext.attention {
+      indexing_maps = [
+        affine_map<(b, m, k1, k2, n) -> (b, m, k1)>,
+        affine_map<(b, m, k1, k2, n) -> (b, k2, k1)>,
+        affine_map<(b, m, k1, k2, n) -> (b, k2, n)>,
+        affine_map<(b, m, k1, k2, n) -> ()>,
+        affine_map<(b, m, k1, k2, n) -> (b, m, n)>,
+        affine_map<(b, m, k1, k2, n) -> (b, m, n)>,
+        affine_map<(b, m, k1, k2, n) -> (b, m)>]}
+      ins(%query, %key, %value, %scale, %mask :
+          tensor<2x4x8xf32>, tensor<2x6x8xf32>,
+          tensor<2x6x16xf32>, f32, tensor<2x4x16xi1>)
+      outs(%output, %logsumexp : tensor<2x4x16xf32>, tensor<2x4xf32>) {
+    ^bb0(%score: f32):
+      iree_linalg_ext.yield %score : f32
+  } -> tensor<2x4x16xf32>, tensor<2x4xf32>
+  return %result#0, %result#1 : tensor<2x4x16xf32>, tensor<2x4xf32>
 }
 
 // -----
@@ -1853,5 +1997,117 @@ func.func @map_load_wrong_num_yielded_values(
     // expected-error@+1 {{expected transformation_region to yield a value for each source dimension and a padding value}}
     iree_linalg_ext.yield %idx0 : index
   } : memref<4xf32> into memref<4xf32>
+  return
+}
+
+// -----
+
+#q = affine_map<(b, m, k1, k2, n) -> (b, m, k1)>
+#k = affine_map<(b, m, k1, k2, n) -> (b, k2, k1)>
+#v = affine_map<(b, m, k1, k2, n) -> (b, k2, n)>
+#scale = affine_map<(b, m, k1, k2, n) -> ()>
+#o = affine_map<(b, m, k1, k2, n) -> (b, m, n)>
+
+func.func @attention_non_boolean_use_exp2(
+    %query: tensor<2x4x8xf32>, %key: tensor<2x6x8xf32>,
+    %value: tensor<2x6x16xf32>) {
+  %scale = arith.constant 1.0 : f32
+  %output = tensor.empty() : tensor<2x4x16xf32>
+  // expected-error @+1 {{expected decomposition_config entry 'use_exp2' to be a boolean}}
+  %result = iree_linalg_ext.attention {
+      decomposition_config = {use_exp2 = 7 : i64},
+      indexing_maps = [#q, #k, #v, #scale, #o]}
+      ins(%query, %key, %value, %scale :
+          tensor<2x4x8xf32>, tensor<2x6x8xf32>,
+          tensor<2x6x16xf32>, f32)
+      outs(%output : tensor<2x4x16xf32>) {
+    ^bb0(%score: f32):
+      iree_linalg_ext.yield %score : f32
+  } -> tensor<2x4x16xf32>
+  return
+}
+
+// -----
+
+#q = affine_map<(b, m, k1, k2, n) -> (b, m, k1)>
+#k = affine_map<(b, m, k1, k2, n) -> (b, k2, k1)>
+#v = affine_map<(b, m, k1, k2, n) -> (b, k2, n)>
+#scale = affine_map<(b, m, k1, k2, n) -> ()>
+#o = affine_map<(b, m, k1, k2, n) -> (b, m, n)>
+
+func.func @attention_non_dictionary_qk_attrs(
+    %query: tensor<2x4x8xf32>, %key: tensor<2x6x8xf32>,
+    %value: tensor<2x6x16xf32>) {
+  %scale = arith.constant 1.0 : f32
+  %output = tensor.empty() : tensor<2x4x16xf32>
+  // expected-error @+1 {{expected decomposition_config entry 'qk_attrs' to be a dictionary}}
+  %result = iree_linalg_ext.attention {
+      decomposition_config = {qk_attrs = true},
+      indexing_maps = [#q, #k, #v, #scale, #o]}
+      ins(%query, %key, %value, %scale :
+          tensor<2x4x8xf32>, tensor<2x6x8xf32>,
+          tensor<2x6x16xf32>, f32)
+      outs(%output : tensor<2x4x16xf32>) {
+    ^bb0(%score: f32):
+      iree_linalg_ext.yield %score : f32
+  } -> tensor<2x4x16xf32>
+  return
+}
+
+// -----
+
+#q = affine_map<(b, m, k1, k2, n) -> (b, m, k1)>
+#k = affine_map<(b, m, k1, k2, n) -> (b, k2, k1)>
+#v = affine_map<(b, m, k1, k2, n) -> (b, k2, n)>
+#scale = affine_map<(b, m, k1, k2, n) -> ()>
+#o = affine_map<(b, m, k1, k2, n) -> (b, m, n)>
+
+func.func @attention_non_dictionary_pv_attrs(
+    %query: tensor<2x4x8xf32>, %key: tensor<2x6x8xf32>,
+    %value: tensor<2x6x16xf32>) {
+  %scale = arith.constant 1.0 : f32
+  %output = tensor.empty() : tensor<2x4x16xf32>
+  // expected-error @+1 {{expected decomposition_config entry 'pv_attrs' to be a dictionary}}
+  %result = iree_linalg_ext.attention {
+      decomposition_config = {pv_attrs = "bad"},
+      indexing_maps = [#q, #k, #v, #scale, #o]}
+      ins(%query, %key, %value, %scale :
+          tensor<2x4x8xf32>, tensor<2x6x8xf32>,
+          tensor<2x6x16xf32>, f32)
+      outs(%output : tensor<2x4x16xf32>) {
+    ^bb0(%score: f32):
+      iree_linalg_ext.yield %score : f32
+  } -> tensor<2x4x16xf32>
+  return
+}
+
+// -----
+
+#q = affine_map<(b, m, k1, k2, n) -> (b, m, k1)>
+#k = affine_map<(b, m, k1, k2, n) -> (b, k2, k1)>
+#v = affine_map<(b, m, k1, k2, n) -> (b, k2, n)>
+#scale = affine_map<(b, m, k1, k2, n) -> ()>
+#o = affine_map<(b, m, k1, k2, n) -> (b, m, n)>
+#row = affine_map<(b, m, k1, k2, n) -> (b, m)>
+
+func.func @online_attention_non_boolean_use_exp2(
+    %query: tensor<2x4x8xf32>, %key: tensor<2x6x8xf32>,
+    %value: tensor<2x6x16xf32>) {
+  %scale = arith.constant 1.0 : f32
+  %output = tensor.empty() : tensor<2x4x16xf32>
+  %max = tensor.empty() : tensor<2x4xf32>
+  %sum = tensor.empty() : tensor<2x4xf32>
+  // expected-error @+1 {{expected decomposition_config entry 'use_exp2' to be a boolean}}
+  %result:3 = iree_linalg_ext.online_attention {
+      decomposition_config = {use_exp2 = "false"},
+      indexing_maps = [#q, #k, #v, #scale, #o, #row, #row]}
+      ins(%query, %key, %value, %scale :
+          tensor<2x4x8xf32>, tensor<2x6x8xf32>,
+          tensor<2x6x16xf32>, f32)
+      outs(%output, %max, %sum :
+          tensor<2x4x16xf32>, tensor<2x4xf32>, tensor<2x4xf32>) {
+    ^bb0(%score: f32):
+      iree_linalg_ext.yield %score : f32
+  } -> tensor<2x4x16xf32>, tensor<2x4xf32>, tensor<2x4xf32>
   return
 }

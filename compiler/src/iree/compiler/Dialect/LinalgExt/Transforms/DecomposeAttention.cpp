@@ -37,7 +37,12 @@ void DecomposeAttentionPass::runOnOperation() {
     rewriter.setInsertionPoint(onlineAtt);
 
     NamedAttrList decompositionConfig(onlineAtt.getDecompositionConfigAttr());
-    decompositionConfig.set("use_exp2", rewriter.getBoolAttr(useExp2));
+    // Preserve an explicit semantic choice carried by the source attention
+    // operation. The pass option is only the default for operations that do
+    // not already specify their exponentiation mode.
+    if (!decompositionConfig.get("use_exp2")) {
+      decompositionConfig.set("use_exp2", rewriter.getBoolAttr(useExp2));
+    }
     onlineAtt.setDecompositionConfigAttr(
         decompositionConfig.getDictionary(context));
 

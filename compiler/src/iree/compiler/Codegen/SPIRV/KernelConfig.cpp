@@ -1378,11 +1378,10 @@ static LogicalResult setAttentionOpConfig(IREE::GPU::TargetAttr target,
         op.getContext(), {b.getNamedAttr("lowering_config", mk(qkT))});
     auto pvAttrs = DictionaryAttr::get(
         op.getContext(), {b.getNamedAttr("lowering_config", mk(pvT))});
-    auto decomp = DictionaryAttr::get(
-        op.getContext(),
-        {b.getNamedAttr(IREE::LinalgExt::AttentionOp::getQKAttrStr(), qkAttrs),
-         b.getNamedAttr(IREE::LinalgExt::AttentionOp::getPVAttrStr(), pvAttrs)});
-    op.setDecompositionConfigAttr(decomp);
+    NamedAttrList decomp(op.getDecompositionConfigAttr());
+    decomp.set(IREE::LinalgExt::AttentionOp::getQKAttrStr(), qkAttrs);
+    decomp.set(IREE::LinalgExt::AttentionOp::getPVAttrStr(), pvAttrs);
+    op.setDecompositionConfigAttr(decomp.getDictionary(op.getContext()));
   }
 
   std::array<int64_t, 3> workgroupSize = {subgroupSize, 1, 1};

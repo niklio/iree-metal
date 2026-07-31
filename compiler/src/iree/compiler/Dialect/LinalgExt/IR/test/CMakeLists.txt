@@ -14,6 +14,8 @@ iree_lit_test_suite(
   NAME
     lit
   SRCS
+    "attention_backward.mlir"
+    "attention_backward_invalid.mlir"
     "canonicalize.mlir"
     "decompose_aggregate_op.mlir"
     "invalid.mlir"

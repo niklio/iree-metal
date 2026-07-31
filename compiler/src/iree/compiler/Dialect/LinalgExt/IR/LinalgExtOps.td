@@ -856,7 +856,8 @@ def IREELinalgExt_ArgCompareOp : IREELinalgExt_Op<"arg_compare", [
 //===----------------------------------------------------------------------===//
 
 def IREELinalgExt_AttentionOp : IREELinalgExt_Op<"attention",
-    [DeclareOpInterfaceMethods<LinalgFusionInterface,
+    [AttrSizedOperandSegments,
+     DeclareOpInterfaceMethods<LinalgFusionInterface,
       ["getIndexingMapsForResults", "getIndexingMapsForOperands",
        "getStaticLoopRanges"]>,
      DeclareOpInterfaceMethods<IndexingMapOpInterface, ["getMatchingIndexingMap"]>,
@@ -880,6 +881,10 @@ def IREELinalgExt_AttentionOp : IREELinalgExt_Op<"attention",
     If an additional mask argument M is included, the result of the first matmul is modified according to:
 
     Q @ K.T += M
+
+    An optional second output returns the row-wise log-sum-exp in natural-log
+    units. Its element type must be f32 and its indexing map contains the batch
+    and query dimensions.
   }];
 
   let arguments = (ins AnyShaped:$query,
@@ -888,6 +893,7 @@ def IREELinalgExt_AttentionOp : IREELinalgExt_Op<"attention",
                        AnyFloat:$scale,
                        Optional<AnyShaped>:$mask,
                        AnyShaped:$output,
+                       Optional<AnyShaped>:$logsumexp,
                        AffineMapArrayAttr:$indexing_maps,
                        OptionalAttr<DictionaryAttr>:$decomposition_config
   );
@@ -899,7 +905,7 @@ def IREELinalgExt_AttentionOp : IREELinalgExt_Op<"attention",
   let assemblyFormat = [{
     attr-dict
     `ins` `(` $query `,` $key `,` $value `,` $scale (`,` $mask^)?  `:` type($query) `,` type($key) `,` type($value) `,` type($scale) (`,` type($mask)^ )?`)`
-    `outs` `(` $output `:` type($output) `)`
+    `outs` `(` $output (`,` $logsumexp^)? `:` type($output) (`,` type($logsumexp)^)? `)`
     $region
     (`->` type($results)^)?
   }];
@@ -911,6 +917,15 @@ def IREELinalgExt_AttentionOp : IREELinalgExt_Op<"attention",
       "Value":$value,
       "Value":$scale,
       "Value":$output,
+      "ArrayAttr":$indexing_maps,
+      CArg<"std::optional<Value>", "std::nullopt">:$mask)>,
+    OpBuilder<(ins "TypeRange":$results,
+      "Value":$query,
+      "Value":$key,
+      "Value":$value,
+      "Value":$scale,
+      "Value":$output,
+      "Value":$logsumexp,
       "ArrayAttr":$indexing_maps,
       CArg<"std::optional<Value>", "std::nullopt">:$mask)>,
     OpBuilder<(ins "TypeRange":$results,
@@ -947,6 +962,13 @@ def IREELinalgExt_AttentionOp : IREELinalgExt_Op<"attention",
     AffineMap getOutputMap() {
       return cast<AffineMap>(getIndexingMapsArray()[getNumDpsInputs()]);
     }
+    std::optional<AffineMap> getLogsumexpMap() {
+      if (getLogsumexp()) {
+        return cast<AffineMap>(
+            getIndexingMapsArray()[getNumDpsInputs() + 1]);
+      }
+      return std::nullopt;
+    }
     int64_t getIterationDomainRank() {
       return getQueryMap().getNumDims();
     }
@@ -956,9 +978,121 @@ def IREELinalgExt_AttentionOp : IREELinalgExt_Op<"attention",
     // Attributes to set on QK and PV matmul after decomposition.
     static StringRef getQKAttrStr() { return "qk_attrs"; }
     static StringRef getPVAttrStr() { return "pv_attrs"; }
+    // Flag to control whether to use exp2 (with log2(e) scaling) or exp.
+    static StringRef getUseExp2AttrStr() { return "use_exp2"; }
   }];
 
   let hasCanonicalizer = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// AttentionBackward
+//===----------------------------------------------------------------------===//
+
+def IREELinalgExt_AttentionBackwardOp :
+    IREELinalgExt_Op<"attention_backward",
+      [IndexingMapOpInterface,
+       DeclareOpInterfaceMethods<ReifyRankedShapedTypeOpInterface,
+          ["reifyResultShapes"]>,
+       DeclareOpInterfaceMethods<AggregatedOpInterface,
+          ["decomposeOperation"]>]> {
+  let summary = [{Scaled dot-product attention backward operator.}];
+  let description = [{
+    Computes gradients of scaled dot-product attention:
+
+      O = softmax(scale * (Q @ K.T) + mask) @ V
+
+    The operation consumes Q, K, V, the forward output O, its gradient dO,
+    and the forward row-wise log-sum-exp in natural-log f32 units. It produces
+    dQ, dK, and dV using destination-passing style.
+
+    An integer mask is a nondifferentiated predicate mask and follows
+    AttentionOp's legacy low-bit truth semantics for integer widths greater
+    than one. A floating-point mask is a nondifferentiated additive mask.
+    This operation represents the identity score transform only; dropout,
+    soft-capping, and arbitrary AttentionOp score-region transforms must not be
+    raised to this operation.
+
+    Indexing maps are ordered as Q, K, V, O, dO, LSE, scale, optional mask,
+    dQ, dK, and dV.
+  }];
+
+  let arguments = (ins AnyRankedTensor:$query,
+                       AnyRankedTensor:$key,
+                       AnyRankedTensor:$value,
+                       AnyRankedTensor:$output,
+                       AnyRankedTensor:$output_grad,
+                       AnyRankedTensor:$logsumexp,
+                       AnyFloat:$scale,
+                       Optional<AnyRankedTensor>:$mask,
+                       AnyRankedTensor:$query_grad,
+                       AnyRankedTensor:$key_grad,
+                       AnyRankedTensor:$value_grad,
+                       AffineMapArrayAttr:$indexing_maps,
+                       OptionalAttr<DictionaryAttr>:$decomposition_config);
+
+  let results = (outs Variadic<AnyRankedTensor>:$results);
+  let hasVerifier = 1;
+  let assemblyFormat = [{
+    attr-dict
+    `ins` `(` $query `,` $key `,` $value `,` $output `,` $output_grad `,`
+        $logsumexp `,` $scale (`,` $mask^)?
+        `:` type($query) `,` type($key) `,` type($value) `,` type($output) `,`
+        type($output_grad) `,` type($logsumexp) `,` type($scale)
+        (`,` type($mask)^)? `)`
+    `outs` `(` $query_grad `,` $key_grad `,` $value_grad
+        `:` type($query_grad) `,` type($key_grad) `,` type($value_grad) `)`
+    (`->` type($results)^)?
+  }];
+
+  let extraClassDeclaration = [{
+    // DestinationStyleOpInterface.
+    MutableOperandRange getDpsInitsMutable();
+
+    SmallVector<AffineMap> getIndexingMapsArray();
+
+    AffineMap getQueryMap() {
+      return getIndexingMapsArray()[0];
+    }
+    AffineMap getKeyMap() {
+      return getIndexingMapsArray()[1];
+    }
+    AffineMap getValueMap() {
+      return getIndexingMapsArray()[2];
+    }
+    AffineMap getOutputMap() {
+      return getIndexingMapsArray()[3];
+    }
+    AffineMap getOutputGradMap() {
+      return getIndexingMapsArray()[4];
+    }
+    AffineMap getLogsumexpMap() {
+      return getIndexingMapsArray()[5];
+    }
+    AffineMap getScaleMap() {
+      return getIndexingMapsArray()[6];
+    }
+    std::optional<AffineMap> getMaskMap() {
+      if (getMask()) {
+        return getIndexingMapsArray()[7];
+      }
+      return std::nullopt;
+    }
+    AffineMap getQueryGradMap() {
+      return getIndexingMapsArray()[getNumDpsInputs()];
+    }
+    AffineMap getKeyGradMap() {
+      return getIndexingMapsArray()[getNumDpsInputs() + 1];
+    }
+    AffineMap getValueGradMap() {
+      return getIndexingMapsArray()[getNumDpsInputs() + 2];
+    }
+    int64_t getIterationDomainRank() {
+      return getQueryMap().getNumDims();
+    }
+    // Flag to control whether scores use exp2 (with log2(e) scaling) or exp.
+    static StringRef getUseExp2AttrStr() { return "use_exp2"; }
+  }];
 }
 
 //===----------------------------------------------------------------------===//

@@ -41,6 +41,47 @@ util.func public @attention_static(%arg0: tensor<20x4096x16xf16>, %arg1: tensor<
 #map1 = affine_map<(d0, d1, d2, d3, d4) -> (d0, d3, d2)>
 #map2 = affine_map<(d0, d1, d2, d3, d4) -> (d0, d3, d4)>
 #map3 = affine_map<(d0, d1, d2, d3, d4) -> ()>
+#map4 = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d4)>
+#map5 = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1)>
+
+// Reshape-by-expansion currently returns one replacement, so a two-result
+// attention must remain intact rather than dropping or corrupting its LSE.
+util.func public @no_expand_two_result_attention(
+    %query: tensor<20x4096x16xf16>,
+    %key: tensor<20x1024x16xf16>,
+    %value: tensor<20x1024x64xf16>,
+    %scale: f16)
+    -> (tensor<2x10x4096x64xf16>, tensor<20x4096xf32>) {
+  %output = tensor.empty() : tensor<20x4096x64xf16>
+  %logsumexp = tensor.empty() : tensor<20x4096xf32>
+  %attention:2 = iree_linalg_ext.attention {
+      indexing_maps = [#map, #map1, #map2, #map3, #map4, #map5]}
+      ins(%query, %key, %value, %scale :
+          tensor<20x4096x16xf16>, tensor<20x1024x16xf16>,
+          tensor<20x1024x64xf16>, f16)
+      outs(%output, %logsumexp :
+          tensor<20x4096x64xf16>, tensor<20x4096xf32>) {
+    ^bb0(%score: f16):
+      iree_linalg_ext.yield %score : f16
+  } -> tensor<20x4096x64xf16>, tensor<20x4096xf32>
+  %expanded = tensor.expand_shape %attention#0 [[0, 1], [2], [3]]
+      output_shape [2, 10, 4096, 64]
+      : tensor<20x4096x64xf16> into tensor<2x10x4096x64xf16>
+  util.return %expanded, %attention#1 :
+      tensor<2x10x4096x64xf16>, tensor<20x4096xf32>
+}
+
+// CHECK-LABEL: func public @no_expand_two_result_attention
+// CHECK:       %[[ATTENTION:.+]]:2 = iree_linalg_ext.attention
+// CHECK:       %[[EXPANDED:.+]] = tensor.expand_shape %[[ATTENTION]]#0
+// CHECK:       util.return %[[EXPANDED]], %[[ATTENTION]]#1
+
+// -----
+
+#map = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2)>
+#map1 = affine_map<(d0, d1, d2, d3, d4) -> (d0, d3, d2)>
+#map2 = affine_map<(d0, d1, d2, d3, d4) -> (d0, d3, d4)>
+#map3 = affine_map<(d0, d1, d2, d3, d4) -> ()>
 #map4 = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d3)>
 #map5 = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d4)>
 

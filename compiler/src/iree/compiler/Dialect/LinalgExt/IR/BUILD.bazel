@@ -48,6 +48,7 @@ iree_compiler_cc_library(
     name = "IR",
     srcs = [
         "AggregatedOpInterfaceImpl.cpp",
+        "AttentionBackwardOp.cpp",
         "LinalgExtAttrs.cpp.inc",
         "LinalgExtDialect.cpp",
         "LinalgExtDialect.cpp.inc",
@@ -78,6 +79,7 @@ iree_compiler_cc_library(
         ":LinalgExtPureOpsIncGen",
         ":LinalgExtTypesGen",
         "//compiler/src/iree/compiler/Dialect/LinalgExt/Utils",
+        "//compiler/src/iree/compiler/Dialect/Util/IR",
         "@llvm-project//llvm:Support",
         "@llvm-project//mlir:AffineDialect",
         "@llvm-project//mlir:AffineUtils",

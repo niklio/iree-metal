@@ -1702,6 +1702,46 @@ func.func @attention(%query: tensor<192x1024x64xf32>, %key: tensor<192x1024x64xf
 
 // -----
 
+func.func @attention_with_logsumexp(
+    %query: tensor<192x1024x64xf32>,
+    %key: tensor<192x1024x64xf32>,
+    %value: tensor<192x1024x64xf32>)
+    -> (tensor<192x1024x64xf32>, tensor<192x1024xf32>) {
+  %output = tensor.empty() : tensor<192x1024x64xf32>
+  %logsumexp = tensor.empty() : tensor<192x1024xf32>
+  %scale = arith.constant 1.0 : f32
+  %result:2 = iree_linalg_ext.attention {
+      indexing_maps = [
+        affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2)>,
+        affine_map<(d0, d1, d2, d3, d4) -> (d0, d3, d2)>,
+        affine_map<(d0, d1, d2, d3, d4) -> (d0, d3, d4)>,
+        affine_map<(d0, d1, d2, d3, d4) -> ()>,
+        affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d4)>,
+        affine_map<(d0, d1, d2, d3, d4) -> (d0, d1)>
+      ]}
+      ins(%query, %key, %value, %scale :
+          tensor<192x1024x64xf32>, tensor<192x1024x64xf32>,
+          tensor<192x1024x64xf32>, f32)
+      outs(%output, %logsumexp :
+          tensor<192x1024x64xf32>, tensor<192x1024xf32>) {
+    ^bb0(%score: f32):
+      iree_linalg_ext.yield %score : f32
+  } -> tensor<192x1024x64xf32>, tensor<192x1024xf32>
+  return %result#0, %result#1 :
+      tensor<192x1024x64xf32>, tensor<192x1024xf32>
+}
+
+// CHECK-DAG: #[[$MAP_LSE:.+]] = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1)>
+// CHECK-LABEL: func.func @attention_with_logsumexp(
+// CHECK:         %[[ATTN:.+]]:2 = iree_linalg_ext.attention
+// CHECK-SAME:      indexing_maps = [{{.*}}, #[[$MAP_LSE]]]
+// CHECK-SAME:      outs(%{{.+}}, %{{.+}} :
+// CHECK-SAME:      tensor<192x1024x64xf32>, tensor<192x1024xf32>)
+// CHECK:         } -> tensor<192x1024x64xf32>, tensor<192x1024xf32>
+// CHECK:         return %[[ATTN]]#0, %[[ATTN]]#1
+
+// -----
+
 func.func @cross_attention(%query: tensor<192x1024x64xf32>, %key: tensor<192x2048x64xf32>, %value: tensor<192x2048x64xf32>) -> tensor<192x1024x64xf32> {
   %0 = tensor.empty() : tensor<192x1024x64xf32>
   %scale = arith.constant 1.0 : f32

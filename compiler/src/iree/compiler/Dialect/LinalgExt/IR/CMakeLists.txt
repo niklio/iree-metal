@@ -27,6 +27,7 @@ iree_cc_library(
     "LinalgExtOps.h.inc"
   SRCS
     "AggregatedOpInterfaceImpl.cpp"
+    "AttentionBackwardOp.cpp"
     "LinalgExtAttrs.cpp.inc"
     "LinalgExtDialect.cpp"
     "LinalgExtDialect.cpp.inc"
@@ -69,6 +70,7 @@ iree_cc_library(
     MLIRValueBoundsOpInterface
     MLIRViewLikeInterface
     iree::compiler::Dialect::LinalgExt::Utils
+    iree::compiler::Dialect::Util::IR
   PUBLIC
 )
 

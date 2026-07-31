@@ -8,6 +8,48 @@ util.func public @empty() {
 
 // -----
 
+// The aggregate has no single valid tiling interface: its three gradient
+// results reduce different iteration dimensions. The global optimization
+// pipeline must decompose it into independently tileable linalg operations
+// before dispatch formation.
+util.func public @attention_backward_is_decomposed(
+    %query: tensor<1x2x3xf32>, %key: tensor<1x4x3xf32>,
+    %value: tensor<1x4x5xf32>, %output: tensor<1x2x5xf32>,
+    %output_grad: tensor<1x2x5xf32>, %logsumexp: tensor<1x2xf32>,
+    %query_grad: tensor<1x2x3xf32>, %key_grad: tensor<1x4x3xf32>,
+    %value_grad: tensor<1x4x5xf32>)
+    -> (tensor<1x2x3xf32>, tensor<1x4x3xf32>, tensor<1x4x5xf32>) {
+  %scale = arith.constant 0.5 : f32
+  %grads:3 = iree_linalg_ext.attention_backward {
+      indexing_maps = [
+        affine_map<(b, m, k1, k2, n) -> (b, m, k1)>,
+        affine_map<(b, m, k1, k2, n) -> (b, k2, k1)>,
+        affine_map<(b, m, k1, k2, n) -> (b, k2, n)>,
+        affine_map<(b, m, k1, k2, n) -> (b, m, n)>,
+        affine_map<(b, m, k1, k2, n) -> (b, m, n)>,
+        affine_map<(b, m, k1, k2, n) -> (b, m)>,
+        affine_map<(b, m, k1, k2, n) -> ()>,
+        affine_map<(b, m, k1, k2, n) -> (b, m, k1)>,
+        affine_map<(b, m, k1, k2, n) -> (b, k2, k1)>,
+        affine_map<(b, m, k1, k2, n) -> (b, k2, n)>]}
+      ins(%query, %key, %value, %output, %output_grad, %logsumexp, %scale :
+          tensor<1x2x3xf32>, tensor<1x4x3xf32>, tensor<1x4x5xf32>,
+          tensor<1x2x5xf32>, tensor<1x2x5xf32>, tensor<1x2xf32>, f32)
+      outs(%query_grad, %key_grad, %value_grad :
+          tensor<1x2x3xf32>, tensor<1x4x3xf32>, tensor<1x4x5xf32>)
+      -> tensor<1x2x3xf32>, tensor<1x4x3xf32>, tensor<1x4x5xf32>
+  util.return %grads#0, %grads#1, %grads#2 :
+      tensor<1x2x3xf32>, tensor<1x4x3xf32>, tensor<1x4x5xf32>
+}
+
+// CHECK-LABEL: util.func public @attention_backward_is_decomposed
+// CHECK-NOT:   iree_linalg_ext.attention_backward
+// CHECK:       math.exp
+// CHECK-NOT:   iree_linalg_ext.attention_backward
+// CHECK:       util.return
+
+// -----
+
 util.func public @elementwiseOps(%arg0 : tensor<4xf32>) -> tensor<4xf32> {
   %0 = arith.addf %arg0, %arg0 : tensor<4xf32>
   %1 = arith.subf %0, %arg0 : tensor<4xf32>
