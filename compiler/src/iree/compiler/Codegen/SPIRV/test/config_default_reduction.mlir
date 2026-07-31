@@ -273,8 +273,136 @@ func.func @fail_reduction_with_nondistributable_consumer(
   return %epilogue : tensor<16x74x64xf32>
 }
 
-//  CHECK-DAG: #[[TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = SPIRVBaseDistribute {{.*}}>
+//  CHECK-DAG: #[[TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = SPIRVBaseVectorize {{.*}}>
 //      CHECK: func.func @fail_reduction_with_nondistributable_consumer(
 // CHECK-SAME:     translation_info = #[[TRANSLATION]]
 // CHECK-NOT: pipeline = SPIRVSubgroupReduce
 //      CHECK: return
+
+// -----
+
+// Static non-multiple reductions smaller than a subgroup must not use the
+// subgroup-reduce pipeline. With the transposed input map produced by a
+// [T,D] -> [B,T,D] broadcast VJP, that pipeline fans the short reduction out
+// from lane 0 through workgroup memory without a barrier. The B=31/32/33 cases
+// pin the boundary, while B=577 protects the correct, fast masked-loop path.
+#executable_target_vulkan_spirv_fb = #hal.executable.target<"vulkan-spirv", "vulkan-spirv-fb", {
+  iree_codegen.target_info = #iree_gpu.target<arch = "", features = "spirv:v1.6,cap:Shader", wgp = <
+    compute = fp32|int32, storage = b32|b16, subgroup = shuffle,
+    subgroup_size_choices = [32], max_workgroup_sizes = [512, 512, 512],
+    max_thread_count_per_workgroup = 512, max_workgroup_memory_bytes = 16384,
+    max_workgroup_counts = [65535, 65535, 65535]>>
+}>
+#broadcast_vjp_input = affine_map<(d0, d1) -> (d1, d0)>
+#broadcast_vjp_output = affine_map<(d0, d1) -> (d0)>
+
+func.func @broadcast_vjp_reduce_b2(%input: tensor<2x128xf32>) -> tensor<128xbf16>
+    attributes {hal.executable.target = #executable_target_vulkan_spirv_fb} {
+  %zero = arith.constant 0.000000e+00 : bf16
+  %empty = tensor.empty() : tensor<128xbf16>
+  %filled = linalg.fill ins(%zero : bf16) outs(%empty : tensor<128xbf16>) -> tensor<128xbf16>
+  %result = linalg.generic {
+      indexing_maps = [#broadcast_vjp_input, #broadcast_vjp_output],
+      iterator_types = ["parallel", "reduction"]}
+      ins(%input : tensor<2x128xf32>) outs(%filled : tensor<128xbf16>) {
+  ^bb0(%in: f32, %out: bf16):
+    %in_bf16 = arith.truncf %in : f32 to bf16
+    %sum = arith.addf %out, %in_bf16 : bf16
+    linalg.yield %sum : bf16
+  } -> tensor<128xbf16>
+  return %result : tensor<128xbf16>
+}
+
+func.func @broadcast_vjp_reduce_b31(%input: tensor<31x128xf32>) -> tensor<128xbf16>
+    attributes {hal.executable.target = #executable_target_vulkan_spirv_fb} {
+  %zero = arith.constant 0.000000e+00 : bf16
+  %empty = tensor.empty() : tensor<128xbf16>
+  %filled = linalg.fill ins(%zero : bf16) outs(%empty : tensor<128xbf16>) -> tensor<128xbf16>
+  %result = linalg.generic {
+      indexing_maps = [#broadcast_vjp_input, #broadcast_vjp_output],
+      iterator_types = ["parallel", "reduction"]}
+      ins(%input : tensor<31x128xf32>) outs(%filled : tensor<128xbf16>) {
+  ^bb0(%in: f32, %out: bf16):
+    %in_bf16 = arith.truncf %in : f32 to bf16
+    %sum = arith.addf %out, %in_bf16 : bf16
+    linalg.yield %sum : bf16
+  } -> tensor<128xbf16>
+  return %result : tensor<128xbf16>
+}
+
+func.func @broadcast_vjp_reduce_b32(%input: tensor<32x128xf32>) -> tensor<128xbf16>
+    attributes {hal.executable.target = #executable_target_vulkan_spirv_fb} {
+  %zero = arith.constant 0.000000e+00 : bf16
+  %empty = tensor.empty() : tensor<128xbf16>
+  %filled = linalg.fill ins(%zero : bf16) outs(%empty : tensor<128xbf16>) -> tensor<128xbf16>
+  %result = linalg.generic {
+      indexing_maps = [#broadcast_vjp_input, #broadcast_vjp_output],
+      iterator_types = ["parallel", "reduction"]}
+      ins(%input : tensor<32x128xf32>) outs(%filled : tensor<128xbf16>) {
+  ^bb0(%in: f32, %out: bf16):
+    %in_bf16 = arith.truncf %in : f32 to bf16
+    %sum = arith.addf %out, %in_bf16 : bf16
+    linalg.yield %sum : bf16
+  } -> tensor<128xbf16>
+  return %result : tensor<128xbf16>
+}
+
+func.func @broadcast_vjp_reduce_b33(%input: tensor<33x128xf32>) -> tensor<128xbf16>
+    attributes {hal.executable.target = #executable_target_vulkan_spirv_fb} {
+  %zero = arith.constant 0.000000e+00 : bf16
+  %empty = tensor.empty() : tensor<128xbf16>
+  %filled = linalg.fill ins(%zero : bf16) outs(%empty : tensor<128xbf16>) -> tensor<128xbf16>
+  %result = linalg.generic {
+      indexing_maps = [#broadcast_vjp_input, #broadcast_vjp_output],
+      iterator_types = ["parallel", "reduction"]}
+      ins(%input : tensor<33x128xf32>) outs(%filled : tensor<128xbf16>) {
+  ^bb0(%in: f32, %out: bf16):
+    %in_bf16 = arith.truncf %in : f32 to bf16
+    %sum = arith.addf %out, %in_bf16 : bf16
+    linalg.yield %sum : bf16
+  } -> tensor<128xbf16>
+  return %result : tensor<128xbf16>
+}
+
+func.func @broadcast_vjp_reduce_b577(%input: tensor<577x128xf32>) -> tensor<128xbf16>
+    attributes {hal.executable.target = #executable_target_vulkan_spirv_fb} {
+  %zero = arith.constant 0.000000e+00 : bf16
+  %empty = tensor.empty() : tensor<128xbf16>
+  %filled = linalg.fill ins(%zero : bf16) outs(%empty : tensor<128xbf16>) -> tensor<128xbf16>
+  %result = linalg.generic {
+      indexing_maps = [#broadcast_vjp_input, #broadcast_vjp_output],
+      iterator_types = ["parallel", "reduction"]}
+      ins(%input : tensor<577x128xf32>) outs(%filled : tensor<128xbf16>) {
+  ^bb0(%in: f32, %out: bf16):
+    %in_bf16 = arith.truncf %in : f32 to bf16
+    %sum = arith.addf %out, %in_bf16 : bf16
+    linalg.yield %sum : bf16
+  } -> tensor<128xbf16>
+  return %result : tensor<128xbf16>
+}
+
+//  CHECK-DAG: #[[B2_CONFIG:.+]] = #iree_codegen.lowering_config<tile_sizes = {{\[}}[32], [1], [0, 2]{{\]}}>
+//  CHECK-DAG: #[[B31_CONFIG:.+]] = #iree_codegen.lowering_config<tile_sizes = {{\[}}[32], [1], [0, 31]{{\]}}>
+//  CHECK-DAG: #[[SUBGROUP_CONFIG:.+]] = #iree_codegen.lowering_config<tile_sizes = {{\[}}[1], [0, 32]{{\]}}>
+//  CHECK-DAG: #[[BASE_TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = SPIRVBaseVectorize workgroup_size = [32, 1, 1]>
+//  CHECK-DAG: #[[SUBGROUP_TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = SPIRVSubgroupReduce workgroup_size = [32, 1, 1]>
+//      CHECK: func.func @broadcast_vjp_reduce_b2(
+// CHECK-SAME:     translation_info = #[[BASE_TRANSLATION]]
+//      CHECK:   linalg.generic
+// CHECK-SAME:       lowering_config = #[[B2_CONFIG]]
+//      CHECK: func.func @broadcast_vjp_reduce_b31(
+// CHECK-SAME:     translation_info = #[[BASE_TRANSLATION]]
+//      CHECK:   linalg.generic
+// CHECK-SAME:       lowering_config = #[[B31_CONFIG]]
+//      CHECK: func.func @broadcast_vjp_reduce_b32(
+// CHECK-SAME:     translation_info = #[[SUBGROUP_TRANSLATION]]
+//      CHECK:   linalg.generic
+// CHECK-SAME:       lowering_config = #[[SUBGROUP_CONFIG]]
+//      CHECK: func.func @broadcast_vjp_reduce_b33(
+// CHECK-SAME:     translation_info = #[[SUBGROUP_TRANSLATION]]
+//      CHECK:   linalg.generic
+// CHECK-SAME:       lowering_config = #[[SUBGROUP_CONFIG]]
+//      CHECK: func.func @broadcast_vjp_reduce_b577(
+// CHECK-SAME:     translation_info = #[[SUBGROUP_TRANSLATION]]
+//      CHECK:   linalg.generic
+// CHECK-SAME:       lowering_config = #[[SUBGROUP_CONFIG]]

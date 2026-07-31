@@ -30,7 +30,34 @@ func.func @matmul_8x8x8(
   return %result : tensor<8x8xf32>
 }
 
-// CHECK-DAG: #[[TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = SPIRVSubgroupReduce
+// CHECK-DAG: #[[TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = SPIRVBaseVectorize
 // CHECK-LABEL: func.func @matmul_8x8x8(
 // CHECK-SAME: translation_info = #[[TRANSLATION]]
 // CHECK-NOT: APPLE_SIMDGROUP
+
+// -----
+
+// A reduction smaller than Apple's 32-lane subgroup must stay off the masked
+// subgroup-reduction path. Forcing a reduction tile of 32 for this broadcast
+// VJP drops all but one batch contribution on Metal.
+#tiny_input = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+#tiny_output = affine_map<(d0, d1, d2) -> (d0, d1)>
+func.func @tiny_broadcast_vjp_reduction(
+    %input: tensor<512x768x2xbf16>,
+    %init: tensor<512x768xbf16>) -> tensor<512x768xbf16> {
+  %result = linalg.generic {
+      indexing_maps = [#tiny_input, #tiny_output],
+      iterator_types = ["parallel", "parallel", "reduction"]}
+      ins(%input : tensor<512x768x2xbf16>)
+      outs(%init : tensor<512x768xbf16>) {
+    ^bb0(%in: bf16, %out: bf16):
+      %sum = arith.addf %out, %in : bf16
+      linalg.yield %sum : bf16
+  } -> tensor<512x768xbf16>
+  return %result : tensor<512x768xbf16>
+}
+
+// CHECK-LABEL: func.func @tiny_broadcast_vjp_reduction(
+// CHECK-SAME: translation_info = #[[TRANSLATION]]
+// CHECK: linalg.generic
+// CHECK-SAME: iterator_types = ["parallel", "parallel", "reduction"]

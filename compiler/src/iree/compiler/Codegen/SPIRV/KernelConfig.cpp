@@ -1748,6 +1748,17 @@ static LogicalResult setReductionConfig(IREE::GPU::TargetAttr target,
     reductionSize *= bounds[dim];
   }
   if (reductionSize % subgroupSize != 0) {
+    // Below one full subgroup tile, reduction tiling canonicalizes to a lane-0
+    // vector fan-out through workgroup memory without the synchronization
+    // needed before the subgroup reduction. On Metal this drops every
+    // contribution except the first one (notably for broadcast VJPs over model
+    // batch B=2/4/8). Let the default distribute pipeline handle these tiny
+    // reductions. At subgroupSize and above, the tiled loop has the required
+    // barrier; keep that path for non-multiples such as sequence 577, where it
+    // is both correct and substantially faster than the fallback.
+    if (reductionSize < subgroupSize) {
+      return failure();
+    }
     // IREE_METAL_COOP_REDUCE_NONMULT (default ON): a STATIC reduction whose size isn't
     // a multiple of the subgroup (e.g. softmax over seq=577) would otherwise bail to
     // the scalar default config — which is BOTH 16.6x slower AND (validated vs CPU)
