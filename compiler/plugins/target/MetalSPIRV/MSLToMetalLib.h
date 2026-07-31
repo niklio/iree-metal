@@ -7,18 +7,35 @@
 #ifndef IREE_COMPILER_PLUGINS_TARGET_METALSPIRV_MSLTOMETALLIB_H_
 #define IREE_COMPILER_PLUGINS_TARGET_METALSPIRV_MSLTOMETALLIB_H_
 
+#include <cstdint>
+#include <optional>
+#include <string>
+
 #include "compiler/plugins/target/MetalSPIRV/MetalTargetPlatform.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/MemoryBuffer.h"
 
 namespace mlir::iree_compiler::IREE::HAL {
 
+namespace detail {
+
+// Builds the deterministic offline Metal compiler command for a known
+// MTLLanguageVersion value. Returns std::nullopt for unsupported versions.
+std::optional<std::string>
+buildMetalCompileCommand(MetalTargetPlatform targetPlatform,
+                         uint32_t languageVersion, llvm::StringRef mslFile,
+                         llvm::StringRef libFile);
+
+} // namespace detail
+
 // Invokes system commands to compile the given |mslCode| into a Metal library
 // and returns the library binary code. |fileName| will be used as a hint for
-// creating intermediate files.
+// creating intermediate files. |languageVersion| is the MTLLanguageVersion
+// selected while cross-compiling the same source.
 std::unique_ptr<llvm::MemoryBuffer>
 compileMSLToMetalLib(MetalTargetPlatform targetPlatform,
-                     llvm::StringRef mslCode, llvm::StringRef fileName);
+                     uint32_t languageVersion, llvm::StringRef mslCode,
+                     llvm::StringRef fileName);
 
 } // namespace mlir::iree_compiler::IREE::HAL
 

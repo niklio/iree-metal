@@ -140,14 +140,11 @@ iree_cc_library(
     iree::compiler::Codegen::Common::GPU::CommonGPUPasses
     iree::compiler::Codegen::Common::GPU::GPUHeuristics
     iree::compiler::Codegen::Common::TransformDialectInterpreterPass
-    # iree-metal (attn vector-distribute port, M0): temporary dep so the SPIRV
-    # attention pipeline can reuse the LLVMGPU vector-distribute passes
-    # (ConfigureTensorLayouts + VectorDistribute). To be replaced by moving those
-    # passes to Common/GPU (roadmap #1). No cycle: LLVMGPU does not dep SPIRV.
-    iree::compiler::Codegen::LLVMGPU
     iree::compiler::Codegen::Dialect::Codegen::IR::IREECodegenDialect
     iree::compiler::Codegen::Dialect::GPU::IR::IREEGPUDialect
+    iree::compiler::Codegen::Dialect::VectorExt::IR::IREEVectorExtDialect
     iree::compiler::Codegen::Interfaces::PartitionableLoopsInterface
+    iree::compiler::Codegen::LLVMGPU
     iree::compiler::Codegen::Transforms
     iree::compiler::Codegen::Utils
     iree::compiler::Dialect::HAL::IR

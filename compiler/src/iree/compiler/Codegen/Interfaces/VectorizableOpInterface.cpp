@@ -1108,7 +1108,8 @@ struct InnerTiledOpVectorizationModel
         ValueRange{newOperands}.take_front(tiledOp.getNumInputs()),
         ValueRange{newOperands}.take_back(tiledOp.getNumOutputs()),
         tiledOp.getIndexingMaps(), tiledOp.getIteratorTypes(),
-        tiledOp.getKind(), tiledOp.getSemantics());
+        tiledOp.getKind(), tiledOp.getSemantics(), tiledOp.getPermutations());
+    newTiledOp->setDiscardableAttrs(tiledOp->getDiscardableAttrDictionary());
 
     auto zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
     SmallVector<Value> results;

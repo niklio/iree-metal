@@ -4,8 +4,6 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include <cstdlib>
-
 #include "compiler/plugins/target/MetalSPIRV/MSLToMetalLib.h"
 #include "compiler/plugins/target/MetalSPIRV/MetalTargetPlatform.h"
 #include "compiler/plugins/target/MetalSPIRV/SPIRVToMSL.h"
@@ -213,7 +211,8 @@ public:
              llvm::zip_equal(llvm::seq(mslShaders.size()), mslShaders,
                              mslEntryPointNames)) {
           std::unique_ptr<llvm::MemoryBuffer> lib = compileMSLToMetalLib(
-              options.targetPlatform, shader.source, entryPoint);
+              options.targetPlatform, shader.languageVersion, shader.source,
+              entryPoint);
           if (!lib) {
             return variantOp.emitError()
                    << "failed to compile to MTLLibrary from MSL:\n\n"
@@ -239,19 +238,9 @@ public:
       const bool embedSource = !metallib || serOptions.debugLevel > 1;
       iree_hal_metal_MSLSourceDef_ref_t sourceRef = 0;
       if (embedSource) {
-        // TODO: pull this from an attribute?
-        // https://developer.apple.com/documentation/metal/mtllanguageversion
-        // iree-metal (task#28): Metal 4 cooperative-tensor (matmul2d) MSL requires the
-        // runtime MTLCompiler to build at MSL 4.0; the embedded version drives
-        // executable.m's languageVersion floor. Env-gated so the shipped path stays
-        // on 3.0 (inert by default). 262144 == MTLLanguageVersion4_0.
-        unsigned version =
-            (std::getenv("IREE_METAL_MSL4") || std::getenv("IREE_METAL_MSL4_MATMUL2D"))
-                ? 262144u   // MTLLanguageVersion4_0
-                : 196608u;  // MTLLanguageVersion3_0
         auto sourceStrRef = builder.createString(shader.source);
-        sourceRef =
-            iree_hal_metal_MSLSourceDef_create(builder, version, sourceStrRef);
+        sourceRef = iree_hal_metal_MSLSourceDef_create(
+            builder, shader.languageVersion, sourceStrRef);
       }
       flatbuffers_string_ref_t metallibRef = 0;
       if (metallib) {

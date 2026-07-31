@@ -1251,6 +1251,31 @@ func.func @tensor_multi_mma(%lhs: tensor<2x3x4xf16>, %rhs: tensor<3x5x4xf16>, %a
 
 // -----
 
+#single_tile_accesses = [
+ affine_map<() -> ()>,
+ affine_map<() -> ()>,
+ affine_map<() -> ()>
+]
+func.func @tensor_apple16_preserves_rhs_permutation(
+    %lhs: tensor<16x16xf16>, %rhs: tensor<16x16xf16>,
+    %acc: tensor<16x16xf32>) -> tensor<16x16xf32> {
+  %0 = iree_codegen.inner_tiled ins(%lhs, %rhs) outs(%acc) {
+    indexing_maps = #single_tile_accesses,
+    iterator_types = [],
+    kind = #iree_gpu.mma_layout<APPLE_SIMDGROUP_F32_16x16x16_F16>,
+    permutations = [array<i64: 0, 1>, array<i64: 1, 0>, array<i64: 0, 1>],
+    semantics = #iree_gpu.mma_semantics<distributed = false, opaque = true>
+  } : tensor<16x16xf16>, tensor<16x16xf16> into tensor<16x16xf32>
+  return %0 : tensor<16x16xf32>
+}
+
+// CHECK-LABEL: func @tensor_apple16_preserves_rhs_permutation
+//       CHECK:   %[[MMA:.+]] = iree_codegen.inner_tiled
+//  CHECK-SAME:     permutations = [array<i64: 0, 1>, array<i64: 1, 0>, array<i64: 0, 1>]
+//  CHECK-SAME:     : vector<16x16xf16>, vector<16x16xf16> into vector<16x16xf32>
+
+// -----
+
 #contraction_accesses = [
  affine_map<() -> ()>,
  affine_map<() -> ()>,

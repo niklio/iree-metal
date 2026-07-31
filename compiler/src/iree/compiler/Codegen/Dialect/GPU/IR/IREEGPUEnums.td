@@ -137,6 +137,7 @@ class IREEGPU_I32Enum<string name, string summary, list<EnumCase> cases>
 // * A = vendor:
 //   * 1 = AMD
 //   * 2 = NVIDIA
+//   * 3 = Apple
 // * B = architecture. When an intrinsic exists in multiple architectures, this
 //       should be the architecture it was introduced in, as long as it still
 //       has the same semantics. If a new architecture breaks an existing
@@ -263,6 +264,12 @@ def NV_MMA_SYNC_F16_16x8x16_F16 : I32EnumAttrCase<"NV_MMA_SYNC_F16_16x8x16_F16",
 def NV_WMMA_F32_16x16x16_F16 : I32EnumAttrCase<"NV_WMMA_F32_16x16x16_F16", 0x2120>;
 def NV_WMMA_F16_16x16x16_F16 : I32EnumAttrCase<"NV_WMMA_F16_16x16x16_F16", 0x2121>;
 
+// Apple simdgroup matrix intrinsics.
+def APPLE_SIMDGROUP_F32_8x8x8_F16 : I32EnumAttrCase<"APPLE_SIMDGROUP_F32_8x8x8_F16", 0x3020>;
+def APPLE_SIMDGROUP_F32_16x16x16_F16 : I32EnumAttrCase<"APPLE_SIMDGROUP_F32_16x16x16_F16", 0x3021>;
+def APPLE_SIMDGROUP_F32_8x8x8_BF16 : I32EnumAttrCase<"APPLE_SIMDGROUP_F32_8x8x8_BF16", 0x3022>;
+def APPLE_SIMDGROUP_F32_16x16x16_BF16 : I32EnumAttrCase<"APPLE_SIMDGROUP_F32_16x16x16_BF16", 0x3023>;
+
 def IREEGPU_MMAIntrinsic : IREEGPU_I32EnumAttr<"MMAIntrinsic",
     "Descriptor for different MMA intrinsics", [
       // Introduced in CDNA1.
@@ -367,6 +374,12 @@ def IREEGPU_MMAIntrinsic : IREEGPU_I32EnumAttr<"MMAIntrinsic",
       // opaque NV intrinsics.
       NV_WMMA_F32_16x16x16_F16,
       NV_WMMA_F16_16x16x16_F16,
+
+      // Apple simdgroup matrix intrinsics.
+      APPLE_SIMDGROUP_F32_8x8x8_F16,
+      APPLE_SIMDGROUP_F32_16x16x16_F16,
+      APPLE_SIMDGROUP_F32_8x8x8_BF16,
+      APPLE_SIMDGROUP_F32_16x16x16_BF16,
     ]>;
 
 def VMFMA_F32_16x16x32_F16  : I32EnumAttrCase<"VMFMA_F32_16x16x32_F16", 0>;

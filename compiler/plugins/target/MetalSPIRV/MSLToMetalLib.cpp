@@ -19,10 +19,24 @@
 
 namespace mlir::iree_compiler::IREE::HAL {
 
+static std::optional<llvm::StringRef>
+getMetalLanguageStandard(uint32_t languageVersion) {
+  switch (languageVersion) {
+  case 196608u: // MTLLanguageVersion3_0
+    return "metal3.0";
+  case 196609u: // MTLLanguageVersion3_1
+    return "metal3.1";
+  case 262144u: // MTLLanguageVersion4_0
+    return "metal4.0";
+  default:
+    return std::nullopt;
+  }
+}
+
 /// Returns the command to compile the given MSL source file into Metal library.
-static std::string getMetalCompileCommand(MetalTargetPlatform platform,
-                                          llvm::StringRef mslFile,
-                                          llvm::StringRef libFile) {
+std::optional<std::string> detail::buildMetalCompileCommand(
+    MetalTargetPlatform platform, uint32_t languageVersion,
+    llvm::StringRef mslFile, llvm::StringRef libFile) {
   const char *sdk = "";
   switch (platform) {
   case MetalTargetPlatform::macOS:
@@ -36,12 +50,20 @@ static std::string getMetalCompileCommand(MetalTargetPlatform platform,
     break;
   }
 
+  std::optional<llvm::StringRef> languageStandard =
+      getMetalLanguageStandard(languageVersion);
+  if (!languageStandard) {
+    return std::nullopt;
+  }
+
   // Metal shader offline compilation involves two steps:
   // 1. Compile the MSL source code into an Apple IR (AIR) file,
   // 2. Compile the AIR file into a Metal library.
   return llvm::Twine("xcrun -sdk ")
       .concat(sdk)
-      .concat(" metal -c ")
+      .concat(" metal -std=")
+      .concat(*languageStandard)
+      .concat(" -c ")
       .concat(mslFile)
       .concat(" -o - | xcrun -sdk ")
       .concat(sdk)
@@ -64,7 +86,8 @@ static LogicalResult runSystemCommand(llvm::StringRef command) {
 
 std::unique_ptr<llvm::MemoryBuffer>
 compileMSLToMetalLib(MetalTargetPlatform targetPlatform,
-                     llvm::StringRef mslCode, llvm::StringRef entryPoint) {
+                     uint32_t languageVersion, llvm::StringRef mslCode,
+                     llvm::StringRef entryPoint) {
   llvm::SmallString<32> mslFile, airFile, libFile;
   int mslFd = 0;
   llvm::sys::fs::createTemporaryFile(entryPoint, "metal", mslFd, mslFile);
@@ -77,9 +100,14 @@ compileMSLToMetalLib(MetalTargetPlatform targetPlatform,
     inputStream << mslCode << "\n";
   }
 
-  std::string command =
-      getMetalCompileCommand(targetPlatform, mslFile, libFile);
-  if (failed(runSystemCommand(command))) {
+  std::optional<std::string> command = detail::buildMetalCompileCommand(
+      targetPlatform, languageVersion, mslFile, libFile);
+  if (!command) {
+    llvm::errs() << "Unsupported MSL language version " << languageVersion
+                 << " for offline Metal compilation\n";
+    return nullptr;
+  }
+  if (failed(runSystemCommand(*command))) {
     return nullptr;
   }
 

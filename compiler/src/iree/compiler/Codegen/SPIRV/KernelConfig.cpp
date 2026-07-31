@@ -9,7 +9,10 @@
 #include "iree/compiler/Codegen/Common/GPU/GPUHeuristics.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
+// iree-metal (attn vdist port, M0): reuse LLVMGPU's intrinsic-based attention
+// config.
 #include "iree/compiler/Codegen/Interfaces/PartitionableLoopsInterface.h"
+#include "iree/compiler/Codegen/LLVMGPU/KernelConfig.h"
 #include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "iree/compiler/Codegen/Utils/LinalgOpInfo.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
@@ -958,9 +961,37 @@ setCooperativeMatrixConfig(IREE::GPU::TargetAttr target, linalg::LinalgOp op,
   // full list of sizes instead of just the first element.
   GPUMatmulShapeType problem(dimM, dimN, dimK, lhsElem, rhsElem, initElem);
 
+  auto isAppleSimdgroupMma = [](IREE::GPU::MMAIntrinsic intrinsic) {
+    switch (intrinsic) {
+    case IREE::GPU::MMAIntrinsic::APPLE_SIMDGROUP_F32_8x8x8_F16:
+    case IREE::GPU::MMAIntrinsic::APPLE_SIMDGROUP_F32_16x16x16_F16:
+    case IREE::GPU::MMAIntrinsic::APPLE_SIMDGROUP_F32_8x8x8_BF16:
+    case IREE::GPU::MMAIntrinsic::APPLE_SIMDGROUP_F32_16x16x16_BF16:
+      return true;
+    default:
+      return false;
+    }
+  };
+  // Generated Apple attention targets deliberately contain both inventories.
+  // Keep ordinary matmul on its established intrinsics in that mixed case, but
+  // allow an explicit/custom target containing only first-class Apple
+  // intrinsics to use the inventory it requested.
+  bool hasLegacyMma =
+      llvm::any_of(target.getWgp().getMma(), [&](IREE::GPU::MMAAttr mma) {
+        return !isAppleSimdgroupMma(mma.getIntrinsic());
+      });
+
   SmallVector<GPUIntrinsicType> intrinsics;
   intrinsics.reserve(target.getWgp().getMma().size());
   for (IREE::GPU::MMAAttr mma : target.getWgp().getMma()) {
+    // The Apple attention opt-in advertises both the legacy cooperative-matrix
+    // inventory and first-class simdgroup intrinsics. Ordinary matmul keeps its
+    // established schedule; the distinct attention configurator applies the
+    // inverse filter and selects only these Apple intrinsics.
+    if (target.isApple() && hasLegacyMma &&
+        isAppleSimdgroupMma(mma.getIntrinsic())) {
+      continue;
+    }
     auto [mSize, nSize, kSize] = mma.getMNKShape();
     auto [aType, bType, cType] = mma.getABCElementTypes();
     intrinsics.emplace_back(mSize, nSize, kSize, aType, bType, cType, mma);
@@ -1214,14 +1245,18 @@ setCooperativeMatrixConfig(IREE::GPU::TargetAttr target, linalg::LinalgOp op,
 static LogicalResult setAttentionOpConfig(IREE::GPU::TargetAttr target,
                                           IREE::LinalgExt::AttentionOp op) {
   LLVM_DEBUG(llvm::dbgs() << "trying to deduce config as attention...\n");
-  // iree-metal: the SPIRVVectorDistributeAttention pipeline + this config are DORMANT
-  // scaffolding. Routing attention to it hangs codegen: the decomposed per-tile
-  // matmuls need proper tile configs, and the only machinery that produces them
-  // (LLVMGPU vector-distribute: ConfigureTensorLayouts + PackToIntrinsics + vector
-  // distribution) is deeply LLVMGPU/LLVM-coupled with no SPIR-V/coop equivalent —
-  // a major codegen port, not a wiring job. Until that's built, return failure so
-  // attention ops don't route to the (non-functional) pipeline. Opt in for
-  // development with IREE_METAL_COOP_ATTENTION_WIP.
+  // The Apple vector-distribute prototype is a self-contained opt-in. Reuse
+  // the intrinsic-based schedule configuration, but serialize a distinct
+  // pipeline so lowering no longer depends on this environment variable.
+  if (target.isApple() && getenv("IREE_METAL_ATTN_VDIST")) {
+    return setAttentionIntrinsicBasedVectorDistributionConfig(
+        target, op->getParentOfType<mlir::FunctionOpInterface>(), op,
+        CodeGenPipeline::SPIRVAppleVectorDistributeAttention);
+  }
+
+  // The older generic SPIR-V attention pipeline remains dormant scaffolding.
+  // Its decomposed matmuls require explicit cooperative-tile configuration;
+  // keep it behind its independent development opt-in.
   if (!getenv("IREE_METAL_COOP_ATTENTION_WIP")) {
     return failure();
   }

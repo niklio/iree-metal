@@ -46,6 +46,42 @@ module {
 //  CHECK-SAME:   mma_types = #iree_gpu.mma_layout<WMMAR3_F32_16x16x16_F16>
 
 module {
+  func.func @test_apple_simdgroup_f16_8x8x8_f32() attributes {
+      mma_types = #iree_gpu.mma_layout<APPLE_SIMDGROUP_F32_8x8x8_F16>} {
+    return
+  }
+}
+// CHECK-LABEL: func @test_apple_simdgroup_f16_8x8x8_f32
+//  CHECK-SAME:   mma_types = #iree_gpu.mma_layout<APPLE_SIMDGROUP_F32_8x8x8_F16>
+
+module {
+  func.func @test_apple_simdgroup_bf16_8x8x8_f32() attributes {
+      mma_types = #iree_gpu.mma_layout<APPLE_SIMDGROUP_F32_8x8x8_BF16>} {
+    return
+  }
+}
+// CHECK-LABEL: func @test_apple_simdgroup_bf16_8x8x8_f32
+//  CHECK-SAME:   mma_types = #iree_gpu.mma_layout<APPLE_SIMDGROUP_F32_8x8x8_BF16>
+
+module {
+  func.func @test_apple_simdgroup_f16_16x16x16_f32() attributes {
+      mma_types = #iree_gpu.mma_layout<APPLE_SIMDGROUP_F32_16x16x16_F16>} {
+    return
+  }
+}
+// CHECK-LABEL: func @test_apple_simdgroup_f16_16x16x16_f32
+//  CHECK-SAME:   mma_types = #iree_gpu.mma_layout<APPLE_SIMDGROUP_F32_16x16x16_F16>
+
+module {
+  func.func @test_apple_simdgroup_bf16_16x16x16_f32() attributes {
+      mma_types = #iree_gpu.mma_layout<APPLE_SIMDGROUP_F32_16x16x16_BF16>} {
+    return
+  }
+}
+// CHECK-LABEL: func @test_apple_simdgroup_bf16_16x16x16_f32
+//  CHECK-SAME:   mma_types = #iree_gpu.mma_layout<APPLE_SIMDGROUP_F32_16x16x16_BF16>
+
+module {
   func.func @test_data_tiled_mfma_f32_16x16x4_f32() attributes {
       mma_types = #iree_gpu.data_tiled_mma_layout<intrinsic = MFMA_F32_16x16x4_F32, intrinsics_m = 4, subgroups_m = 2, intrinsics_k = 1, operands_interleaving_intrinsics_k = [0, 1]>} {
     return

@@ -256,6 +256,45 @@ SmallVector<int64_t> getIterationSpaceBounds(linalg::LinalgOp linalgOp) {
   return bounds;
 }
 
+// Preserve an output layout across an immediate pointwise DPS update. This is
+// more than a convenience for layout propagation: canonicalization can replace
+// the pointwise result with a constant and erase the contraction that supplied
+// the original anchor. Anchoring the tied result keeps later reductions and
+// loops distributable in that case.
+static void anchorPointwiseDpsResults(ToLayoutOp anchor,
+                                      RewriterBase &rewriter) {
+  Value anchoredValue = anchor.getResult();
+  VectorLayoutInterface layout = anchor.getLayout();
+  SmallVector<OpResult> resultsToAnchor;
+
+  for (OpOperand &use : anchoredValue.getUses()) {
+    auto genericOp = dyn_cast<linalg::GenericOp>(use.getOwner());
+    if (!genericOp || genericOp.getNumReductionLoops() != 0) {
+      continue;
+    }
+    for (OpResult result : genericOp->getResults()) {
+      OpOperand *initOperand =
+          genericOp.getDpsInitOperand(result.getResultNumber());
+      if (initOperand != &use || result.getType() != anchoredValue.getType()) {
+        continue;
+      }
+      if (genericOp.getMatchingIndexingMap(initOperand) !=
+          genericOp.getIndexingMapMatchingResult(result)) {
+        continue;
+      }
+      resultsToAnchor.push_back(result);
+    }
+  }
+
+  for (OpResult result : resultsToAnchor) {
+    rewriter.setInsertionPointAfter(result.getOwner());
+    auto resultAnchor =
+        ToLayoutOp::create(rewriter, result.getLoc(), result, layout);
+    rewriter.replaceAllUsesExcept(result, resultAnchor.getResult(),
+                                  resultAnchor);
+  }
+}
+
 static LogicalResult
 setContractionAnchor(IREE::Codegen::InnerTileDescAttrInterface intrinsic,
                      SmallVector<bool> promotedOperands, RewriterBase &rewriter,
@@ -309,6 +348,7 @@ setContractionAnchor(IREE::Codegen::InnerTileDescAttrInterface intrinsic,
       ToLayoutOp::create(rewriter, loc, contract->getResult(0), cLayout);
   rewriter.replaceAllUsesExcept(contract->getResult(0), toLayout.getResult(),
                                 toLayout);
+  anchorPointwiseDpsResults(toLayout, rewriter);
 
   return success();
 }

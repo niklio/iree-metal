@@ -1126,7 +1126,43 @@ struct LowerInnerTiledPattern : OpRewritePattern<IREE::Codegen::InnerTiledOp> {
     SmallVector<VectorType> regTypes;
     tiledOp.getKind().getDistributedTileTypes(regTypes);
 
-    for (auto [operand, regType] : llvm::zip_equal(operands, regTypes)) {
+    auto mmaKind = dyn_cast<IREE::GPU::MMAAttr>(tiledOp.getKind());
+    bool isApple16Mma =
+        mmaKind &&
+        (mmaKind.getIntrinsic() ==
+             IREE::GPU::MMAIntrinsic::APPLE_SIMDGROUP_F32_16x16x16_F16 ||
+         mmaKind.getIntrinsic() ==
+             IREE::GPU::MMAIntrinsic::APPLE_SIMDGROUP_F32_16x16x16_BF16);
+    bool hasTransposedRhsPermutation = false;
+    if (std::optional<ArrayAttr> permutations = tiledOp.getPermutations()) {
+      ArrayRef<int64_t> rhsPermutation =
+          cast<DenseI64ArrayAttr>((*permutations)[IREE::GPU::kMMAOperandRhs])
+              .asArrayRef();
+      hasTransposedRhsPermutation = rhsPermutation.size() == 2 &&
+                                    rhsPermutation[0] == 1 &&
+                                    rhsPermutation[1] == 0;
+    }
+
+    for (auto [operandIndex, regType] : llvm::enumerate(regTypes)) {
+      Value &operand = operands[operandIndex];
+      // A packed generic matmul records its transposed physical RHS tile with
+      // permutation [1, 0]. After lane distribution that tile is vector<4x2>;
+      // normalize it to tile-major vector<2x4> before the generic shape cast
+      // erases that distinction. Attention materializes its RHS transpose
+      // before the inner_tiled op and therefore carries no such permutation.
+      // Requiring the explicit permutation makes this fail closed for opaque,
+      // hand-written vector<4x2> operands whose ordering is unknown.
+      auto operandType = dyn_cast<VectorType>(operand.getType());
+      if (isApple16Mma && hasTransposedRhsPermutation &&
+          operandIndex == IREE::GPU::kMMAOperandRhs && operandType &&
+          operandType.getRank() == 2 && operandType.getDimSize(0) == 4 &&
+          operandType.getDimSize(1) == 2) {
+        auto tileMajorType =
+            VectorType::get({2, 4}, operandType.getElementType());
+        operand = vector::TransposeOp::create(
+            rewriter, tiledOp.getLoc(), tileMajorType, operand,
+            rewriter.getDenseI64ArrayAttr({1, 0}));
+      }
       if (operand.getType() != regType) {
         operand = vector::ShapeCastOp::create(rewriter, tiledOp.getLoc(),
                                               regType, operand);
@@ -1152,10 +1188,84 @@ struct LowerInnerTiledPattern : OpRewritePattern<IREE::Codegen::InnerTiledOp> {
     return success();
   }
 };
+
+// Fold the physical-layout round trip at an accumulator edge between two
+// chained Apple MMAs:
+//
+//   canonical --(canonical-to-hardware)--> hardware
+//             --(hardware-to-canonical)--> canonical
+//
+// The terminal marks the source-lane expressions rather than the shuffle ops,
+// which keeps a single provenance marker shared by every fragment element.
+struct FoldAppleMmaShufflePattern : OpRewritePattern<gpu::ShuffleOp> {
+  using Base::Base;
+
+  LogicalResult matchAndRewrite(gpu::ShuffleOp outer,
+                                PatternRewriter &rewriter) const override {
+    if (outer.getMode() != gpu::ShuffleMode::IDX ||
+        !outer.getValid().use_empty()) {
+      return failure();
+    }
+
+    APInt width;
+    if (!matchPattern(outer.getWidth(), m_ConstantInt(&width)) ||
+        width.getSExtValue() != 32) {
+      return failure();
+    }
+
+    auto *dialect =
+        outer.getContext()->getLoadedDialect<IREE::GPU::IREEGPUDialect>();
+    if (!dialect) {
+      return failure();
+    }
+    Operation *outerOffset = outer.getOffset().getDefiningOp();
+    if (!outerOffset ||
+        !dialect->getAppleMmaCanonicalToHardwareAttrHelper().isAttrPresent(
+            outerOffset)) {
+      return failure();
+    }
+
+    // A subgroup shuffle of a lane-uniform constant is the same constant.
+    if (matchPattern(outer.getValue(), m_Constant())) {
+      rewriter.replaceAllUsesWith(outer.getShuffleResult(), outer.getValue());
+      rewriter.eraseOp(outer);
+      return success();
+    }
+
+    // Only accumulator fragments can directly form this pair. Keeping the
+    // type check narrow avoids folding any future packed operand convention.
+    if (!outer.getValue().getType().isF32()) {
+      return failure();
+    }
+    auto inner = outer.getValue().getDefiningOp<gpu::ShuffleOp>();
+    if (!inner || inner.getMode() != gpu::ShuffleMode::IDX ||
+        !inner.getShuffleResult().hasOneUse() ||
+        !inner.getValid().use_empty()) {
+      return failure();
+    }
+    APInt innerWidth;
+    if (!matchPattern(inner.getWidth(), m_ConstantInt(&innerWidth)) ||
+        innerWidth.getSExtValue() != 32) {
+      return failure();
+    }
+    Operation *innerOffset = inner.getOffset().getDefiningOp();
+    if (!innerOffset ||
+        !dialect->getAppleMmaHardwareToCanonicalAttrHelper().isAttrPresent(
+            innerOffset)) {
+      return failure();
+    }
+
+    rewriter.replaceAllUsesWith(outer.getShuffleResult(), inner.getValue());
+    rewriter.eraseOp(outer);
+    rewriter.eraseOp(inner);
+    return success();
+  }
+};
 } // namespace
 
 void populateIREEGPULowerInnerTiledPatterns(RewritePatternSet &patterns) {
-  patterns.add<LowerInnerTiledPattern>(patterns.getContext());
+  patterns.add<LowerInnerTiledPattern, FoldAppleMmaShufflePattern>(
+      patterns.getContext());
 }
 
 //===----------------------------------------------------------------------===//
@@ -1564,7 +1674,8 @@ distributeInnerTiledOp(RewriterBase &rewriter,
   // Step 3. Create the new inner_tiled op.
   auto newTiledOp = IREE::Codegen::InnerTiledOp::create(
       rewriter, loc, inputSlices, initSlices, tiledOp.getIndexingMaps(),
-      tiledOp.getIteratorTypes(), tiledOp.getKind(), distributedSemantics);
+      tiledOp.getIteratorTypes(), tiledOp.getKind(), distributedSemantics,
+      tiledOp.getPermutations());
 
   newTiledOp->setDiscardableAttrs(tiledOp->getDiscardableAttrDictionary());
 
@@ -1634,7 +1745,8 @@ struct DropInnerTiledUnitDimsPattern
         ValueRange{newOperands}.take_front(tiledOp.getNumInputs()),
         ValueRange{newOperands}.drop_front(tiledOp.getNumInputs()),
         rewriter.getAffineMapArrayAttr(emptyMaps), rewriter.getArrayAttr({}),
-        tiledOp.getKind(), tiledOp.getSemantics());
+        tiledOp.getKind(), tiledOp.getSemantics(), tiledOp.getPermutations());
+    newTiledOp->setDiscardableAttrs(tiledOp->getDiscardableAttrDictionary());
 
     SmallVector<Value> newResults(newTiledOp.getResults());
     for (auto [newResult, externalShape] :

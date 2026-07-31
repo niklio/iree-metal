@@ -188,22 +188,27 @@ void addDotProductFeatures(ComputeBitwidths compute, DotProductOps dotProduct,
   }
 }
 
-void addMatrixFeatures(IREE::GPU::MMAOpsArrayAttr mmaOps,
+void addMatrixFeatures(IREE::GPU::TargetAttr target,
+                       IREE::GPU::MMAOpsArrayAttr mmaOps,
                        SetVector<Capability> &caps, SetVector<Extension> &exts,
                        SetVector<Attribute> &coopMatAttrs) {
   if (!mmaOps.empty()) {
     caps.insert(Capability::CooperativeMatrixKHR);
     exts.insert(Extension::SPV_KHR_cooperative_matrix);
-    // If any MMA op uses bf16, advertise the bf16 type + bf16-coop capabilities.
-    // (iree-metal trains in bf16; Metal has simdgroup_matrix<bfloat,8,8>.)
-    for (IREE::GPU::MMAAttr mma : mmaOps) {
-      auto [aType, bType, cType] = mma.getABCElementTypes();
-      if (isa<BFloat16Type>(aType) || isa<BFloat16Type>(bType) ||
-          isa<BFloat16Type>(cType)) {
-        caps.insert(Capability::BFloat16TypeKHR);
-        caps.insert(Capability::BFloat16CooperativeMatrixKHR);
-        exts.insert(Extension::SPV_KHR_bfloat16);
-        break;
+    // Metal 3.1 exposes native bfloat simdgroup matrices. Keep this relaxation
+    // Apple-specific: Vulkan targets still need their bf16 MMA entries filtered
+    // unless the API-level cooperative-matrix support is represented
+    // explicitly.
+    if (target.isApple()) {
+      for (IREE::GPU::MMAAttr mma : mmaOps) {
+        auto [aType, bType, cType] = mma.getABCElementTypes();
+        if (isa<BFloat16Type>(aType) || isa<BFloat16Type>(bType) ||
+            isa<BFloat16Type>(cType)) {
+          caps.insert(Capability::BFloat16TypeKHR);
+          caps.insert(Capability::BFloat16CooperativeMatrixKHR);
+          exts.insert(Extension::SPV_KHR_bfloat16);
+          break;
+        }
       }
     }
   }
@@ -214,18 +219,22 @@ spirv::ResourceLimitsAttr convertLimits(IREE::GPU::TargetAttr target) {
   IREE::GPU::TargetWgpAttr wgp = target.getWgp();
   Builder b(context);
 
-  SmallVector<Attribute, 4> coopMatAttrs;
+  SetVector<Attribute> coopMatAttrs;
   for (IREE::GPU::MMAAttr mmaOp : wgp.getMma()) {
     auto [mSize, nSize, kSize] = mmaOp.getMNKShape();
     auto [aType, bType, cType] = mmaOp.getABCElementTypes();
 
     // Filter out types not supported by VK_KHR_cooperative_matrix. See
     // https://registry.khronos.org/vulkan/specs/latest/man/html/VkComponentTypeKHR.html.
-    // NOTE(iree-metal): we don't target Vulkan — the SPIR-V is consumed by spirv-cross and
-    // lowered to MSL, and Metal has simdgroup_matrix<bfloat,8,8>. So bf16 IS supported on
-    // this path; keep the <16-bit (f8) filter but allow bf16 through.
+    // The Metal path is consumed by SPIRV-Cross rather than Vulkan and supports
+    // native bfloat simdgroup matrices. Other targets retain the Vulkan bf16
+    // filter; all targets continue to reject float element types below 16 bits.
     bool isSupportedByCoopMatrix = true;
     for (Type elemType : {aType, bType, cType}) {
+      if (isa<BFloat16Type>(elemType) && !target.isApple()) {
+        isSupportedByCoopMatrix = false;
+        break;
+      }
       if (auto floatType = dyn_cast<FloatType>(elemType)) {
         if (floatType.getWidth() < 16) {
           isSupportedByCoopMatrix = false;
@@ -237,7 +246,7 @@ spirv::ResourceLimitsAttr convertLimits(IREE::GPU::TargetAttr target) {
       continue;
     }
 
-    coopMatAttrs.push_back(spirv::CooperativeMatrixPropertiesKHRAttr::get(
+    coopMatAttrs.insert(spirv::CooperativeMatrixPropertiesKHRAttr::get(
         context, mSize, nSize, kSize, aType, bType, cType, cType,
         false /*saturatingAccumulation*/,
         spirv::ScopeAttr::get(context, spirv::Scope::Subgroup)));
@@ -250,8 +259,8 @@ spirv::ResourceLimitsAttr convertLimits(IREE::GPU::TargetAttr target) {
       wgp.getMaxThreadCountPerWorkgroup(),
       b.getI32ArrayAttr(wgp.getMaxWorkgroupSizes().asArrayRef()),
       preferredSubgroupSize, target.getMinSubgroupSize(),
-      target.getMaxSubgroupSize(), ArrayAttr::get(context, coopMatAttrs),
-      ArrayAttr{});
+      target.getMaxSubgroupSize(),
+      ArrayAttr::get(context, coopMatAttrs.getArrayRef()), ArrayAttr{});
 }
 
 //===----------------------------------------------------------------------===//
@@ -284,7 +293,7 @@ convertGPUTarget(MLIRContext *context, IREE::HAL::ExecutableVariantOp variant) {
   addStorageFeatures(wgp.getStorage().getValue(), caps, exts);
   addSubgroupFeatures(wgp.getSubgroup().getValue(), caps, exts);
   addDotProductFeatures(compute, wgp.getDot().getValue(), caps, exts);
-  addMatrixFeatures(wgp.getMma(), caps, exts, coopMatAttrs);
+  addMatrixFeatures(gpuTarget, wgp.getMma(), caps, exts, coopMatAttrs);
 
   auto triple = spirv::VerCapExtAttr::get(
       *version, caps.getArrayRef(), exts.getArrayRef(), variant.getContext());

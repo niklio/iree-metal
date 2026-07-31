@@ -7,6 +7,7 @@
 #include "iree/compiler/Codegen/Common/PassUtils.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenDialect.h"
+#include "iree/compiler/Codegen/Dialect/VectorExt/IR/VectorExtDialect.h"
 #include "iree/compiler/Codegen/SPIRV/KernelConfig.h"
 #include "iree/compiler/Codegen/SPIRV/Passes.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
@@ -53,6 +54,7 @@ public:
         .insert<IREE::Codegen::IREECodegenDialect, affine::AffineDialect,
                 gpu::GPUDialect, IREE::HAL::HALDialect, linalg::LinalgDialect,
                 IREE::LinalgExt::IREELinalgExtDialect, memref::MemRefDialect,
+                IREE::VectorExt::IREEVectorExtDialect,
                 bufferization::BufferizationDialect, scf::SCFDialect,
                 spirv::SPIRVDialect, transform::TransformDialect,
                 vector::VectorDialect>();
@@ -135,6 +137,9 @@ void SPIRVLowerExecutableTargetPass::runOnOperation() {
       break;
     case CodeGenPipeline::SPIRVVectorDistributeAttention:
       addSPIRVVectorDistributeAttentionPassPipeline(pipeline);
+      break;
+    case CodeGenPipeline::SPIRVAppleVectorDistributeAttention:
+      addSPIRVAppleVectorDistributeAttentionPassPipeline(pipeline);
       break;
     // No pipeline specified, nothing to do.
     case CodeGenPipeline::None:

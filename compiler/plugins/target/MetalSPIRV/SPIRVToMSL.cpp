@@ -94,6 +94,17 @@ public:
     return !hasUnknownCase;
   }
 
+  bool requiresMSL31() {
+    bool required = false;
+    ir.for_each_typed_id<SPIRV_CROSS_NAMESPACE::SPIRType>(
+        [&](uint32_t, SPIRV_CROSS_NAMESPACE::SPIRType &type) {
+          required |=
+              type.op == spv::OpTypeCooperativeMatrixKHR ||
+              type.basetype == SPIRV_CROSS_NAMESPACE::SPIRType::BFloat16;
+        });
+    return required;
+  }
+
   Options getCompilationOptions(IREE::HAL::MetalTargetPlatform platform) {
     // TODO(antiagainst): fill out the following according to the Metal GPU
     // family.
@@ -107,14 +118,21 @@ public:
       spvCrossOptions.platform = SPIRVToMSLCompiler::Options::Platform::iOS;
       break;
     }
-    // iree-metal: Metal 4 cooperative-tensor (matmul2d) emission requires MSL 4.0.
-    // Env-gated so the shipped path stays on MSL 3.0 (inert by default); set
-    // IREE_METAL_MSL4 to emit MSL 4.0 for the matmul2d microkernel port. MSL 4.0 is
-    // a strict superset, so the existing coop-matrix simdgroup path is unaffected.
-    spvCrossOptions.msl_version =
-        (std::getenv("IREE_METAL_MSL4") || std::getenv("IREE_METAL_MSL4_MATMUL2D"))
-            ? SPIRVToMSLCompiler::Options::make_msl_version(4, 0)
-            : SPIRVToMSLCompiler::Options::make_msl_version(3, 0);
+    // Apple cooperative matrices and native bfloat types require MSL 3.1.
+    // Derive that floor from the serialized SPIR-V rather than an ambient
+    // feature flag so cross-compilation is reproducible in a fresh process.
+    // Metal 4 tensor emission remains an independent development opt-in.
+    if (std::getenv("IREE_METAL_MSL4") ||
+        std::getenv("IREE_METAL_MSL4_MATMUL2D")) {
+      spvCrossOptions.msl_version =
+          SPIRVToMSLCompiler::Options::make_msl_version(4, 0);
+    } else if (requiresMSL31()) {
+      spvCrossOptions.msl_version =
+          SPIRVToMSLCompiler::Options::make_msl_version(3, 1);
+    } else {
+      spvCrossOptions.msl_version =
+          SPIRVToMSLCompiler::Options::make_msl_version(3, 0);
+    }
     // Enable using Metal argument buffers. It is more akin to Vulkan descriptor
     // sets, which is how IREE HAL models resource bindings and mappings.
     spvCrossOptions.argument_buffers = true;
@@ -335,6 +353,12 @@ crossCompileSPIRVToMSL(IREE::HAL::MetalTargetPlatform targetPlatform,
 
   auto spvCrossOptions = spvCrossCompiler.getCompilationOptions(targetPlatform);
   spvCrossCompiler.set_msl_options(spvCrossOptions);
+  uint32_t languageVersion = 196608u; // MTLLanguageVersion3_0
+  if (spvCrossOptions.supports_msl_version(4, 0)) {
+    languageVersion = 262144u; // MTLLanguageVersion4_0
+  } else if (spvCrossOptions.supports_msl_version(3, 1)) {
+    languageVersion = 196609u; // MTLLanguageVersion3_1
+  }
 
   std::string mslSource = spvCrossCompiler.compile();
   // Get the revised entry point name. Cross compiling to MSL generates source
@@ -365,8 +389,9 @@ crossCompileSPIRVToMSL(IREE::HAL::MetalTargetPlatform targetPlatform,
   if (!workgroupSize.x || !workgroupSize.y || !workgroupSize.z) {
     return std::nullopt;
   }
-  return std::make_pair(MetalShader{std::move(mslSource), workgroupSize},
-                        spirvEntryPoint.name);
+  return std::make_pair(
+      MetalShader{std::move(mslSource), workgroupSize, languageVersion},
+      spirvEntryPoint.name);
 }
 
 } // namespace mlir::iree_compiler

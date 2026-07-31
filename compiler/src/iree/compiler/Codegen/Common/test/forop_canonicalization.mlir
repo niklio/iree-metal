@@ -1,4 +1,5 @@
 // RUN: iree-opt %s --split-input-file --pass-pipeline="builtin.module(func.func(iree-codegen-canonicalize-scf-for),canonicalize)" | FileCheck %s
+// RUN: iree-opt %s --split-input-file --pass-pipeline="builtin.module(func.func(iree-codegen-canonicalize-scf-for{explode-large-vectors=true}))" | FileCheck %s --check-prefix=EXPLODE
 
 func.func @loop_carried_vector_shape_cast(%arg0: vector<4xf32>, %arg1: vector<4xf32>) -> (vector<4xf32>, vector<4xf32>) {
   %c0 = arith.constant 0 : index
@@ -300,3 +301,21 @@ func.func @multiple_users() -> vector<1x1x1x4xf32> {
 //  CHECK-NEXT:     }
 //       CHECK:     %[[SHAPE_CAST_1:.+]] = vector.shape_cast %[[FOR]] : vector<4xf32> to vector<1x1x1x4xf32>
 //       CHECK:     return %[[SHAPE_CAST_1]] : vector<1x1x1x4xf32>
+
+// -----
+
+func.func @explode_preserves_loop_attrs(
+    %lb: i32, %ub: i32, %step: i32, %init: vector<8xf32>)
+    -> vector<8xf32> {
+  %result = scf.for unsigned %iv = %lb to %ub step %step
+      iter_args(%iter = %init) -> (vector<8xf32>) : i32 {
+    %next = arith.addf %iter, %iter : vector<8xf32>
+    scf.yield %next : vector<8xf32>
+  } {iree.test_marker = "preserved"}
+  return %result : vector<8xf32>
+}
+
+// EXPLODE-LABEL: func.func @explode_preserves_loop_attrs
+// EXPLODE:         scf.for unsigned
+// EXPLODE-SAME:      -> (f32, f32, f32, f32, f32, f32, f32, f32) : i32 {
+// EXPLODE:         } {iree.test_marker = "preserved"}

@@ -83,6 +83,41 @@ module attributes { transform.with_named_sequence } {
 
 // -----
 
+#one_outer_dim_accesses = [
+ affine_map<(i) -> (i)>,
+ affine_map<(i) -> (i)>,
+ affine_map<(i) -> (i)>
+]
+func.func @drop_apple16_unit_dim_preserves_rhs_permutation(
+    %lhs: vector<1x2x4xf16>, %rhs: vector<1x4x2xf16>,
+    %acc: vector<1x2x4xf32>) -> vector<1x2x4xf32> {
+  %0 = iree_codegen.inner_tiled ins(%lhs, %rhs) outs(%acc) {
+    indexing_maps = #one_outer_dim_accesses,
+    iterator_types = [#linalg.iterator_type<parallel>],
+    kind = #iree_gpu.mma_layout<APPLE_SIMDGROUP_F32_16x16x16_F16>,
+    permutations = [array<i64: 0, 1>, array<i64: 1, 0>, array<i64: 0, 1>],
+    semantics = #iree_gpu.mma_semantics<distributed = true, opaque = true>
+  } : vector<1x2x4xf16>, vector<1x4x2xf16> into vector<1x2x4xf32>
+  return %0 : vector<1x2x4xf32>
+}
+
+module attributes { transform.with_named_sequence } {
+  transform.named_sequence @__transform_main(%root: !transform.any_op {transform.readonly}) {
+    %func = transform.structured.match ops{["func.func"]} in %root : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %func {
+      transform.apply_patterns.iree.drop_inner_tiled_unit_dims
+    } : !transform.any_op
+    transform.yield
+  }
+}
+
+// CHECK-LABEL: func @drop_apple16_unit_dim_preserves_rhs_permutation
+//       CHECK:   %[[MMA:.+]] = iree_codegen.inner_tiled
+//  CHECK-SAME:     permutations = [array<i64: 0, 1>, array<i64: 1, 0>, array<i64: 0, 1>]
+//  CHECK-SAME:     : vector<2x4xf16>, vector<4x2xf16> into vector<2x4xf32>
+
+// -----
+
 #contraction_accesses = [
  affine_map<(i, j, k, b) -> (i, k, b)>,
  affine_map<(i, j, k, b) -> (k, b, j)>,

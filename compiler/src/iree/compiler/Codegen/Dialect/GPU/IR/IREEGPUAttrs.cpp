@@ -31,6 +31,7 @@
 #include "mlir/Dialect/NVGPU/IR/NVGPUDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/Dialect/Utils/IndexingUtils.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
@@ -87,6 +88,10 @@ static bool isNvWmma(MMAIntrinsic intrinsic) {
   return getArchID(intrinsic) == 0x2100;
 }
 
+static bool isAppleSimdgroupMma(MMAIntrinsic intrinsic) {
+  return getArchID(intrinsic) == 0x3000;
+}
+
 int64_t getIntrinsicSubgroupSize(ScaledMMAIntrinsic intrinsic) {
   switch (intrinsic) {
   case ScaledMMAIntrinsic::MFMA_SCALE_F32_16x16x128_B32:
@@ -131,6 +136,8 @@ static std::tuple<Type, Type, Type> getABCElementTypes(MLIRContext *context,
   case MMAIntrinsic::NV_MMA_SYNC_F32_16x8x16_F16:
   case MMAIntrinsic::NV_WMMA_F32_16x16x16_F16:
   case MMAIntrinsic::WMMA_F32_16x16x32_F16:
+  case MMAIntrinsic::APPLE_SIMDGROUP_F32_8x8x8_F16:
+  case MMAIntrinsic::APPLE_SIMDGROUP_F32_16x16x16_F16:
     return {f16, f16, f32};
   case MMAIntrinsic::WMMAR3_F16_16x16x16_F16:
   case MMAIntrinsic::WMMAR4_F16_16x16x16_F16:
@@ -147,6 +154,8 @@ static std::tuple<Type, Type, Type> getABCElementTypes(MLIRContext *context,
   case MMAIntrinsic::WMMAR3_F32_16x16x16_BF16:
   case MMAIntrinsic::WMMAR4_F32_16x16x16_BF16:
   case MMAIntrinsic::WMMA_F32_16x16x32_BF16:
+  case MMAIntrinsic::APPLE_SIMDGROUP_F32_8x8x8_BF16:
+  case MMAIntrinsic::APPLE_SIMDGROUP_F32_16x16x16_BF16:
     return {bf16, bf16, f32};
   case MMAIntrinsic::WMMAR3_BF16_16x16x16_BF16:
   case MMAIntrinsic::WMMAR4_BF16_16x16x16_BF16:
@@ -542,6 +551,34 @@ MMASingleSubgroupLayout getSingleSubgroupLayout(MMAIntrinsic intrinsic,
     default:
       return {};
     }
+  case MMAIntrinsic::APPLE_SIMDGROUP_F32_8x8x8_F16:
+  case MMAIntrinsic::APPLE_SIMDGROUP_F32_8x8x8_BF16:
+    switch (operandIndex) {
+    case kMMAOperandLhs:
+    case kMMAOperandRhs:
+    case kMMAOperandAcc:
+      // Canonical logical layout: lane (r * 4 + c) owns the two horizontally
+      // adjacent elements (r, 2 * c) and (r, 2 * c + 1).
+      // The terminal below permutes these canonical lanes to the physical
+      // Apple simdgroup_matrix_storage layout.
+      return {/*outer=*/{1, 1}, /*thread=*/{8, 4},
+              /*tstrides=*/{4, 1}, /*element=*/{1, 2}};
+    default:
+      return {};
+    }
+  case MMAIntrinsic::APPLE_SIMDGROUP_F32_16x16x16_F16:
+  case MMAIntrinsic::APPLE_SIMDGROUP_F32_16x16x16_BF16:
+    switch (operandIndex) {
+    case kMMAOperandLhs:
+    case kMMAOperandRhs:
+    case kMMAOperandAcc:
+      // Four logical 8x8 tiles, each retaining the canonical two adjacent
+      // elements per lane used by the native Apple terminal.
+      return {/*outer=*/{2, 2}, /*thread=*/{8, 4},
+              /*tstrides=*/{4, 1}, /*element=*/{1, 2}};
+    default:
+      return {};
+    }
   case MMAIntrinsic::NV_WMMA_F32_16x16x16_F16:
   case MMAIntrinsic::NV_WMMA_F16_16x16x16_F16:
     return {};
@@ -771,6 +808,111 @@ SmallVector<VirtualMMAIntrinsic> MMAAttr::getVirtualIntrinsics() const {
   }
 }
 
+enum class AppleMmaShuffleDirection {
+  CanonicalToHardware,
+  HardwareToCanonical,
+};
+
+// Returns the source lane for the permutation between IREE's canonical 8x8
+// logical layout and Apple's simdgroup_matrix_storage lane layout.
+static Value getAppleMmaShuffleSourceLane(OpBuilder &builder, Location loc,
+                                          AppleMmaShuffleDirection direction) {
+  Value lane = gpu::LaneIdOp::create(builder, loc,
+                                     /*upper_bound=*/builder.getIndexAttr(32));
+  lane = arith::IndexCastOp::create(builder, loc, builder.getI32Type(), lane);
+  auto c32 = [&](int32_t value) -> Value {
+    return arith::ConstantIntOp::create(builder, loc, value, 32);
+  };
+
+  Value unchanged = arith::AndIOp::create(builder, loc, lane, c32(0x11));
+  Value shiftedRight;
+  Value shiftedLeft;
+  if (direction == AppleMmaShuffleDirection::CanonicalToHardware) {
+    // At Apple destination lane a, fetch canonical source lane:
+    //   s = (a & 0x11) | ((a & 0x8) >> 2) | ((a & 0x6) << 1).
+    shiftedRight = arith::ShRUIOp::create(
+        builder, loc, arith::AndIOp::create(builder, loc, lane, c32(0x8)),
+        c32(2));
+    shiftedLeft = arith::ShLIOp::create(
+        builder, loc, arith::AndIOp::create(builder, loc, lane, c32(0x6)),
+        c32(1));
+  } else {
+    // At canonical destination lane s, fetch Apple source lane:
+    //   a = (s & 0x11) | ((s & 0xC) >> 1) | ((s & 0x2) << 2).
+    shiftedRight = arith::ShRUIOp::create(
+        builder, loc, arith::AndIOp::create(builder, loc, lane, c32(0xC)),
+        c32(1));
+    shiftedLeft = arith::ShLIOp::create(
+        builder, loc, arith::AndIOp::create(builder, loc, lane, c32(0x2)),
+        c32(2));
+  }
+  Value partiallyPermuted =
+      arith::OrIOp::create(builder, loc, unchanged, shiftedRight);
+  Value sourceLane =
+      arith::OrIOp::create(builder, loc, partiallyPermuted, shiftedLeft);
+
+  // Preserve which direction this source-lane expression implements. Chained
+  // Apple MMAs otherwise materialize an immediately inverse pair of subgroup
+  // shuffles at every accumulator edge.
+  auto *dialect =
+      builder.getContext()->getLoadedDialect<IREE::GPU::IREEGPUDialect>();
+  assert(dialect && "expected the IREE GPU dialect to be loaded");
+  UnitAttr marker = builder.getUnitAttr();
+  if (direction == AppleMmaShuffleDirection::CanonicalToHardware) {
+    dialect->getAppleMmaCanonicalToHardwareAttrHelper().setAttr(
+        sourceLane.getDefiningOp(), marker);
+  } else {
+    dialect->getAppleMmaHardwareToCanonicalAttrHelper().setAttr(
+        sourceLane.getDefiningOp(), marker);
+  }
+  return sourceLane;
+}
+
+static Value shuffleAppleMmaFragment(OpBuilder &builder, Location loc,
+                                     Value fragment, Value sourceLane) {
+  auto fragmentType = cast<VectorType>(fragment.getType());
+  int64_t fragmentElements = fragmentType.getNumElements();
+  assert(fragmentType.getRank() == 1 && fragmentElements % 2 == 0 &&
+         "Apple MMA fragments must contain pairs of lane-local elements");
+
+  Value subgroupSize = arith::ConstantIntOp::create(builder, loc, 32, 32);
+  Type elementType = fragmentType.getElementType();
+  if (elementType.isF16() || elementType.isBF16()) {
+    // Shuffle each native 8x8 tile's two 16-bit values together so the
+    // hardware observes the original lane-local pair.
+    Value shuffled = ub::PoisonOp::create(builder, loc, fragmentType);
+    VectorType pairType = VectorType::get({2}, elementType);
+    VectorType packedType = VectorType::get({1}, builder.getI32Type());
+    for (int64_t i = 0; i < fragmentElements; i += 2) {
+      Value pair = vector::ExtractStridedSliceOp::create(
+          builder, loc, fragment, /*offset=*/i, /*size=*/2, /*stride=*/1);
+      Value packed = vector::BitCastOp::create(builder, loc, packedType, pair);
+      packed = vector::ExtractOp::create(builder, loc, packed, 0);
+      packed = gpu::ShuffleOp::create(builder, loc, packed, sourceLane,
+                                      subgroupSize, gpu::ShuffleMode::IDX)
+                   .getShuffleResult();
+      Value packedVector =
+          vector::BroadcastOp::create(builder, loc, packedType, packed);
+      pair = vector::BitCastOp::create(builder, loc, pairType, packedVector);
+      shuffled = vector::InsertStridedSliceOp::create(
+          builder, loc, pair, shuffled, /*offset=*/i, /*stride=*/1);
+    }
+    return shuffled;
+  }
+
+  assert(elementType.isF32() &&
+         "Apple MMA accumulator fragments must contain f32 elements");
+  Value shuffled = ub::PoisonOp::create(builder, loc, fragmentType);
+  for (int64_t i = 0; i < fragmentElements; ++i) {
+    Value scalar = vector::ExtractOp::create(builder, loc, fragment, i);
+    scalar = gpu::ShuffleOp::create(builder, loc, scalar, sourceLane,
+                                    subgroupSize, gpu::ShuffleMode::IDX)
+                 .getShuffleResult();
+    shuffled = vector::InsertOp::create(builder, loc, scalar, shuffled, i);
+  }
+  return shuffled;
+}
+
 static Value createMmaOp(OpBuilder &builder, Location loc,
                          MMAIntrinsic intrinsic, Type resultType, Value lhs,
                          Value rhs, Value acc, bool colMajor = false) {
@@ -819,6 +961,74 @@ static Value createMmaOp(OpBuilder &builder, Location loc,
 
     return nvgpu::MmaSyncOp::create(builder, loc, lhs, rhs, acc, mmShapeAttr)
         .getResult();
+  }
+  if (isAppleSimdgroupMma(intrinsic)) {
+    // Apple's physical accumulator layout is fixed; the column-major variant
+    // would require a distinct terminal permutation.
+    if (colMajor) {
+      return {};
+    }
+
+    // The thread-local insert/extract indices below are part of the
+    // SPIR-V-to-MSL ABI. Fail closed before creating any operations unless all
+    // fragments have exactly the type and element count prescribed by this
+    // intrinsic. This prevents malformed IR from turning into out-of-bounds
+    // simdgroup_matrix_storage indexing in the terminal backend.
+    VectorType expectedLhsType =
+        getThreadVectorType(builder.getContext(), intrinsic, kMMAOperandLhs);
+    VectorType expectedRhsType =
+        getThreadVectorType(builder.getContext(), intrinsic, kMMAOperandRhs);
+    VectorType expectedAccType =
+        getThreadVectorType(builder.getContext(), intrinsic, kMMAOperandAcc);
+    if (lhs.getType() != expectedLhsType || rhs.getType() != expectedRhsType ||
+        acc.getType() != expectedAccType || resultType != expectedAccType) {
+      return {};
+    }
+
+    Value hardwareSourceLane = getAppleMmaShuffleSourceLane(
+        builder, loc, AppleMmaShuffleDirection::CanonicalToHardware);
+    lhs = shuffleAppleMmaFragment(builder, loc, lhs, hardwareSourceLane);
+    rhs = shuffleAppleMmaFragment(builder, loc, rhs, hardwareSourceLane);
+    acc = shuffleAppleMmaFragment(builder, loc, acc, hardwareSourceLane);
+
+    auto packFragment = [&](Value fragment, ArrayRef<int64_t> matrixShape,
+                            StringRef operand) -> Value {
+      auto fragmentType = cast<VectorType>(fragment.getType());
+      Type elementType = fragmentType.getElementType();
+      auto matrixType =
+          gpu::MMAMatrixType::get(matrixShape, elementType, operand);
+      Value zero = arith::ConstantOp::create(builder, loc, elementType,
+                                             builder.getZeroAttr(elementType));
+      Value matrix = gpu::SubgroupMmaConstantMatrixOp::create(builder, loc,
+                                                              matrixType, zero);
+      for (int64_t i = 0, e = fragmentType.getNumElements(); i < e; ++i) {
+        Value scalar = vector::ExtractOp::create(builder, loc, fragment, i);
+        Value index = arith::ConstantIndexOp::create(builder, loc, i);
+        matrix = gpu::SubgroupMmaInsertThreadLocalOp::create(
+            builder, loc, matrixType, scalar, matrix, ValueRange{index});
+      }
+      return matrix;
+    };
+
+    Value matrixA = packFragment(lhs, {layout.mSize, layout.kSize}, "AOp");
+    Value matrixB = packFragment(rhs, {layout.kSize, layout.nSize}, "BOp");
+    Value matrixC = packFragment(acc, {layout.mSize, layout.nSize}, "COp");
+    Value matrixD = gpu::SubgroupMmaComputeOp::create(
+        builder, loc, matrixC.getType(), matrixA, matrixB, matrixC,
+        /*a_transpose=*/UnitAttr(), /*b_transpose=*/UnitAttr());
+
+    auto resultFragmentType = cast<VectorType>(resultType);
+    Value result = ub::PoisonOp::create(builder, loc, resultFragmentType);
+    for (int64_t i = 0, e = resultFragmentType.getNumElements(); i < e; ++i) {
+      Value index = arith::ConstantIndexOp::create(builder, loc, i);
+      Value scalar = gpu::SubgroupMmaExtractThreadLocalOp::create(
+          builder, loc, resultFragmentType.getElementType(), matrixD,
+          ValueRange{index});
+      result = vector::InsertOp::create(builder, loc, scalar, result, i);
+    }
+    Value canonicalSourceLane = getAppleMmaShuffleSourceLane(
+        builder, loc, AppleMmaShuffleDirection::HardwareToCanonical);
+    return shuffleAppleMmaFragment(builder, loc, result, canonicalSourceLane);
   }
   return {};
 }

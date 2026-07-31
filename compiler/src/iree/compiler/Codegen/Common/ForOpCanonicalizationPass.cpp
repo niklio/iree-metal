@@ -308,8 +308,156 @@ struct PackForOpInductionVarVector final : OpRewritePattern<scf::ForOp> {
   }
 };
 
+/// Explodes SPIR-V-illegal vector loop-carried values into scalar iter args.
+///
+/// Vector distribution intentionally keeps the per-lane online-softmax state
+/// as vector values. LLVM targets can represent those values as aggregates,
+/// but SPIR-V's native vectors are restricted to rank one and at most four
+/// elements. By the time this pattern runs, vector lowering has already
+/// scalarized the computation around the loop-carried values, so retaining an
+/// oversized vector merely as an scf.for container is unnecessary.
+///
+/// For example:
+///
+///   %r = scf.for ... iter_args(%v = %init) -> vector<8xf32> {
+///     ...
+///     scf.yield %next : vector<8xf32>
+///   }
+///
+/// becomes a loop with eight scalar iter args. Reconstructing the old vector
+/// at the loop boundary lets normal vector.extract/from_elements folding
+/// remove the temporary wrappers without teaching every vector user about the
+/// structural conversion.
+struct ExplodeLargeVectorForOpIterArgs final : OpRewritePattern<scf::ForOp> {
+  using Base::Base;
+
+  static bool needsExplosion(Type type) {
+    auto vectorType = dyn_cast<VectorType>(type);
+    if (!vectorType || vectorType.isScalable()) {
+      return false;
+    }
+    // This is a structural cleanup for the small per-lane online-softmax
+    // state, not a general scalarization strategy. Refuse unexpectedly large
+    // aggregates so a bad schedule fails legalization instead of multiplying
+    // every loop argument and exploding compile time.
+    constexpr int64_t kMaxExplodedElements = 64;
+    if (vectorType.getNumElements() > kMaxExplodedElements) {
+      return false;
+    }
+    return vectorType.getRank() != 1 || vectorType.getNumElements() > 4;
+  }
+
+  static SmallVector<int64_t> getPosition(VectorType type,
+                                          int64_t linearIndex) {
+    SmallVector<int64_t> position(type.getRank());
+    for (int64_t dim = type.getRank() - 1; dim >= 0; --dim) {
+      position[dim] = linearIndex % type.getDimSize(dim);
+      linearIndex /= type.getDimSize(dim);
+    }
+    return position;
+  }
+
+  static SmallVector<Value> extractElements(PatternRewriter &rewriter,
+                                            Value vector) {
+    auto vectorType = cast<VectorType>(vector.getType());
+    SmallVector<Value> elements;
+    elements.reserve(vectorType.getNumElements());
+    for (int64_t i = 0; i < vectorType.getNumElements(); ++i) {
+      elements.push_back(vector::ExtractOp::create(
+          rewriter, vector.getLoc(), vector, getPosition(vectorType, i)));
+    }
+    return elements;
+  }
+
+  LogicalResult matchAndRewrite(scf::ForOp forOp,
+                                PatternRewriter &rewriter) const override {
+    if (llvm::none_of(forOp.getRegionIterArgs(), [](BlockArgument arg) {
+          return needsExplosion(arg.getType());
+        })) {
+      return failure();
+    }
+
+    SmallVector<Value> newInitArgs;
+    for (Value init : forOp.getInitArgs()) {
+      if (!needsExplosion(init.getType())) {
+        newInitArgs.push_back(init);
+        continue;
+      }
+      llvm::append_range(newInitArgs, extractElements(rewriter, init));
+    }
+
+    auto newForOp =
+        scf::ForOp::create(rewriter, forOp.getLoc(), forOp.getLowerBound(),
+                           forOp.getUpperBound(), forOp.getStep(), newInitArgs,
+                           /*bodyBuilder=*/nullptr, forOp.getUnsignedCmp());
+    // Preserve loop annotations and any other attributes carried by the
+    // original operation. In particular, dropping `unsignedCmp` changes the
+    // trip count for integer induction variables whose high bit is set.
+    newForOp->setAttrs(forOp->getAttrs());
+    Block *oldBody = forOp.getBody();
+    Block *newBody = newForOp.getBody();
+
+    IRMapping mapping;
+    mapping.map(oldBody->getArgument(0), newBody->getArgument(0));
+    unsigned newArgIndex = 1;
+    rewriter.setInsertionPointToStart(newBody);
+    for (BlockArgument oldArg : forOp.getRegionIterArgs()) {
+      if (!needsExplosion(oldArg.getType())) {
+        mapping.map(oldArg, newBody->getArgument(newArgIndex++));
+        continue;
+      }
+      auto vectorType = cast<VectorType>(oldArg.getType());
+      ValueRange scalarArgs = newBody->getArguments().slice(
+          newArgIndex, vectorType.getNumElements());
+      mapping.map(oldArg,
+                  vector::FromElementsOp::create(rewriter, oldArg.getLoc(),
+                                                 vectorType, scalarArgs));
+      newArgIndex += vectorType.getNumElements();
+    }
+
+    for (Operation &op : oldBody->without_terminator()) {
+      rewriter.clone(op, mapping);
+    }
+
+    auto oldYield = cast<scf::YieldOp>(oldBody->getTerminator());
+    SmallVector<Value> newYieldValues;
+    rewriter.setInsertionPointToEnd(newBody);
+    for (Value oldYieldValue : oldYield.getOperands()) {
+      Value mappedValue = mapping.lookupOrDefault(oldYieldValue);
+      if (!needsExplosion(mappedValue.getType())) {
+        newYieldValues.push_back(mappedValue);
+        continue;
+      }
+      llvm::append_range(newYieldValues,
+                         extractElements(rewriter, mappedValue));
+    }
+    scf::YieldOp::create(rewriter, forOp.getLoc(), newYieldValues);
+
+    SmallVector<Value> replacements;
+    unsigned newResultIndex = 0;
+    rewriter.setInsertionPointAfter(newForOp);
+    for (Value oldResult : forOp.getResults()) {
+      if (!needsExplosion(oldResult.getType())) {
+        replacements.push_back(newForOp.getResult(newResultIndex++));
+        continue;
+      }
+      auto vectorType = cast<VectorType>(oldResult.getType());
+      ValueRange scalarResults = newForOp.getResults().slice(
+          newResultIndex, vectorType.getNumElements());
+      replacements.push_back(vector::FromElementsOp::create(
+          rewriter, oldResult.getLoc(), vectorType, scalarResults));
+      newResultIndex += vectorType.getNumElements();
+    }
+
+    rewriter.replaceOp(forOp, replacements);
+    return success();
+  }
+};
+
 struct ForOpCanonicalizationPass final
     : impl::ForOpCanonicalizationPassBase<ForOpCanonicalizationPass> {
+  using Base::Base;
+
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<scf::SCFDialect, vector::VectorDialect>();
   }
@@ -326,6 +474,12 @@ struct ForOpCanonicalizationPass final
     }
     RewritePatternSet packPatterns(&getContext());
     packPatterns.add<PackForOpInductionVarVector>(fn.getContext());
+    // The LLVMGPU vector-distribute attention pipeline can leave aggregate
+    // vectors as loop-carried state. Its serialized pipeline explicitly
+    // enables this; normal pipelines retain their existing behavior.
+    if (explodeLargeVectors) {
+      packPatterns.add<ExplodeLargeVectorForOpIterArgs>(fn.getContext());
+    }
     if (failed(applyPatternsGreedily(fn, std::move(packPatterns)))) {
       return signalPassFailure();
     }

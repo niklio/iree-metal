@@ -12,7 +12,7 @@ index 1a07d506b..ff7007ca3 100644
  class MMAMatrixOf<list<Type> allowedTypes> :
    ContainerType<AnyTypeOf<allowedTypes>, IsMMAMatrixTypePred,
 diff --git a/mlir/include/mlir/Dialect/GPU/IR/GPUOps.td b/mlir/include/mlir/Dialect/GPU/IR/GPUOps.td
-index 6b0fd1ed9..b28ef5109 100644
+index 6b0fd1ed9..574dc3c4e 100644
 --- a/mlir/include/mlir/Dialect/GPU/IR/GPUOps.td
 +++ b/mlir/include/mlir/Dialect/GPU/IR/GPUOps.td
 @@ -1912,7 +1912,7 @@ def GPU_SubgroupMmaStoreMatrixOp : GPU_Op<"subgroup_mma_store_matrix",
@@ -37,6 +37,102 @@ index 6b0fd1ed9..b28ef5109 100644
                    OptionalAttr<UnitAttr>:$a_transpose,
                    OptionalAttr<UnitAttr>:$b_transpose);
  
+@@ -2003,7 +2003,7 @@ def GPU_SubgroupMmaConstantMatrixOp : GPU_Op<"subgroup_mma_constant_matrix",
+     ```
+   }];
+ 
+-  let arguments = (ins AnyTypeOf<[SI8, UI8, I32, F16, F32]>:$value);
++  let arguments = (ins AnyTypeOf<[SI8, UI8, I32, F16, BF16, F32]>:$value);
+ 
+   let results = (outs GPU_MMAMatrix:$res);
+ 
+diff --git a/mlir/lib/Conversion/GPUToNVVM/WmmaOpsToNvvm.cpp b/mlir/lib/Conversion/GPUToNVVM/WmmaOpsToNvvm.cpp
+index 6254de817..5513c2a94 100644
+--- a/mlir/lib/Conversion/GPUToNVVM/WmmaOpsToNvvm.cpp
++++ b/mlir/lib/Conversion/GPUToNVVM/WmmaOpsToNvvm.cpp
+@@ -42,6 +42,24 @@ static LogicalResult areAllLLVMTypes(Operation *op, ValueRange operands,
+ /// Error string to emit when an unimplemented WMMA variant is encountered.
+ static constexpr StringRef kInvalidCaseStr = "Unsupported WMMA variant.";
+ 
++/// The legacy NVVM WMMA ops modeled by this lowering do not provide BF16
++/// load/store variants. NVVM has BF16 mma.sync support, but that is a different
++/// op family with different fragment layouts.
++static LogicalResult
++rejectUnsupportedWmmaTypes(Operation *op,
++                           ConversionPatternRewriter &rewriter) {
++  auto isUnsupported = [](Type type) {
++    auto matrixType = dyn_cast<gpu::MMAMatrixType>(type);
++    return matrixType && matrixType.getElementType().isBF16();
++  };
++  if (llvm::any_of(op->getOperandTypes(), isUnsupported) ||
++      llvm::any_of(op->getResultTypes(), isUnsupported)) {
++    return rewriter.notifyMatchFailure(
++        op, "BF16 is unsupported by the legacy NVVM WMMA lowering");
++  }
++  return success();
++}
++
+ static NVVM::MMAFrag convertOperand(StringRef operandName) {
+   if (operandName == "AOp")
+     return NVVM::MMAFrag::a;
+@@ -84,6 +102,8 @@ struct WmmaLoadOpToNVVMLowering
+                   OpAdaptor adaptor,
+                   ConversionPatternRewriter &rewriter) const override {
+     Operation *op = subgroupMmaLoadMatrixOp.getOperation();
++    if (failed(rejectUnsupportedWmmaTypes(op, rewriter)))
++      return failure();
+     if (failed(areAllLLVMTypes(op, adaptor.getOperands(), rewriter)))
+       return failure();
+ 
+@@ -151,6 +171,8 @@ struct WmmaStoreOpToNVVMLowering
+                   OpAdaptor adaptor,
+                   ConversionPatternRewriter &rewriter) const override {
+     Operation *op = subgroupMmaStoreMatrixOp.getOperation();
++    if (failed(rejectUnsupportedWmmaTypes(op, rewriter)))
++      return failure();
+     if (failed(areAllLLVMTypes(op, adaptor.getOperands(), rewriter)))
+       return failure();
+ 
+@@ -204,6 +226,8 @@ struct WmmaMmaOpToNVVMLowering
+                   OpAdaptor adaptor,
+                   ConversionPatternRewriter &rewriter) const override {
+     Operation *op = subgroupMmaComputeOp.getOperation();
++    if (failed(rejectUnsupportedWmmaTypes(op, rewriter)))
++      return failure();
+     if (failed(areAllLLVMTypes(op, adaptor.getOperands(), rewriter)))
+       return failure();
+ 
+@@ -278,6 +302,8 @@ struct WmmaConstantOpToNVVMLowering
+   matchAndRewrite(gpu::SubgroupMmaConstantMatrixOp subgroupMmaConstantOp,
+                   OpAdaptor adaptor,
+                   ConversionPatternRewriter &rewriter) const override {
++    if (failed(rejectUnsupportedWmmaTypes(subgroupMmaConstantOp, rewriter)))
++      return failure();
+     if (failed(areAllLLVMTypes(subgroupMmaConstantOp.getOperation(),
+                                adaptor.getOperands(), rewriter)))
+       return failure();
+@@ -362,6 +388,8 @@ struct WmmaElementwiseOpToNVVMLowering
+   matchAndRewrite(gpu::SubgroupMmaElementwiseOp subgroupMmaElementwiseOp,
+                   OpAdaptor adaptor,
+                   ConversionPatternRewriter &rewriter) const override {
++    if (failed(rejectUnsupportedWmmaTypes(subgroupMmaElementwiseOp, rewriter)))
++      return failure();
+     if (failed(areAllLLVMTypes(subgroupMmaElementwiseOp.getOperation(),
+                                adaptor.getOperands(), rewriter)))
+       return failure();
+@@ -405,6 +433,12 @@ struct WmmaElementwiseOpToNVVMLowering
+ 
+ /// Return the LLVMStructureType corresponding to the MMAMatrixType `type`.
+ Type mlir::convertMMAToLLVMType(gpu::MMAMatrixType type) {
++  // A null type makes TypeConverter treat this as a hard conversion failure.
++  // Keep this guard here as well as in the rewrite patterns because this
++  // helper is also used by transform-dialect type converter registration.
++  if (type.getElementType().isBF16())
++    return {};
++
+   NVVM::MMAFrag frag = convertOperand(type.getOperand());
+   NVVM::MMATypes eltType = getElementType(type);
+   auto nRow = type.getShape()[0];
 diff --git a/mlir/lib/Conversion/GPUToSPIRV/GPUToSPIRV.cpp b/mlir/lib/Conversion/GPUToSPIRV/GPUToSPIRV.cpp
 index c33a903d0..1555905c1 100644
 --- a/mlir/lib/Conversion/GPUToSPIRV/GPUToSPIRV.cpp
@@ -74,6 +170,56 @@ index c33a903d0..1555905c1 100644
      return success();
    }
  };
+diff --git a/mlir/lib/Conversion/GPUToSPIRV/WmmaOpsToSPIRV.cpp b/mlir/lib/Conversion/GPUToSPIRV/WmmaOpsToSPIRV.cpp
+index 84c1febd6..54f2aa78a 100644
+--- a/mlir/lib/Conversion/GPUToSPIRV/WmmaOpsToSPIRV.cpp
++++ b/mlir/lib/Conversion/GPUToSPIRV/WmmaOpsToSPIRV.cpp
+@@ -32,6 +32,11 @@ namespace mlir {
+ // Patterns and helpers.
+ //===----------------------------------------------------------------------===//
+ 
++static bool isBF16CooperativeMatrix(Type type) {
++  auto matrixType = dyn_cast<spirv::CooperativeMatrixType>(type);
++  return matrixType && matrixType.getElementType().isBF16();
++}
++
+ /// Creates a SPIR-V op to replace the given GPU subgroup mma elementwise op
+ /// when the elementwise op directly supports with cooperative matrix type.
+ /// Returns false if cannot.
+@@ -193,6 +198,19 @@ struct WmmaElementwiseOpToSPIRVDefaultLowering final
+     if (!coopType)
+       return rewriter.notifyMatchFailure(op, "type conversion failed");
+ 
++    // SPV_KHR_bfloat16 allows BF16 cooperative-matrix values in FConvert and
++    // CooperativeMatrixMulAddKHR, but not in component-wise arithmetic ops.
++    bool isConversion = op.getOpType() == gpu::MMAElementwiseOp::EXTF ||
++                        op.getOpType() == gpu::MMAElementwiseOp::TRUNCF;
++    if (!isConversion &&
++        (isBF16CooperativeMatrix(coopType) ||
++         llvm::any_of(adaptor.getOperands(), [](Value operand) {
++           return isBF16CooperativeMatrix(operand.getType());
++         }))) {
++      return rewriter.notifyMatchFailure(
++          op, "BF16 cooperative-matrix arithmetic is not supported by SPIR-V");
++    }
++
+     return success(
+         createElementwiseOp(rewriter, op, coopType, adaptor.getOperands()));
+   }
+@@ -219,6 +237,13 @@ struct WmmaElementwiseOpToSPIRVScalarMulLowering final
+     if (op.getOpType() != gpu::MMAElementwiseOp::MULF)
+       return failure();
+ 
++    if (llvm::any_of(adaptor.getOperands(), [](Value operand) {
++          return isBF16CooperativeMatrix(operand.getType());
++        })) {
++      return rewriter.notifyMatchFailure(
++          op, "BF16 cooperative matrices cannot use MatrixTimesScalar");
++    }
++
+     // Use the original operands to check whether one of the operands is a splat
+     // scalar value.
+     Value lhs = op.getOperands().front();
 diff --git a/mlir/lib/Conversion/MemRefToSPIRV/MemRefToSPIRV.cpp b/mlir/lib/Conversion/MemRefToSPIRV/MemRefToSPIRV.cpp
 index 565dee6f2..86f99cf18 100644
 --- a/mlir/lib/Conversion/MemRefToSPIRV/MemRefToSPIRV.cpp
@@ -142,7 +288,7 @@ index 975fe2839..d4e367474 100644
  }
  
 diff --git a/mlir/lib/Dialect/GPU/IR/GPUDialect.cpp b/mlir/lib/Dialect/GPU/IR/GPUDialect.cpp
-index 2680c7311..24dbe8f03 100644
+index 2680c7311..7ee8c3146 100644
 --- a/mlir/lib/Dialect/GPU/IR/GPUDialect.cpp
 +++ b/mlir/lib/Dialect/GPU/IR/GPUDialect.cpp
 @@ -209,9 +209,9 @@ Type MMAMatrixType::getElementType() const { return getImpl()->elementType; }
@@ -158,3 +304,340 @@ index 2680c7311..24dbe8f03 100644
  }
  
  LogicalResult
+@@ -226,7 +226,8 @@ MMAMatrixType::verifyInvariants(function_ref<InFlightDiagnostic()> emitError,
+ 
+   if (!MMAMatrixType::isValidElementType(elementType))
+     return emitError()
+-           << "MMAMatrixType elements must be SI8, UI8, I32, F16, F32, or F64";
++           << "MMAMatrixType elements must be SI8, UI8, I32, F16, BF16, F32, "
++              "or F64";
+ 
+   return success();
+ }
+diff --git a/mlir/lib/Dialect/SPIRV/IR/SPIRVTypes.cpp b/mlir/lib/Dialect/SPIRV/IR/SPIRVTypes.cpp
+index 331d98c1d..c19e79bb0 100644
+--- a/mlir/lib/Dialect/SPIRV/IR/SPIRVTypes.cpp
++++ b/mlir/lib/Dialect/SPIRV/IR/SPIRVTypes.cpp
+@@ -305,6 +305,10 @@ void TypeExtensionVisitor::addConcrete(CooperativeMatrixType type) {
+ 
+ void TypeCapabilityVisitor::addConcrete(CooperativeMatrixType type) {
+   add(type.getElementType());
++  if (type.getElementType().isBF16()) {
++    static constexpr auto bf16Cap = Capability::BFloat16CooperativeMatrixKHR;
++    capabilities.push_back(bf16Cap);
++  }
+   static constexpr auto caps = Capability::CooperativeMatrixKHR;
+   capabilities.push_back(caps);
+ }
+diff --git a/mlir/test/Conversion/GPUToNVVM/wmma-ops-to-nvvm.mlir b/mlir/test/Conversion/GPUToNVVM/wmma-ops-to-nvvm.mlir
+index a08014430..ac828b39b 100644
+--- a/mlir/test/Conversion/GPUToNVVM/wmma-ops-to-nvvm.mlir
++++ b/mlir/test/Conversion/GPUToNVVM/wmma-ops-to-nvvm.mlir
+@@ -1,6 +1,6 @@
+-// RUN: mlir-opt --convert-gpu-to-nvvm --split-input-file %s | FileCheck %s
+-// RUN: mlir-opt --convert-gpu-to-nvvm="allow-pattern-rollback=0" --split-input-file %s | FileCheck %s
+-// RUN: mlir-opt --convert-gpu-to-nvvm="index-bitwidth=32" --split-input-file %s | FileCheck --check-prefix=CHECK32 %s
++// RUN: mlir-opt --convert-gpu-to-nvvm --split-input-file --verify-diagnostics %s | FileCheck %s
++// RUN: mlir-opt --convert-gpu-to-nvvm="allow-pattern-rollback=0" --split-input-file --verify-diagnostics %s | FileCheck %s
++// RUN: mlir-opt --convert-gpu-to-nvvm="index-bitwidth=32" --split-input-file --verify-diagnostics %s | FileCheck --check-prefix=CHECK32 %s
+ 
+ gpu.module @test_module {
+ 
+@@ -41,6 +41,25 @@ gpu.module @test_module {
+ 
+ // -----
+ 
++gpu.module @test_module {
++  func.func @gpu_wmma_bf16_is_rejected() {
++    %wg = memref.alloca() {alignment = 32} : memref<32x32xbf16, 3>
++    %i = arith.constant 0 : index
++    // The legacy nvvm.wmma intrinsic family has no BF16 load/store variants.
++    // This must fail conversion instead of reaching an llvm_unreachable.
++    // expected-error @+1 {{failed to legalize operation 'gpu.subgroup_mma_load_matrix'}}
++    %0 = gpu.subgroup_mma_load_matrix %wg[%i, %i]
++      {leadDimension = 32 : index} : memref<32x32xbf16, 3> ->
++      !gpu.mma_matrix<16x16xbf16, "COp">
++    gpu.subgroup_mma_store_matrix %0, %wg[%i, %i]
++      {leadDimension = 32 : index} :
++      !gpu.mma_matrix<16x16xbf16, "COp">, memref<32x32xbf16, 3>
++    return
++  }
++}
++
++// -----
++
+ gpu.module @test_module {
+ 
+   // CHECK-LABEL: func @gpu_wmma_int8_load_op() ->
+diff --git a/mlir/test/Conversion/GPUToSPIRV/wmma-ops-to-spirv-khr-coop-matrix.mlir b/mlir/test/Conversion/GPUToSPIRV/wmma-ops-to-spirv-khr-coop-matrix.mlir
+index 4b371118f..bc164e075 100644
+--- a/mlir/test/Conversion/GPUToSPIRV/wmma-ops-to-spirv-khr-coop-matrix.mlir
++++ b/mlir/test/Conversion/GPUToSPIRV/wmma-ops-to-spirv-khr-coop-matrix.mlir
+@@ -206,3 +206,141 @@ module attributes {
+     }
+   }
+ }
++
++// -----
++
++module attributes {
++  gpu.container_module,
++  spirv.target_env = #spirv.target_env<#spirv.vce<v1.6,
++    [Shader, BFloat16CooperativeMatrixKHR],
++    [SPV_KHR_bfloat16, SPV_KHR_cooperative_matrix,
++     SPV_KHR_storage_buffer_storage_class]>,
++    #spirv.resource_limits<>>} {
++
++  gpu.module @kernels {
++    gpu.func @gpu_wmma_bf16_matrix_times_scalar_is_rejected(
++        %A: !gpu.mma_matrix<16x16xbf16, "COp">, %scalar: bf16,
++        %out: memref<16x16xf32, #spirv.storage_class<StorageBuffer>>) kernel
++      attributes {
++        spirv.entry_point_abi =
++          #spirv.entry_point_abi<workgroup_size = [32, 4, 1]>
++      } {
++      %splat = gpu.subgroup_mma_constant_matrix %scalar :
++        !gpu.mma_matrix<16x16xbf16, "COp">
++      // expected-error @+1 {{failed to legalize operation 'gpu.subgroup_mma_elementwise'}}
++      %B = gpu.subgroup_mma_elementwise mulf %A, %splat :
++        (!gpu.mma_matrix<16x16xbf16, "COp">,
++         !gpu.mma_matrix<16x16xbf16, "COp">) ->
++        !gpu.mma_matrix<16x16xbf16, "COp">
++      %C = gpu.subgroup_mma_elementwise extf %B :
++        (!gpu.mma_matrix<16x16xbf16, "COp">) ->
++        !gpu.mma_matrix<16x16xf32, "COp">
++      %c0 = arith.constant 0 : index
++      gpu.subgroup_mma_store_matrix %C, %out[%c0, %c0]
++        {leadDimension = 16 : index} :
++        !gpu.mma_matrix<16x16xf32, "COp">,
++        memref<16x16xf32, #spirv.storage_class<StorageBuffer>>
++      gpu.return
++    }
++  }
++}
++
++// -----
++
++module attributes {
++  gpu.container_module,
++  spirv.target_env = #spirv.target_env<#spirv.vce<v1.6,
++    [Shader, BFloat16CooperativeMatrixKHR],
++    [SPV_KHR_bfloat16, SPV_KHR_cooperative_matrix,
++     SPV_KHR_storage_buffer_storage_class]>,
++    #spirv.resource_limits<>>} {
++
++  gpu.module @kernels {
++    // CHECK-LABEL: spirv.func @gpu_wmma_bf16_mma_op
++    // CHECK-SAME: !spirv.coopmatrix<16x16xbf16, Subgroup, MatrixA>
++    // CHECK-SAME: !spirv.coopmatrix<16x16xbf16, Subgroup, MatrixB>
++    // CHECK-SAME: !spirv.coopmatrix<16x16xf32, Subgroup, MatrixAcc>
++    gpu.func @gpu_wmma_bf16_mma_op(
++        %A: !gpu.mma_matrix<16x16xbf16, "AOp">,
++        %B: !gpu.mma_matrix<16x16xbf16, "BOp">,
++        %C: !gpu.mma_matrix<16x16xf32, "COp">,
++        %out: memref<16x16xf32, #spirv.storage_class<StorageBuffer>>) kernel
++      attributes {
++        spirv.entry_point_abi =
++          #spirv.entry_point_abi<workgroup_size = [32, 4, 1]>
++      } {
++      // CHECK: spirv.KHR.CooperativeMatrixMulAdd
++      // CHECK-SAME: !spirv.coopmatrix<16x16xbf16, Subgroup, MatrixA>,
++      // CHECK-SAME: !spirv.coopmatrix<16x16xbf16, Subgroup, MatrixB>
++      // CHECK-SAME: -> !spirv.coopmatrix<16x16xf32, Subgroup, MatrixAcc>
++      %D = gpu.subgroup_mma_compute %A, %B, %C :
++        !gpu.mma_matrix<16x16xbf16, "AOp">,
++        !gpu.mma_matrix<16x16xbf16, "BOp"> ->
++        !gpu.mma_matrix<16x16xf32, "COp">
++      %c0 = arith.constant 0 : index
++      gpu.subgroup_mma_store_matrix %D, %out[%c0, %c0]
++        {leadDimension = 16 : index} :
++        !gpu.mma_matrix<16x16xf32, "COp">,
++        memref<16x16xf32, #spirv.storage_class<StorageBuffer>>
++      gpu.return
++    }
++
++    // CHECK-LABEL: spirv.func @gpu_wmma_bf16_convert
++    gpu.func @gpu_wmma_bf16_convert(
++        %A: !gpu.mma_matrix<16x16xbf16, "COp">,
++        %out: memref<16x16xf32, #spirv.storage_class<StorageBuffer>>) kernel
++      attributes {
++        spirv.entry_point_abi =
++          #spirv.entry_point_abi<workgroup_size = [32, 4, 1]>
++      } {
++      // CHECK: spirv.FConvert
++      // CHECK-SAME: !spirv.coopmatrix<16x16xbf16, Subgroup, MatrixAcc> to !spirv.coopmatrix<16x16xf32, Subgroup, MatrixAcc>
++      %B = gpu.subgroup_mma_elementwise extf %A :
++        (!gpu.mma_matrix<16x16xbf16, "COp">) ->
++        !gpu.mma_matrix<16x16xf32, "COp">
++      %c0 = arith.constant 0 : index
++      gpu.subgroup_mma_store_matrix %B, %out[%c0, %c0]
++        {leadDimension = 16 : index} :
++        !gpu.mma_matrix<16x16xf32, "COp">,
++        memref<16x16xf32, #spirv.storage_class<StorageBuffer>>
++      gpu.return
++    }
++  }
++}
++
++// -----
++
++module attributes {
++  gpu.container_module,
++  spirv.target_env = #spirv.target_env<#spirv.vce<v1.6,
++    [Shader, BFloat16CooperativeMatrixKHR],
++    [SPV_KHR_bfloat16, SPV_KHR_cooperative_matrix,
++     SPV_KHR_storage_buffer_storage_class]>,
++    #spirv.resource_limits<>>} {
++
++  gpu.module @kernels {
++    gpu.func @gpu_wmma_bf16_elementwise_is_rejected(
++        %A: !gpu.mma_matrix<16x16xbf16, "COp">,
++        %B: !gpu.mma_matrix<16x16xbf16, "COp">,
++        %out: memref<16x16xf32, #spirv.storage_class<StorageBuffer>>) kernel
++      attributes {
++        spirv.entry_point_abi =
++          #spirv.entry_point_abi<workgroup_size = [32, 4, 1]>
++      } {
++      // expected-error @+1 {{failed to legalize operation 'gpu.subgroup_mma_elementwise'}}
++      %C = gpu.subgroup_mma_elementwise addf %A, %B :
++        (!gpu.mma_matrix<16x16xbf16, "COp">,
++         !gpu.mma_matrix<16x16xbf16, "COp">) ->
++        !gpu.mma_matrix<16x16xbf16, "COp">
++      %D = gpu.subgroup_mma_elementwise extf %C :
++        (!gpu.mma_matrix<16x16xbf16, "COp">) ->
++        !gpu.mma_matrix<16x16xf32, "COp">
++      %c0 = arith.constant 0 : index
++      gpu.subgroup_mma_store_matrix %D, %out[%c0, %c0]
++        {leadDimension = 16 : index} :
++        !gpu.mma_matrix<16x16xf32, "COp">,
++        memref<16x16xf32, #spirv.storage_class<StorageBuffer>>
++      gpu.return
++    }
++  }
++}
+diff --git a/mlir/test/Dialect/GPU/invalid.mlir b/mlir/test/Dialect/GPU/invalid.mlir
+index f8e75cec9..0ce05876e 100644
+--- a/mlir/test/Dialect/GPU/invalid.mlir
++++ b/mlir/test/Dialect/GPU/invalid.mlir
+@@ -742,8 +742,8 @@ func.func @mmamatrix_operand_type(){
+ func.func @mmamatrix_invalid_element_type(){
+     %wg = memref.alloca() {alignment = 32} : memref<32x32xf16, 3>
+     %i = arith.constant 16 : index
+-    // expected-error @+1 {{MMAMatrixType elements must be SI8, UI8, I32, F16, F32, or F64}}
+-    %0 = gpu.subgroup_mma_load_matrix %wg[%i, %i] {leadDimension = 32 : index} : memref<32x32xf16, 3> -> !gpu.mma_matrix<16x16xbf16, "AOp">
++    // expected-error @+1 {{MMAMatrixType elements must be SI8, UI8, I32, F16, BF16, F32, or F64}}
++    %0 = gpu.subgroup_mma_load_matrix %wg[%i, %i] {leadDimension = 32 : index} : memref<32x32xf16, 3> -> !gpu.mma_matrix<16x16xf8E4M3FN, "AOp">
+     return
+ }
+ 
+@@ -762,7 +762,7 @@ func.func @mmaLoadOp_identity_layout(){
+ // -----
+ 
+ func.func @mma_invalid_memref_type(%src: memref<32x4xvector<4x8xf32>>, %i: index) {
+-    // expected-error @+1 {{operand #0 must be memref of 8-bit signless integer or 32-bit signless integer or 16-bit float or 32-bit float or 64-bit float or vector of 8-bit signless integer or 32-bit signless integer or 16-bit float or 32-bit float or 64-bit float values of ranks 1 values}}
++    // expected-error @+1 {{operand #0 must be memref of 8-bit signless integer or 32-bit signless integer or 16-bit float or bfloat16 type or 32-bit float or 64-bit float or vector of 8-bit signless integer or 32-bit signless integer or 16-bit float or bfloat16 type or 32-bit float or 64-bit float values of ranks 1 values}}
+     %0 = gpu.subgroup_mma_load_matrix %src[%i, %i] {leadDimension = 4 : index} : memref<32x4xvector<4x8xf32>> -> !gpu.mma_matrix<16x16xf16, "AOp">
+     return
+ }
+diff --git a/mlir/test/Dialect/GPU/ops.mlir b/mlir/test/Dialect/GPU/ops.mlir
+index 1d05268ed..35c538b19 100644
+--- a/mlir/test/Dialect/GPU/ops.mlir
++++ b/mlir/test/Dialect/GPU/ops.mlir
+@@ -425,6 +425,47 @@ module attributes {gpu.container_module} {
+     return
+   }
+ 
++  // CHECK-LABEL: func @mmamatrix_valid_bf16
++  func.func @mmamatrix_valid_bf16(
++      %a : memref<16x16xbf16>, %b : memref<16x16xbf16>,
++      %c : memref<16x16xf32>) {
++    %c0 = arith.constant 0 : index
++    %zero_f32 = arith.constant 0.0 : f32
++    %zero_bf16 = arith.constant 0.0 : bf16
++    // CHECK: gpu.subgroup_mma_load_matrix
++    // CHECK-SAME: memref<16x16xbf16> -> !gpu.mma_matrix<16x16xbf16, "AOp">
++    %A = gpu.subgroup_mma_load_matrix %a[%c0, %c0] {leadDimension = 16 : index} :
++      memref<16x16xbf16> -> !gpu.mma_matrix<16x16xbf16, "AOp">
++    // CHECK: gpu.subgroup_mma_load_matrix
++    // CHECK-SAME: memref<16x16xbf16> -> !gpu.mma_matrix<16x16xbf16, "BOp">
++    %B = gpu.subgroup_mma_load_matrix %b[%c0, %c0] {leadDimension = 16 : index} :
++      memref<16x16xbf16> -> !gpu.mma_matrix<16x16xbf16, "BOp">
++    %C = gpu.subgroup_mma_constant_matrix %zero_f32 :
++      !gpu.mma_matrix<16x16xf32, "COp">
++    // CHECK: gpu.subgroup_mma_compute
++    // CHECK-SAME: !gpu.mma_matrix<16x16xbf16, "AOp">, !gpu.mma_matrix<16x16xbf16, "BOp"> -> !gpu.mma_matrix<16x16xf32, "COp">
++    %D = gpu.subgroup_mma_compute %A, %B, %C :
++      !gpu.mma_matrix<16x16xbf16, "AOp">,
++      !gpu.mma_matrix<16x16xbf16, "BOp"> ->
++      !gpu.mma_matrix<16x16xf32, "COp">
++    gpu.subgroup_mma_store_matrix %D, %c[%c0, %c0]
++      {leadDimension = 16 : index} :
++      !gpu.mma_matrix<16x16xf32, "COp">, memref<16x16xf32>
++
++    // BF16 accumulator construction and storage are target-neutral GPU IR
++    // features even though individual backends may reject them.
++    // CHECK: gpu.subgroup_mma_constant_matrix
++    // CHECK-SAME: !gpu.mma_matrix<16x16xbf16, "COp">
++    %C_bf16 = gpu.subgroup_mma_constant_matrix %zero_bf16 :
++      !gpu.mma_matrix<16x16xbf16, "COp">
++    // CHECK: gpu.subgroup_mma_store_matrix
++    // CHECK-SAME: !gpu.mma_matrix<16x16xbf16, "COp">, memref<16x16xbf16>
++    gpu.subgroup_mma_store_matrix %C_bf16, %a[%c0, %c0]
++      {leadDimension = 16 : index} :
++      !gpu.mma_matrix<16x16xbf16, "COp">, memref<16x16xbf16>
++    return
++  }
++
+   // CHECK-LABEL: func @mmamatrix_valid_vector_element_type
+   func.func @mmamatrix_valid_vector_element_type(%src : memref<32x4xvector<4xf32>>, %i : index) {
+     // CHECK: gpu.subgroup_mma_load_matrix
+diff --git a/mlir/test/Dialect/SPIRV/Transforms/vce-deduction.mlir b/mlir/test/Dialect/SPIRV/Transforms/vce-deduction.mlir
+index 7dab87f80..ff4128f81 100644
+--- a/mlir/test/Dialect/SPIRV/Transforms/vce-deduction.mlir
++++ b/mlir/test/Dialect/SPIRV/Transforms/vce-deduction.mlir
+@@ -253,3 +253,20 @@ spirv.module Physical64 GLSL450 attributes {
+   spirv.GlobalVariable @recursive:
+     !spirv.ptr<!spirv.struct<rec, (!spirv.ptr<!spirv.struct<rec>, StorageBuffer>)>, StorageBuffer>
+ }
++
++// A BF16 cooperative matrix requires the dedicated capability, not merely the
++// base BF16 and cooperative-matrix capabilities.
++// CHECK: requires #spirv.vce<v1.6, [BFloat16TypeKHR, BFloat16CooperativeMatrixKHR, CooperativeMatrixKHR, Shader, Matrix], [SPV_KHR_bfloat16, SPV_KHR_cooperative_matrix]>
++spirv.module Logical GLSL450 attributes {
++  spirv.target_env = #spirv.target_env<
++    #spirv.vce<v1.6, [Shader, BFloat16CooperativeMatrixKHR],
++      [SPV_KHR_bfloat16, SPV_KHR_cooperative_matrix]>,
++    #spirv.resource_limits<>>
++} {
++  spirv.func @bf16_cooperative_matrix(
++      %arg : !spirv.coopmatrix<16x16xbf16, Subgroup, MatrixA>)
++      -> !spirv.coopmatrix<16x16xbf16, Subgroup, MatrixA> "None" {
++    spirv.ReturnValue %arg :
++      !spirv.coopmatrix<16x16xbf16, Subgroup, MatrixA>
++  }
++}
+diff --git a/mlir/test/Dialect/SPIRV/Transforms/vce-deduction-invalid.mlir b/mlir/test/Dialect/SPIRV/Transforms/vce-deduction-invalid.mlir
+new file mode 100644
+index 000000000..b6ecf00d8
+--- /dev/null
++++ b/mlir/test/Dialect/SPIRV/Transforms/vce-deduction-invalid.mlir
+@@ -0,0 +1,19 @@
++// RUN: mlir-opt -spirv-update-vce -verify-diagnostics %s
++
++// BFloat16TypeKHR plus CooperativeMatrixKHR is insufficient for a BF16
++// cooperative matrix. SPV_KHR_bfloat16 requires the dedicated combined
++// capability.
++spirv.module Logical GLSL450 attributes {
++  spirv.target_env = #spirv.target_env<
++    #spirv.vce<v1.6, [Shader, BFloat16TypeKHR, CooperativeMatrixKHR],
++      [SPV_KHR_bfloat16, SPV_KHR_cooperative_matrix]>,
++    #spirv.resource_limits<>>
++} {
++  spirv.func @bf16_cooperative_matrix_missing_capability(
++      %arg : !spirv.coopmatrix<16x16xbf16, Subgroup, MatrixA>)
++      -> !spirv.coopmatrix<16x16xbf16, Subgroup, MatrixA> "None" {
++    // expected-error @+1 {{'spirv.ReturnValue' requires at least one capability in [BFloat16CooperativeMatrixKHR] but none allowed in target environment}}
++    spirv.ReturnValue %arg :
++      !spirv.coopmatrix<16x16xbf16, Subgroup, MatrixA>
++  }
++}

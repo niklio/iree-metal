@@ -6,7 +6,9 @@
 
 #include "iree/compiler/Codegen/Dialect/GPU/TargetUtils/KnownTargets.h"
 
+#include <cstdlib>
 #include <optional>
+
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUEnums.h"
 #include "llvm/ADT/DenseMap.h"
@@ -781,6 +783,20 @@ std::optional<TargetDetails> getAppleTargetDetails() {
       // WMMAR4_F32_16x16x16_BF16 gives ABC={bf16,bf16,f32} @ 16x16x16 (matches the f16 tiling).
       MMAIntrinsic::WMMAR4_F32_16x16x16_BF16,
   };
+  // The vector-distribute attention prototype models Metal's native 8x8
+  // simdgroup_matrix instruction and larger logical tiles composed from it.
+  // Include the legacy entries as well so enabling attention does not replace
+  // the target inventory seen by unrelated matmuls. Pipeline configuration
+  // filters this combined inventory in opposite directions for legacy matmul
+  // and Apple vector-distributed attention.
+  static const MMAIntrinsic appleVdistMMAOps[] = {
+      MMAIntrinsic::NV_WMMA_F32_16x16x16_F16,
+      MMAIntrinsic::WMMAR4_F32_16x16x16_BF16,
+      MMAIntrinsic::APPLE_SIMDGROUP_F32_16x16x16_F16,
+      MMAIntrinsic::APPLE_SIMDGROUP_F32_16x16x16_BF16,
+      MMAIntrinsic::APPLE_SIMDGROUP_F32_8x8x8_F16,
+      MMAIntrinsic::APPLE_SIMDGROUP_F32_8x8x8_BF16,
+  };
   // clang-format off
   static const WgpDetails wgp = {
       computeBitwdiths,   allStorageBits,       allSubgroupOps,  allDotProductOps,
@@ -789,9 +805,17 @@ std::optional<TargetDetails> getAppleTargetDetails() {
       {1024, 1024, 1024}, 1024,               32 * 1024,
       // Note: These values have not been checked and may be higher
       {0xffff, 0xffff, 0xffff}};
+  static const WgpDetails vdistWgp = {
+      computeBitwdiths,   allStorageBits,            allSubgroupOps,
+      allDotProductOps,   /*mmaCount=*/std::size(appleVdistMMAOps),
+      /*mmaOps=*/appleVdistMMAOps,                    /*scaledMmaCount=*/0,
+      /*scaledMmaOps=*/nullptr,                       {32, 32},
+      {1024, 1024, 1024}, 1024,                      32 * 1024,
+      {0xffff, 0xffff, 0xffff}};
   // clang-format on
 
-  return TargetDetails{&wgp, nullptr};
+  return TargetDetails{std::getenv("IREE_METAL_ATTN_VDIST") ? &vdistWgp : &wgp,
+                       nullptr};
 }
 
 //===----------------------------------------------------------------------===//
@@ -1268,6 +1292,7 @@ TargetAttr getFullTarget(StringRef targetAPI, StringRef aliasTarget,
   return llvm::StringSwitch<TargetAttr>(targetAPI)
       .Case("cuda", getCUDATargetDetails(aliasTarget, features, context))
       .Case("hip", getHIPTargetDetails(aliasTarget, features, context))
+      .Case("metal", getMetalTargetDetails(context))
       .Case("vulkan", getVulkanTargetDetails(aliasTarget, context))
       .Default(nullptr);
 }

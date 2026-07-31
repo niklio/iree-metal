@@ -47,6 +47,10 @@ def SPIRVEraseStorageBufferStaticShapePass :
 def SPIRVFinalVectorLoweringPass : InterfacePass<
     "iree-spirv-final-vector-lowering", "mlir::FunctionOpInterface"> {
   let summary = "Perform final lowering of vectors ops to fit SPIR-V";
+  let options = [
+    Option<"dropUnitDims", "drop-unit-dims", "bool", /*default=*/"false",
+      "Fold unit dimensions through vector shape casts">,
+  ];
 }
 
 def SPIRVInitialVectorLoweringPass : InterfacePass<

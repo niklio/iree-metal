@@ -182,3 +182,16 @@ func.func @pad_if_below_limit() {
   %0 = memref.alloc() : memref<4x32x126xf32, #gpu.address_space<workgroup>>
   return
 }
+
+// -----
+
+// CHECK-LABEL: func.func @pad_alloc_dealloc
+//       CHECK: %[[A:.*]] = memref.alloc() : memref<4x32x66xf32, #gpu.address_space<workgroup>>
+//       CHECK: %[[S:.*]] = memref.subview %[[A]][0, 0, 0] [4, 32, 64] [1, 1, 1]
+//   CHECK-NOT: memref.dealloc %[[S]]
+//       CHECK: memref.dealloc %[[A]] : memref<4x32x66xf32, #gpu.address_space<workgroup>>
+func.func @pad_alloc_dealloc() {
+  %0 = memref.alloc() : memref<4x32x64xf32, #gpu.address_space<workgroup>>
+  memref.dealloc %0 : memref<4x32x64xf32, #gpu.address_space<workgroup>>
+  return
+}

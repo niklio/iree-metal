@@ -53,6 +53,112 @@ module attributes { transform.with_named_sequence } {
 
 // -----
 
+#apple_contraction_accesses = [
+ affine_map<() -> ()>,
+ affine_map<() -> ()>,
+ affine_map<() -> ()>
+]
+func.func @distribute_inner_tiled_apple_f16_8x8x8_f32(
+    %lhs: tensor<8x8xf16>, %rhs: tensor<8x8xf16>,
+    %acc: tensor<8x8xf32>) -> tensor<8x8xf32> {
+  %0 = iree_codegen.inner_tiled ins(%lhs, %rhs) outs(%acc) {
+    indexing_maps = #apple_contraction_accesses,
+    iterator_types = [],
+    kind = #iree_gpu.mma_layout<APPLE_SIMDGROUP_F32_8x8x8_F16>,
+    semantics = #iree_gpu.mma_semantics<distributed = false, opaque = true>
+  } : tensor<8x8xf16>, tensor<8x8xf16> into tensor<8x8xf32>
+  return %0 : tensor<8x8xf32>
+}
+
+module attributes { transform.with_named_sequence } {
+  transform.named_sequence @__transform_main(%root: !transform.any_op {transform.readonly}) {
+    %inner_tiled = transform.structured.match ops{["iree_codegen.inner_tiled"]} in %root : (!transform.any_op) -> !transform.any_op
+    transform.iree.distribute_inner_tiled %inner_tiled : (!transform.any_op) -> !transform.any_op
+    %func = transform.structured.match ops{["func.func"]} in %root : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %func {
+      transform.apply_patterns.canonicalization
+    } : !transform.any_op
+    transform.apply_cse to %func : !transform.any_op
+    transform.yield
+  }
+}
+
+// CHECK-LABEL: func @distribute_inner_tiled_apple_f16_8x8x8_f32
+//  CHECK-SAME:   %[[LHS:[A-Za-z0-9]+]]: tensor<8x8xf16>
+//  CHECK-SAME:   %[[RHS:[A-Za-z0-9]+]]: tensor<8x8xf16>
+//  CHECK-SAME:   %[[ACC:[A-Za-z0-9]+]]: tensor<8x8xf32>
+//       CHECK:   scf.forall (%[[LANE_ID:.+]]) in (32) shared_outs(%[[ITER_ARG:.+]] = %[[ACC]]) -> (tensor<8x8xf32>)
+//       CHECK:     %[[ID:.+]]:3 = affine.delinearize_index %[[LANE_ID]] into (8, 4)
+//       CHECK:     %[[ROW:.+]] = iree_codegen.index_hint %[[ID]]#1(#iree_gpu.lane_constant<4>) : index
+//       CHECK:     %[[COL_PAIR:.+]] = iree_codegen.index_hint %[[ID]]#2(#iree_gpu.lane_increment<4, aligned>) : index
+//       CHECK:     %[[COL:.+]] = affine.linearize_index disjoint [%[[COL_PAIR]], %c0] by (4, 2)
+//       CHECK:     %[[LHS_SLICE:.+]] = tensor.extract_slice %[[LHS]][%[[ROW]], %[[COL]]] [1, 2] [1, 1]
+//  CHECK-SAME:       tensor<8x8xf16> to tensor<1x2xf16>
+//       CHECK:     %[[RHS_SLICE:.+]] = tensor.extract_slice %[[RHS]][%[[ROW]], %[[COL]]] [1, 2] [1, 1]
+//  CHECK-SAME:       tensor<8x8xf16> to tensor<1x2xf16>
+//       CHECK:     %[[ACC_SLICE:.+]] = tensor.extract_slice %[[ITER_ARG]][%[[ROW]], %[[COL]]] [1, 2] [1, 1]
+//  CHECK-SAME:       tensor<8x8xf32> to tensor<1x2xf32>
+//       CHECK:     iree_codegen.inner_tiled ins(%[[LHS_SLICE]], %[[RHS_SLICE]]) outs(%[[ACC_SLICE]])
+//  CHECK-SAME:       kind = #iree_gpu.mma_layout<APPLE_SIMDGROUP_F32_8x8x8_F16>
+//  CHECK-SAME:       semantics = #iree_gpu.mma_semantics<distributed = true, opaque = true>
+//       CHECK:   mapping = [#iree_gpu.lane_id<0>]
+
+// -----
+
+#apple_contraction_accesses = [
+ affine_map<() -> ()>,
+ affine_map<() -> ()>,
+ affine_map<() -> ()>
+]
+func.func @distribute_inner_tiled_apple_f16_16x16x16_f32(
+    %lhs: tensor<2x8x2x8xf16>, %rhs: tensor<2x8x2x8xf16>,
+    %acc: tensor<2x8x2x8xf32>) -> tensor<2x8x2x8xf32> {
+  %0 = iree_codegen.inner_tiled ins(%lhs, %rhs) outs(%acc) {
+    indexing_maps = #apple_contraction_accesses,
+    iterator_types = [],
+    kind = #iree_gpu.mma_layout<APPLE_SIMDGROUP_F32_16x16x16_F16>,
+    permutations = [array<i64: 0, 1, 2, 3>, array<i64: 2, 3, 0, 1>, array<i64: 0, 1, 2, 3>],
+    semantics = #iree_gpu.mma_semantics<distributed = false, opaque = true>
+  } : tensor<2x8x2x8xf16>, tensor<2x8x2x8xf16> into tensor<2x8x2x8xf32>
+  return %0 : tensor<2x8x2x8xf32>
+}
+
+module attributes { transform.with_named_sequence } {
+  transform.named_sequence @__transform_main(%root: !transform.any_op {transform.readonly}) {
+    %inner_tiled = transform.structured.match ops{["iree_codegen.inner_tiled"]} in %root : (!transform.any_op) -> !transform.any_op
+    transform.iree.distribute_inner_tiled %inner_tiled : (!transform.any_op) -> !transform.any_op
+    %func = transform.structured.match ops{["func.func"]} in %root : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %func {
+      transform.apply_patterns.canonicalization
+    } : !transform.any_op
+    transform.apply_cse to %func : !transform.any_op
+    transform.yield
+  }
+}
+
+// CHECK-LABEL: func @distribute_inner_tiled_apple_f16_16x16x16_f32
+//  CHECK-SAME:   %[[LHS:[A-Za-z0-9]+]]: tensor<2x8x2x8xf16>
+//  CHECK-SAME:   %[[RHS:[A-Za-z0-9]+]]: tensor<2x8x2x8xf16>
+//  CHECK-SAME:   %[[ACC:[A-Za-z0-9]+]]: tensor<2x8x2x8xf32>
+//       CHECK:   scf.forall (%[[LANE_ID:.+]]) in (32) shared_outs(%[[ITER_ARG:.+]] = %[[ACC]]) -> (tensor<2x8x2x8xf32>)
+//       CHECK:     %[[ID:.+]]:3 = affine.delinearize_index %[[LANE_ID]] into (8, 4)
+//       CHECK:     %[[ROW:.+]] = iree_codegen.index_hint %[[ID]]#1(#iree_gpu.lane_constant<4>) : index
+//       CHECK:     %[[COL_PAIR:.+]] = iree_codegen.index_hint %[[ID]]#2(#iree_gpu.lane_increment<4, aligned>) : index
+//       CHECK:     %[[COL:.+]] = affine.linearize_index disjoint [%[[COL_PAIR]], %c0] by (4, 2)
+//       CHECK:     %[[LHS_SLICE:.+]] = tensor.extract_slice %[[LHS]][0, %[[ROW]], 0, %[[COL]]] [2, 1, 2, 2] [1, 1, 1, 1]
+//  CHECK-SAME:       tensor<2x8x2x8xf16> to tensor<2x1x2x2xf16>
+//       CHECK:     %[[RHS_SLICE:.+]] = tensor.extract_slice %[[RHS]][0, %[[COL]], 0, %[[ROW]]] [2, 2, 2, 1] [1, 1, 1, 1]
+//  CHECK-SAME:       tensor<2x8x2x8xf16> to tensor<2x2x2x1xf16>
+//       CHECK:     %[[ACC_SLICE:.+]] = tensor.extract_slice %[[ITER_ARG]][0, %[[ROW]], 0, %[[COL]]] [2, 1, 2, 2] [1, 1, 1, 1]
+//  CHECK-SAME:       tensor<2x8x2x8xf32> to tensor<2x1x2x2xf32>
+//       CHECK:     iree_codegen.inner_tiled ins(%[[LHS_SLICE]], %[[RHS_SLICE]]) outs(%[[ACC_SLICE]])
+//  CHECK-SAME:       kind = #iree_gpu.mma_layout<APPLE_SIMDGROUP_F32_16x16x16_F16>
+//  CHECK-SAME:       permutations = [array<i64: 0, 1, 2, 3>, array<i64: 2, 3, 0, 1>, array<i64: 0, 1, 2, 3>]
+//  CHECK-SAME:       semantics = #iree_gpu.mma_semantics<distributed = true, opaque = true>
+//       CHECK:   mapping = [#iree_gpu.lane_id<0>]
+
+// -----
+
 #contraction_accesses = [
  affine_map<(i, j, k) -> (i, k)>,
  affine_map<(i, j, k) -> (j, k)>,

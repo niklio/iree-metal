@@ -31,7 +31,9 @@ def IREEGPU_Dialect : Dialect {
   let useDefaultAttributePrinterParser = 1;
 
   let discardableAttrs = (ins
-    "::mlir::UnitAttr":$use_rocdl_buffer_instructions
+    "::mlir::UnitAttr":$use_rocdl_buffer_instructions,
+    "::mlir::UnitAttr":$apple_mma_canonical_to_hardware,
+    "::mlir::UnitAttr":$apple_mma_hardware_to_canonical
   );
   let extraClassDeclaration = [{
     void registerAttributes();

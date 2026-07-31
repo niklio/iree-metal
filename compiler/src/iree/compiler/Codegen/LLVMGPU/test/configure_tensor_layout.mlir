@@ -50,6 +50,82 @@ func.func @matmul_96x64x16_mfma(%lhs: tensor<96x16xf16>,
 
 // -----
 
+// Preserve the contraction result layout across a pointwise DPS update. If the
+// update folds to a constant (as an all-false attention mask does), the result
+// anchor must remain available to distribute the following reduction.
+
+#translation = #iree_codegen.translation_info<pipeline = LLVMGPUVectorDistribute
+                                              workgroup_size = [64, 1, 1]
+                                              subgroup_size = 64>
+
+#contraction_maps = [
+  affine_map<(m, n, k) -> (m, k)>,
+  affine_map<(m, n, k) -> (n, k)>,
+  affine_map<(m, n, k) -> (m, n)>
+]
+
+#contraction_traits = {
+  indexing_maps = #contraction_maps,
+  iterator_types = ["parallel", "parallel", "reduction"],
+  lowering_config = #iree_gpu.lowering_config<{
+    mma_kind = #iree_gpu.mma_layout<WMMAR3_F32_16x16x16_F16>,
+    subgroup_basis = [[1, 1, 1], [0, 1, 2]]
+  }>
+}
+
+#scalar = affine_map<(m, n) -> ()>
+#identity = affine_map<(m, n) -> (m, n)>
+#row = affine_map<(m, n) -> (m)>
+
+func.func @pointwise_dps_preserves_result_anchor(
+    %lhs: tensor<16x16xf16>,
+    %rhs: tensor<16x16xf16>,
+    %init: tensor<16x16xf32>,
+    %row_init: tensor<16xf32>) -> tensor<16xf32>
+    attributes {translation_info = #translation} {
+  %scores = linalg.generic #contraction_traits
+      ins(%lhs, %rhs : tensor<16x16xf16>, tensor<16x16xf16>)
+      outs(%init : tensor<16x16xf32>) {
+    ^bb0(%l: f16, %r: f16, %acc: f32):
+      %lext = arith.extf %l : f16 to f32
+      %rext = arith.extf %r : f16 to f32
+      %mul = arith.mulf %lext, %rext : f32
+      %add = arith.addf %acc, %mul : f32
+      linalg.yield %add : f32
+  } -> tensor<16x16xf32>
+  %false = arith.constant false
+  %masked = linalg.generic {
+      indexing_maps = [#scalar, #identity],
+      iterator_types = ["parallel", "parallel"]}
+      ins(%false : i1) outs(%scores : tensor<16x16xf32>) {
+    ^bb0(%condition: i1, %score: f32):
+      %masked_out = arith.constant -3.40282347E+38 : f32
+      %selected = arith.select %condition, %score, %masked_out : f32
+      linalg.yield %selected : f32
+  } -> tensor<16x16xf32>
+  %max = linalg.generic {
+      indexing_maps = [#identity, #row],
+      iterator_types = ["parallel", "reduction"]}
+      ins(%masked : tensor<16x16xf32>)
+      outs(%row_init : tensor<16xf32>) {
+    ^bb0(%value: f32, %acc: f32):
+      %next = arith.maximumf %value, %acc : f32
+      linalg.yield %next : f32
+  } -> tensor<16xf32>
+  return %max : tensor<16xf32>
+}
+
+// CHECK-LABEL: func.func @pointwise_dps_preserves_result_anchor(
+// CHECK: %[[SCORES:.+]] = linalg.generic
+// CHECK: %[[SCORES_LAYOUT:.+]] = iree_vector_ext.to_layout %[[SCORES]] to layout(
+// CHECK: %[[MASKED:.+]] = linalg.generic
+// CHECK-SAME: outs(%[[SCORES_LAYOUT]] : tensor<16x16xf32>)
+// CHECK: %[[MASKED_LAYOUT:.+]] = iree_vector_ext.to_layout %[[MASKED]] to layout(
+// CHECK: linalg.generic
+// CHECK-SAME: ins(%[[MASKED_LAYOUT]] : tensor<16x16xf32>)
+
+// -----
+
 #translation = #iree_codegen.translation_info<pipeline = LLVMGPUVectorDistribute
                                               workgroup_size = [64, 1, 1]
                                               subgroup_size = 64>

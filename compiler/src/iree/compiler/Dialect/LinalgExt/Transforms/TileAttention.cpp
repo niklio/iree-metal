@@ -101,6 +101,8 @@ void convertToOnlineAttention(IREE::LinalgExt::AttentionOp attnOp,
   indexingMaps.push_back(sumMap);
 
   Value mask = attnOp.getMask() ? attnOp.getMask() : Value();
+  bool hasIntegerMask =
+      mask && isa<IntegerType>(getElementTypeOrSelf(mask.getType()));
 
   OnlineAttentionOp onlineAttn = OnlineAttentionOp::create(
       rewriter, loc,
@@ -132,12 +134,27 @@ void convertToOnlineAttention(IREE::LinalgExt::AttentionOp attnOp,
       rewriter, loc, attnOp.getOutput().getType(), ValueRange{sum, x},
       attnOp.getOutput(), compressedMaps, iteratorTypes,
       [&](OpBuilder &b, Location loc, ValueRange args) {
+        Value sum = args[0];
+        Value sumIsZero;
+        Value zero;
         Value one = arith::ConstantOp::create(
-            b, loc, b.getFloatAttr(args[0].getType(), 1.0));
-        Value reciprocal = arith::DivFOp::create(b, loc, one, args[0]);
+            b, loc, b.getFloatAttr(sum.getType(), 1.0));
+        if (hasIntegerMask) {
+          // An all-false mask produces the neutral online state (x = 0,
+          // sum = 0). Avoid forming 1 / 0 and define its final output as zero.
+          zero = arith::ConstantOp::create(b, loc,
+                                           b.getFloatAttr(sum.getType(), 0.0));
+          sumIsZero = arith::CmpFOp::create(b, loc, arith::CmpFPredicate::OEQ,
+                                            sum, zero);
+          sum = arith::SelectOp::create(b, loc, sumIsZero, one, sum);
+        }
+        Value reciprocal = arith::DivFOp::create(b, loc, one, sum);
         // Both sum and x are in fp32, as created earlier, so we only need
         // to cast after the mul.
         Value result = arith::MulFOp::create(b, loc, reciprocal, args[1]);
+        if (hasIntegerMask) {
+          result = arith::SelectOp::create(b, loc, sumIsZero, zero, result);
+        }
         // Cast result to the required type by attention output.
         result = convertScalarToDtype(b, loc, result, args[2].getType(),
                                       /*isUnsignedCast=*/false);

@@ -78,6 +78,23 @@ static LogicalResult padAlloc(MLIRContext *context, AllocLikeOp allocOp,
   Value subview = memref::SubViewOp::create(rewriter, loc, paddedAlloc, offsets,
                                             sizes, strides);
   replaceMemrefUsesAndPropagateType(rewriter, loc, allocOp, subview);
+
+  // `memref.dealloc` must free the value produced by `memref.alloc`, not an
+  // alias produced by a view-like operation. Type propagation above replaces
+  // all uses of the original dynamic allocation, including deallocations, with
+  // the bounded subview. Retarget those deallocations to the new padded
+  // allocation. Besides restoring valid memref semantics, this allows the
+  // subview to become dead after its load/store users are folded.
+  SmallVector<memref::DeallocOp> deallocOps;
+  for (Operation *user : subview.getUsers()) {
+    if (auto deallocOp = dyn_cast<memref::DeallocOp>(user)) {
+      deallocOps.push_back(deallocOp);
+    }
+  }
+  for (memref::DeallocOp deallocOp : deallocOps) {
+    deallocOp.getMemrefMutable().assign(paddedAlloc);
+  }
+
   rewriter.eraseOp(allocOp);
   return success();
 }

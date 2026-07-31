@@ -79,3 +79,48 @@ hal.executable.variant public @vulkan_spirv_fb target(<"vulkan-spirv", "vulkan-s
 // CHECK-SAME:       #spirv.coop_matrix_props_khr<m_size = 16, n_size = 16, k_size = 16, a_type = f16, b_type = f16, c_type = f16, result_type = f16, acc_sat = false, scope = <Subgroup>>,
 // CHECK-SAME:       #spirv.coop_matrix_props_khr<m_size = 16, n_size = 16, k_size = 16, a_type = i8, b_type = i8, c_type = i32, result_type = i32, acc_sat = false, scope = <Subgroup>>
 // CHECK-SAME: ]>>
+
+
+// -----
+
+// Check that Apple's native 8x8 simdgroup matrix intrinsics are represented
+// directly and that its bf16 path enables the SPIR-V bf16 cooperative-matrix
+// extension and capabilities.
+
+hal.executable @dispatch_apple_simdgroup_matrix {
+hal.executable.variant public @metal_spirv_fb target(<"metal", "metal-spirv-fb", {
+    iree_codegen.target_info = #iree_gpu.target<arch = "apple-m3", features = "spirv:v1.6,cap:Shader",
+      wgp = <compute = fp32|fp16, storage = b32|b16, subgroup = none,
+             mma = [<APPLE_SIMDGROUP_F32_8x8x8_F16>, <APPLE_SIMDGROUP_F32_8x8x8_BF16>,
+                    <APPLE_SIMDGROUP_F32_16x16x16_F16>, <NV_WMMA_F32_16x16x16_F16>],
+      subgroup_size_choices = [32], max_workgroup_sizes = [1024, 1024, 1024], max_thread_count_per_workgroup = 1024, max_workgroup_memory_bytes = 32768,
+      max_workgroup_counts = [65535, 65535, 65535]>>}>) {
+  hal.executable.export public @dispatch ordinal(0) layout(#hal.pipeline.layout<bindings = [
+    #hal.pipeline.binding<storage_buffer>]>
+  ) count(%arg0: !hal.device) -> (index, index, index) {
+    %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
+    hal.return %x, %y, %z : index, index, index
+  }
+  builtin.module {
+    func.func @dispatch() {
+      return
+    }
+  }
+}
+}
+
+//      CHECK: builtin.module attributes
+// CHECK-SAME: spirv.target_env = #spirv.target_env<#spirv.vce<v1.6,
+// CHECK-SAME:   [Shader, Float16,
+// CHECK-SAME:    StorageBuffer16BitAccess, StorageUniform16, StoragePushConstant16,
+// CHECK-SAME:    CooperativeMatrixKHR, BFloat16TypeKHR, BFloat16CooperativeMatrixKHR],
+// CHECK-SAME:   [SPV_KHR_16bit_storage, SPV_KHR_cooperative_matrix, SPV_KHR_bfloat16]>,
+// CHECK-SAME:   Apple,
+// CHECK-SAME:   #spirv.resource_limits<max_compute_shared_memory_size = 32768,
+// CHECK-SAME:     max_compute_workgroup_invocations = 1024, max_compute_workgroup_size = [1024 : i32, 1024 : i32, 1024 : i32],
+// CHECK-SAME:     min_subgroup_size = 32, max_subgroup_size = 32,
+// CHECK-SAME:     cooperative_matrix_properties_khr = [
+// CHECK-SAME:       #spirv.coop_matrix_props_khr<m_size = 8, n_size = 8, k_size = 8, a_type = f16, b_type = f16, c_type = f32, result_type = f32, acc_sat = false, scope = <Subgroup>>,
+// CHECK-SAME:       #spirv.coop_matrix_props_khr<m_size = 8, n_size = 8, k_size = 8, a_type = bf16, b_type = bf16, c_type = f32, result_type = f32, acc_sat = false, scope = <Subgroup>>,
+// CHECK-SAME:       #spirv.coop_matrix_props_khr<m_size = 16, n_size = 16, k_size = 16, a_type = f16, b_type = f16, c_type = f32, result_type = f32, acc_sat = false, scope = <Subgroup>>
+// CHECK-SAME: ]>>

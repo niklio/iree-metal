@@ -66,6 +66,11 @@ def SPIRV_WinogradVectorize
 // the coop matrix units, keeping the [T,T] scores un-materialized.
 def SPIRV_VectorDistributeAttention
     : I32EnumAttrCase<"SPIRVVectorDistributeAttention", 207>;
+// Apple/Metal lowering for intrinsic-based vector-distributed attention.
+// This has a distinct serialized value because its pass graph and vector
+// legalization requirements differ from the generic SPIR-V attention path.
+def SPIRV_AppleVectorDistributeAttention
+    : I32EnumAttrCase<"SPIRVAppleVectorDistributeAttention", 208>;
 
 def VMVX_Default : I32EnumAttrCase<"VMVXDefault", 300>;
 
@@ -96,7 +101,7 @@ def DispatchLoweringPassPipelineEnum : I32EnumAttr<
     SPIRV_BaseLowering, SPIRV_BaseDistribute, SPIRV_BaseVectorize,
     SPIRV_SubgroupReduce, SPIRV_MatmulPromoteVectorize,
     SPIRV_CooperativeMatrixVectorize, SPIRV_WinogradVectorize,
-    SPIRV_VectorDistributeAttention,
+    SPIRV_VectorDistributeAttention, SPIRV_AppleVectorDistributeAttention,
 
     VMVX_Default,
 

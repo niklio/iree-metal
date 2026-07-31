@@ -597,6 +597,11 @@ def ForOpCanonicalizationPass :
   InterfacePass<"iree-codegen-canonicalize-scf-for", "mlir::FunctionOpInterface"> {
   let summary =
       "Adhoc canonicalization of selected loop-carried values/dependencies for scf.for ops";
+  let options = [
+    Option<"explodeLargeVectors", "explode-large-vectors", "bool",
+      /*default=*/"false",
+      "Explode large vector loop-carried values into scalar iter_args">,
+  ];
 }
 
 def FuseTensorPadWithConsumerPass :

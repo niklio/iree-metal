@@ -1264,7 +1264,7 @@ IREE::GPU::TargetAttr getCLGPUTarget(MLIRContext *context) {
     } else if (StringRef(clTestTarget).starts_with("adreno")) {
       backend = "vulkan";
     } else if (StringRef(clTestTarget).starts_with("apple")) {
-      backend = "vulkan";
+      backend = "metal";
     } else if (StringRef(clTestTarget).starts_with("valhall")) {
       backend = "vulkan";
     }

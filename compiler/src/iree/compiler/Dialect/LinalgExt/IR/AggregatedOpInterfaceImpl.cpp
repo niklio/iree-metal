@@ -208,6 +208,20 @@ static Value applyPostQKMatmulElementwise(OpBuilder &builder, Location loc,
   return genericOp.getResult(0);
 }
 
+static bool isIntegerMask(Value mask) {
+  return isa<IntegerType>(getElementTypeOrSelf(mask.getType()));
+}
+
+static Value getIntegerMaskCondition(OpBuilder &builder, Location loc,
+                                     Value mask) {
+  auto maskType = cast<IntegerType>(mask.getType());
+  if (maskType.getWidth() == 1) {
+    return mask;
+  }
+  // Preserve compatibility with the legacy i8 boolean-mask representation.
+  return arith::TruncIOp::create(builder, loc, builder.getI1Type(), mask);
+}
+
 static Value applyMask(OpBuilder &builder, Location loc, AffineMap qkMap,
                        AffineMap maskMap, Value qk, Value mask, bool useExp2) {
 
@@ -219,28 +233,32 @@ static Value applyMask(OpBuilder &builder, Location loc, AffineMap qkMap,
   SmallVector<utils::IteratorType> iteratorTypes(qkMap.getNumDims(),
                                                  utils::IteratorType::parallel);
 
-  Value zero = arith::ConstantOp::create(
+  auto qkElementType = cast<FloatType>(getElementTypeOrSelf(qk.getType()));
+  // Keep the sentinel finite. GPU fast-math modes may not preserve infinities
+  // and can incorrectly fold a dynamic mask whose false value is -infinity.
+  // Integer masks are reapplied after exponentiation so masked elements are
+  // exactly zero even when this sentinel is also the row maximum.
+  Value maskedOut = arith::ConstantOp::create(
       builder, loc,
-      builder.getFloatAttr(getElementTypeOrSelf(qk.getType()), 0.0));
-  Value negInf = arith::ConstantOp::create(
-      builder, loc,
-      builder.getFloatAttr(getElementTypeOrSelf(qk.getType()),
-                           -std::numeric_limits<double>::infinity()));
+      builder.getFloatAttr(
+          qkElementType, APFloat::getLargest(qkElementType.getFloatSemantics(),
+                                             /*Negative=*/true)));
   auto genericOp = linalg::GenericOp::create(
       builder, loc, qk.getType(), SmallVector<Value>{mask}, qk,
       SmallVector<AffineMap>{maskMap, qkMap}, iteratorTypes,
       [&](OpBuilder &b, Location loc, ValueRange args) {
         Value qkVal = args[1];
         Value maskVal = args[0];
+        Value maskedQkVal;
 
-        // TODO: Replace bool mask condition once treated as i1 (instead of i8)
+        // TODO: Remove legacy integer truncation once all bool masks are i1.
         auto maskValType = maskVal.getType();
         if (maskValType.isInteger()) {
-          if (maskValType.getIntOrFloatBitWidth() != 1) {
-            maskVal =
-                arith::TruncIOp::create(b, loc, builder.getI1Type(), maskVal);
-          }
-          maskVal = arith::SelectOp::create(b, loc, maskVal, zero, negInf);
+          maskVal = getIntegerMaskCondition(b, loc, maskVal);
+          // Select the final score directly so adding an extreme score cannot
+          // overflow the finite sentinel back to an infinity.
+          maskedQkVal =
+              arith::SelectOp::create(b, loc, maskVal, qkVal, maskedOut);
         } else {
           maskVal = convertScalarToDtype(b, loc, maskVal, qkVal.getType(),
                                          /*isUnsignedCast=*/false);
@@ -250,15 +268,40 @@ static Value applyMask(OpBuilder &builder, Location loc, AffineMap qkMap,
                 b, loc, b.getFloatAttr(qkVal.getType(), M_LOG2E));
             maskVal = arith::MulFOp::create(b, loc, maskVal, log2e);
           }
+          // Floating masks use the additive attention-mask definition.
+          maskedQkVal = arith::AddFOp::create(b, loc, qkVal, maskVal);
         }
-        // Finally, set the returned value to the qk element plus the mask
-        // element (or 0/-infinity if bool mask). We opt for a AddFOp (instead
-        // of a SelectFOp to stay consistent with the additive definition of
-        // attention masking)
-        Value add = arith::AddFOp::create(b, loc, qkVal, maskVal);
-        linalg::YieldOp::create(b, loc, add);
+        linalg::YieldOp::create(b, loc, maskedQkVal);
       });
 
+  return genericOp.getResult(0);
+}
+
+// Set weights excluded by an integer mask to exactly zero. This must happen
+// after exponentiation: a finite masked score can equal the row maximum for an
+// all-false row or an unmasked score at the minimum finite value.
+static Value applyIntegerMaskToWeights(OpBuilder &builder, Location loc,
+                                       AffineMap weightMap, AffineMap maskMap,
+                                       Value weights, Value mask) {
+  SmallVector<AffineMap> compressedMaps =
+      compressUnusedDims(SmallVector<AffineMap>{weightMap, maskMap});
+  weightMap = compressedMaps[0];
+  maskMap = compressedMaps[1];
+
+  SmallVector<utils::IteratorType> iteratorTypes(weightMap.getNumDims(),
+                                                 utils::IteratorType::parallel);
+  Value zero = arith::ConstantOp::create(
+      builder, loc,
+      builder.getZeroAttr(getElementTypeOrSelf(weights.getType())));
+  auto genericOp = linalg::GenericOp::create(
+      builder, loc, weights.getType(), SmallVector<Value>{mask}, weights,
+      SmallVector<AffineMap>{maskMap, weightMap}, iteratorTypes,
+      [&](OpBuilder &b, Location loc, ValueRange args) {
+        Value condition = getIntegerMaskCondition(b, loc, args[0]);
+        Value maskedWeight =
+            arith::SelectOp::create(b, loc, condition, args[1], zero);
+        linalg::YieldOp::create(b, loc, maskedWeight);
+      });
   return genericOp.getResult(0);
 }
 
@@ -284,6 +327,47 @@ static Value computeSubAndExp(OpBuilder &builder, Location loc,
         Value weight = useExp2 ? math::Exp2Op::create(b, loc, diff).getResult()
                                : math::ExpOp::create(b, loc, diff).getResult();
         linalg::YieldOp::create(b, loc, weight);
+      });
+  return genericOp.getResult(0);
+}
+
+// Compute weights / sum. For an integer mask, define a zero-sum row to
+// normalize to zero because an all-false mask produces that denominator.
+static Value normalizeAttentionWeights(OpBuilder &builder, Location loc,
+                                       AffineMap weightMap, AffineMap sumMap,
+                                       Value weights, Value sum,
+                                       bool zeroForZeroSum) {
+  SmallVector<AffineMap> compressedMaps =
+      compressUnusedDims(SmallVector<AffineMap>{weightMap, sumMap});
+  weightMap = compressedMaps[0];
+  sumMap = compressedMaps[1];
+
+  SmallVector<utils::IteratorType> iteratorTypes(weightMap.getNumDims(),
+                                                 utils::IteratorType::parallel);
+  auto genericOp = linalg::GenericOp::create(
+      builder, loc, weights.getType(), sum, weights,
+      SmallVector<AffineMap>{sumMap, weightMap}, iteratorTypes,
+      [&](OpBuilder &b, Location loc, ValueRange args) {
+        auto weightType = cast<FloatType>(args[1].getType());
+        Value sum = convertScalarToDtype(b, loc, args[0], weightType,
+                                         /*isUnsignedCast=*/false);
+        if (!zeroForZeroSum) {
+          Value normalized = arith::DivFOp::create(b, loc, args[1], sum);
+          linalg::YieldOp::create(b, loc, normalized);
+          return;
+        }
+
+        Value zero =
+            arith::ConstantOp::create(b, loc, b.getFloatAttr(weightType, 0.0));
+        Value one =
+            arith::ConstantOp::create(b, loc, b.getFloatAttr(weightType, 1.0));
+        Value sumIsZero =
+            arith::CmpFOp::create(b, loc, arith::CmpFPredicate::OEQ, sum, zero);
+        Value safeSum = arith::SelectOp::create(b, loc, sumIsZero, one, sum);
+        Value normalized = arith::DivFOp::create(b, loc, args[1], safeSum);
+        normalized =
+            arith::SelectOp::create(b, loc, sumIsZero, zero, normalized);
+        linalg::YieldOp::create(b, loc, normalized);
       });
   return genericOp.getResult(0);
 }
@@ -487,12 +571,19 @@ FailureOr<SmallVector<Value>> AttentionOp::decomposeOperation(OpBuilder &b) {
   // P = exp2(S - max)
   AffineMap pMap = sMap;
   Value p = computeSubAndExp(b, loc, maxMap, sMap, max, s, /*useExp2=*/true);
+  // Optional operands are represented as an engaged optional containing a
+  // null Value when absent, so test the Value rather than optional engagement.
+  bool hasIntegerMask = mask != nullptr && isIntegerMask(*mask);
+  if (hasIntegerMask) {
+    p = applyIntegerMaskToWeights(b, loc, pMap, *getMaskMap(), p, *mask);
+  }
 
   // sum = rowSum(P)
   Value sum = reduce<arith::AddFOp>(b, loc, pMap, sumMap, p, sumFill);
 
   // P = P / sum
-  p = elementwiseValueInPlace<arith::DivFOp>(b, loc, pMap, sumMap, p, sum);
+  p = normalizeAttentionWeights(b, loc, pMap, sumMap, p, sum,
+                                /*zeroForZeroSum=*/hasIntegerMask);
 
   // ---- Scale and truncate LHS to match RHS ----
   SmallVector<OpFoldResult> sSizes;
@@ -588,6 +679,9 @@ OnlineAttentionOp::decomposeOperation(OpBuilder &b) {
   // PMap = SMap
   AffineMap pMap = sMap;
   Value p = computeSubAndExp(b, loc, maxMap, sMap, newMax, s, useExp2);
+  if (mask != nullptr && isIntegerMask(*mask)) {
+    p = applyIntegerMaskToWeights(b, loc, pMap, *getMaskMap(), p, *mask);
+  }
 
   // newSum = normSum + rowSum(P)
   Value newSum = reduce<arith::AddFOp>(b, loc, pMap, sumMap, p, normSum);

@@ -20,4 +20,15 @@ iree_lit_test_suite(
     iree-opt
 )
 
+iree_cc_test(
+  NAME
+    MSLToMetalLibTest
+  SRCS
+    "MSLToMetalLibTest.cpp"
+  DEPS
+    gtest
+    iree::compiler::plugins::target::MetalSPIRV::MSLToMetalLib
+    iree::testing::gtest_main
+)
+
 ### BAZEL_TO_CMAKE_PRESERVES_ALL_CONTENT_BELOW_THIS_LINE ###

@@ -25,6 +25,7 @@ struct MetalShader {
     uint32_t y;
     uint32_t z;
   } threadgroupSize;
+  uint32_t languageVersion;
 };
 
 // Cross compiles SPIR-V into Metal Shading Language source code for the

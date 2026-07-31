@@ -718,9 +718,13 @@ setAttentionPipelineAttributes(IREE::GPU::TargetAttr target,
           target.getContext(), IREE::Codegen::DenormalFpMath::PreserveSign));
 }
 
-static LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
+// iree-metal (attn vdist port): exposed + pipeline-parameterized so the
+// metal-spirv attention path can reuse this schedule/basis/decomposition config
+// (default keeps the LLVMGPU pipeline for existing callers).
+LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
     IREE::GPU::TargetAttr target, mlir::FunctionOpInterface entryPoint,
-    IREE::LinalgExt::AttentionOp op) {
+    IREE::LinalgExt::AttentionOp op,
+    IREE::Codegen::DispatchLoweringPassPipeline pipeline) {
   if (target.getWgp().getMma().empty()) {
     return failure();
   }
@@ -791,6 +795,9 @@ static LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
   Value qMatrix = op.getQuery();
   Value kMatrix = op.getKey();
   Value vMatrix = op.getValue();
+  const bool requiresAppleSimdgroupMma =
+      pipeline == IREE::Codegen::DispatchLoweringPassPipeline::
+                      SPIRVAppleVectorDistributeAttention;
 
   // Helper fn to store mma information.
   auto storeMmaInfo = [](IREE::GPU::MmaInterfaceAttr mma,
@@ -804,6 +811,17 @@ static LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
   intrinsics.reserve(target.getWgp().getMma().size());
   MLIRContext *context = op.getContext();
   for (IREE::GPU::MMAAttr mma : target.getWgp().getMma()) {
+    if (requiresAppleSimdgroupMma) {
+      switch (mma.getIntrinsic()) {
+      case IREE::GPU::MMAIntrinsic::APPLE_SIMDGROUP_F32_8x8x8_F16:
+      case IREE::GPU::MMAIntrinsic::APPLE_SIMDGROUP_F32_16x16x16_F16:
+      case IREE::GPU::MMAIntrinsic::APPLE_SIMDGROUP_F32_8x8x8_BF16:
+      case IREE::GPU::MMAIntrinsic::APPLE_SIMDGROUP_F32_16x16x16_BF16:
+        break;
+      default:
+        continue;
+      }
+    }
     if (mma.getSubgroupSize() != targetSubgroupSize) {
       continue;
     }
@@ -967,7 +985,28 @@ static LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
   IREE::GPU::MMASingleSubgroupLayout pvRhsLayout =
       IREE::GPU::getSingleSubgroupLayout(pvSchedule.mmaKind,
                                          IREE::GPU::kMMAOperandRhs);
-  bool useColMajor = matchLayout(qkOutLayout, pvRhsLayout);
+  auto isAppleSimdgroupIntrinsic =
+      [](IREE::Codegen::InnerTileDescAttrInterface mmaKind) {
+        auto mma = dyn_cast<IREE::GPU::MMAAttr>(mmaKind);
+        if (!mma) {
+          return false;
+        }
+        return mma.getIntrinsic() ==
+                   IREE::GPU::MMAIntrinsic::APPLE_SIMDGROUP_F32_8x8x8_F16 ||
+               mma.getIntrinsic() ==
+                   IREE::GPU::MMAIntrinsic::APPLE_SIMDGROUP_F32_16x16x16_F16 ||
+               mma.getIntrinsic() ==
+                   IREE::GPU::MMAIntrinsic::APPLE_SIMDGROUP_F32_8x8x8_BF16 ||
+               mma.getIntrinsic() ==
+                   IREE::GPU::MMAIntrinsic::APPLE_SIMDGROUP_F32_16x16x16_BF16;
+      };
+  // Apple's canonical A/B/C layouts deliberately match; the target-specific
+  // MMA terminal performs the required physical lane permutation itself.
+  // Treating that match as a request for a column-major accumulator would
+  // transpose the QK fragment and break its direct reuse by PV.
+  bool useColMajor = !isAppleSimdgroupIntrinsic(qkSchedule.mmaKind) &&
+                     !isAppleSimdgroupIntrinsic(pvSchedule.mmaKind) &&
+                     matchLayout(qkOutLayout, pvRhsLayout);
 
   auto getIntrinsic =
       [&](IREE::Codegen::InnerTileDescAttrInterface mmaKind,
@@ -1045,8 +1084,8 @@ static LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
   op.setDecompositionConfigAttr(decompositionConfigDict);
 
   return setOpConfigAndEntryPointFnTranslation(
-      entryPoint, op, loweringConfig, CodeGenPipeline::LLVMGPUVectorDistribute,
-      workgroupSize, targetSubgroupSize, pipelineConfig);
+      entryPoint, op, loweringConfig, pipeline, workgroupSize,
+      targetSubgroupSize, pipelineConfig);
 }
 
 struct AttentionReductionHeuristicSeeds {

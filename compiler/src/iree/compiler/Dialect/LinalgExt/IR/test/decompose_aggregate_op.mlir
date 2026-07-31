@@ -149,6 +149,136 @@ func.func @attention_f16(%query: tensor<192x1024x64xf16>,
 
 // -----
 
+// Spec to decompose a bool-masked attention op.
+module attributes { transform.with_named_sequence } {
+  transform.named_sequence @__transform_main(%module_op: !transform.any_op {transform.readonly}) {
+    %0 = transform.structured.match ops{["iree_linalg_ext.attention"]} in %module_op : (!transform.any_op) -> !transform.any_op
+    transform.iree.decompose_aggregate_op %0 : (!transform.any_op) -> ()
+    transform.yield
+  }
+}
+
+#mapQ = affine_map<(batch, m, k1, k2, n) -> (batch, m, k1)>
+#mapK = affine_map<(batch, m, k1, k2, n) -> (batch, k2, k1)>
+#mapV = affine_map<(batch, m, k1, k2, n) -> (batch, k2, n)>
+#mapS = affine_map<(batch, m, k1, k2, n) -> ()>
+#mapM = affine_map<(batch, m, k1, k2, n) -> (batch, m, k2)>
+#mapO = affine_map<(batch, m, k1, k2, n) -> (batch, m, n)>
+
+func.func @attention_f16_bool_mask(
+    %query: tensor<192x1024x64xf16>,
+    %key: tensor<192x1024x64xf16>,
+    %value: tensor<192x1024x64xf16>,
+    %mask: tensor<192x1024x1024xi1>,
+    %output: tensor<192x1024x64xf32>)
+    -> tensor<192x1024x64xf32> {
+  %scale = arith.constant 1.0 : f16
+  %out = iree_linalg_ext.attention
+      {indexing_maps = [#mapQ, #mapK, #mapV, #mapS, #mapM, #mapO]}
+      ins(%query, %key, %value, %scale, %mask :
+          tensor<192x1024x64xf16>, tensor<192x1024x64xf16>,
+          tensor<192x1024x64xf16>, f16, tensor<192x1024x1024xi1>)
+      outs(%output : tensor<192x1024x64xf32>) {
+    ^bb0(%score: f32):
+      iree_linalg_ext.yield %score : f32
+  } -> tensor<192x1024x64xf32>
+  return %out : tensor<192x1024x64xf32>
+}
+
+// The first row is entirely masked. The second row has a masked and an
+// unmasked score that are both the minimum finite f32 value, so score value
+// alone cannot distinguish which exponential must be zeroed.
+func.func @attention_f32_bool_mask_edge_rows(
+    %query: tensor<1x2x1xf32>,
+    %key: tensor<1x2x1xf32>,
+    %value: tensor<1x2x1xf32>,
+    %output: tensor<1x2x1xf32>)
+    -> tensor<1x2x1xf32> {
+  %scale = arith.constant 1.0 : f32
+  %mask = arith.constant dense<[[[false, false], [false, true]]]> :
+      tensor<1x2x2xi1>
+  %out = iree_linalg_ext.attention
+      {indexing_maps = [#mapQ, #mapK, #mapV, #mapS, #mapM, #mapO]}
+      ins(%query, %key, %value, %scale, %mask :
+          tensor<1x2x1xf32>, tensor<1x2x1xf32>, tensor<1x2x1xf32>, f32,
+          tensor<1x2x2xi1>)
+      outs(%output : tensor<1x2x1xf32>) {
+    ^bb0(%score: f32):
+      %min_finite = arith.constant -3.40282347E+38 : f32
+      iree_linalg_ext.yield %min_finite : f32
+  } -> tensor<1x2x1xf32>
+  return %out : tensor<1x2x1xf32>
+}
+
+// Keep supporting the legacy 0/1 i8 mask representation while i1 masks are
+// being adopted by all attention producers.
+func.func @attention_f32_i8_mask(
+    %query: tensor<1x2x1xf32>,
+    %key: tensor<1x2x1xf32>,
+    %value: tensor<1x2x1xf32>,
+    %mask: tensor<1x2x2xi8>,
+    %output: tensor<1x2x1xf32>)
+    -> tensor<1x2x1xf32> {
+  %scale = arith.constant 1.0 : f32
+  %out = iree_linalg_ext.attention
+      {indexing_maps = [#mapQ, #mapK, #mapV, #mapS, #mapM, #mapO]}
+      ins(%query, %key, %value, %scale, %mask :
+          tensor<1x2x1xf32>, tensor<1x2x1xf32>, tensor<1x2x1xf32>, f32,
+          tensor<1x2x2xi8>)
+      outs(%output : tensor<1x2x1xf32>) {
+    ^bb0(%score: f32):
+      iree_linalg_ext.yield %score : f32
+  } -> tensor<1x2x1xf32>
+  return %out : tensor<1x2x1xf32>
+}
+
+// CHECK-LABEL: @attention_f16_bool_mask
+// CHECK-DAG: %[[MASKED_OUT:.+]] = arith.constant -3.40282347E+38 : f32
+// CHECK-DAG: %[[ZERO:.+]] = arith.constant 0.000000e+00 : f32
+// CHECK-DAG: %[[ONE:.+]] = arith.constant 1.000000e+00 : f32
+// CHECK: ^bb0(%[[MASK:.+]]: i1, %[[SCORE:.+]]: f32):
+// CHECK: %[[MASKED_SCORE:.+]] = arith.select %[[MASK]], %[[SCORE]], %[[MASKED_OUT]] : f32
+// CHECK-NEXT: linalg.yield %[[MASKED_SCORE]] : f32
+// CHECK: math.exp2
+// CHECK: linalg.generic
+// CHECK: ^bb0(%[[EXP_MASK:.+]]: i1, %[[WEIGHT:.+]]: f32):
+// CHECK-NEXT: %[[MASKED_WEIGHT:.+]] = arith.select %[[EXP_MASK]], %[[WEIGHT]], %[[ZERO]] : f32
+// CHECK-NEXT: linalg.yield %[[MASKED_WEIGHT]] : f32
+// CHECK: linalg.generic
+// CHECK: arith.addf
+// CHECK: linalg.generic
+// CHECK: ^bb0(%[[SUM:.+]]: f32, %[[NORM_WEIGHT:.+]]: f32):
+// CHECK-NEXT: %[[SUM_IS_ZERO:.+]] = arith.cmpf oeq, %[[SUM]], %[[ZERO]] : f32
+// CHECK-NEXT: %[[SAFE_SUM:.+]] = arith.select %[[SUM_IS_ZERO]], %[[ONE]], %[[SUM]] : f32
+// CHECK-NEXT: %[[NORMALIZED:.+]] = arith.divf %[[NORM_WEIGHT]], %[[SAFE_SUM]] : f32
+// CHECK-NEXT: %[[ZERO_IF_EMPTY:.+]] = arith.select %[[SUM_IS_ZERO]], %[[ZERO]], %[[NORMALIZED]] : f32
+// CHECK-NEXT: linalg.yield %[[ZERO_IF_EMPTY]] : f32
+// CHECK-NOT: arith.constant 0xFF800000 : f32
+
+// CHECK-LABEL: @attention_f32_bool_mask_edge_rows
+// CHECK-DAG: arith.constant -3.40282347E+38 : f32
+// CHECK-DAG: arith.constant dense<{{.*false, false.*false, true.*}}> : tensor<1x2x2xi1>
+// CHECK: math.exp2
+// CHECK: ^bb0(%[[EDGE_MASK:.+]]: i1, %[[EDGE_WEIGHT:.+]]: f32):
+// CHECK-NEXT: %[[EDGE_MASKED_WEIGHT:.+]] = arith.select %[[EDGE_MASK]], %[[EDGE_WEIGHT]], %{{.+}} : f32
+// CHECK-NEXT: linalg.yield %[[EDGE_MASKED_WEIGHT]] : f32
+// CHECK: arith.cmpf oeq
+// CHECK: arith.divf
+// CHECK: arith.select
+
+// CHECK-LABEL: @attention_f32_i8_mask
+// CHECK: ^bb0(%[[I8_MASK:.+]]: i8, %[[I8_SCORE:.+]]: f32):
+// CHECK-NEXT: %[[I1_MASK:.+]] = arith.trunci %[[I8_MASK]] : i8 to i1
+// CHECK-NEXT: %[[I8_MASKED_SCORE:.+]] = arith.select %[[I1_MASK]], %[[I8_SCORE]], %{{.+}} : f32
+// CHECK-NEXT: linalg.yield %[[I8_MASKED_SCORE]] : f32
+// CHECK: math.exp2
+// CHECK: ^bb0(%[[I8_EXP_MASK:.+]]: i8, %[[I8_WEIGHT:.+]]: f32):
+// CHECK-NEXT: %[[I1_EXP_MASK:.+]] = arith.trunci %[[I8_EXP_MASK]] : i8 to i1
+// CHECK-NEXT: %[[I8_MASKED_WEIGHT:.+]] = arith.select %[[I1_EXP_MASK]], %[[I8_WEIGHT]], %{{.+}} : f32
+// CHECK-NEXT: linalg.yield %[[I8_MASKED_WEIGHT]] : f32
+
+// -----
+
 // Spec to decompose online attention op.
 module attributes { transform.with_named_sequence } {
   transform.named_sequence @__transform_main(%module_op: !transform.any_op {transform.readonly}) {
@@ -162,6 +292,7 @@ module attributes { transform.with_named_sequence } {
 #mapK = affine_map<(batch, m, k1, k2, n) -> (batch, k2, k1)>
 #mapV = affine_map<(batch, m, k1, k2, n) -> (batch, k2, n)>
 #mapS = affine_map<(batch, m, k1, k2, n) -> ()>
+#mapM = affine_map<(batch, m, k1, k2, n) -> (batch, m, k2)>
 #mapO = affine_map<(batch, m, k1, k2, n) -> (batch, m, n)>
 #mapR = affine_map<(batch, m, k1, k2, n) -> (batch, m)>
 
@@ -184,6 +315,29 @@ func.func @online_attention_f16(%query: tensor<192x1024x64xf16>,
         -> tensor<192x1024x64xf32>, tensor<192x1024xf32>, tensor<192x1024xf32>
 
   return %out#0, %out#2 : tensor<192x1024x64xf32>, tensor<192x1024xf32>
+}
+
+func.func @online_attention_f32_bool_mask(
+    %query: tensor<1x2x1xf32>,
+    %key: tensor<1x2x1xf32>,
+    %value: tensor<1x2x1xf32>,
+    %mask: tensor<1x2x2xi1>,
+    %output: tensor<1x2x1xf32>,
+    %max: tensor<1x2xf32>,
+    %sum: tensor<1x2xf32>)
+    -> (tensor<1x2x1xf32>, tensor<1x2xf32>) {
+  %scale = arith.constant 1.0 : f32
+  %out:3 = iree_linalg_ext.online_attention
+      {indexing_maps = [#mapQ, #mapK, #mapV, #mapS, #mapM, #mapO, #mapR, #mapR]}
+      ins(%query, %key, %value, %scale, %mask :
+          tensor<1x2x1xf32>, tensor<1x2x1xf32>, tensor<1x2x1xf32>, f32,
+          tensor<1x2x2xi1>)
+      outs(%output, %max, %sum :
+          tensor<1x2x1xf32>, tensor<1x2xf32>, tensor<1x2xf32>) {
+    ^bb0(%score: f32):
+      iree_linalg_ext.yield %score : f32
+  } -> tensor<1x2x1xf32>, tensor<1x2xf32>, tensor<1x2xf32>
+  return %out#0, %out#2 : tensor<1x2x1xf32>, tensor<1x2xf32>
 }
 
 // We just want to check if we are using the correct algorithm and the
@@ -239,6 +393,19 @@ func.func @online_attention_f16(%query: tensor<192x1024x64xf16>,
 // CHECK:   arith.mulf
 // CHECK:   arith.addf
 // CHECK:   linalg.yield
+
+// CHECK-LABEL: @online_attention_f32_bool_mask
+// CHECK-DAG: %[[ONLINE_MASKED_OUT:.+]] = arith.constant -3.40282347E+38 : f32
+// CHECK-DAG: %[[ONLINE_ZERO:.+]] = arith.constant 0.000000e+00 : f32
+// CHECK: ^bb0(%[[ONLINE_SCORE_MASK:.+]]: i1, %[[ONLINE_SCORE:.+]]: f32):
+// CHECK-NEXT: %[[ONLINE_MASKED_SCORE:.+]] = arith.select %[[ONLINE_SCORE_MASK]], %[[ONLINE_SCORE]], %[[ONLINE_MASKED_OUT]] : f32
+// CHECK-NEXT: linalg.yield %[[ONLINE_MASKED_SCORE]] : f32
+// CHECK: math.exp2
+// CHECK: math.exp2
+// CHECK: linalg.generic
+// CHECK: ^bb0(%[[ONLINE_EXP_MASK:.+]]: i1, %[[ONLINE_WEIGHT:.+]]: f32):
+// CHECK-NEXT: %[[ONLINE_MASKED_WEIGHT:.+]] = arith.select %[[ONLINE_EXP_MASK]], %[[ONLINE_WEIGHT]], %[[ONLINE_ZERO]] : f32
+// CHECK-NEXT: linalg.yield %[[ONLINE_MASKED_WEIGHT]] : f32
 
 // -----
 

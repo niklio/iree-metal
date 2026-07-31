@@ -142,12 +142,81 @@ struct BreakDownCastExtractExtend final : OpRewritePattern<arith::ExtUIOp> {
   }
 };
 
+// Rebuilds a small 1-D subvector directly from the scalar inserts that define
+// it. The generic vector.extract canonicalization deliberately stops when a
+// scalar insert intersects a subvector extraction:
+//
+//   %0 = vector.insert %x, %base[0, 0, 0, 0] : ...
+//   %1 = vector.insert %y, %0[0, 0, 0, 1] : ...
+//   %2 = vector.extract %1[0, 0, 0] : vector<2xf16> from ...
+//
+// This leaves the large aggregate live even though all elements of the
+// extracted subvector are available as scalars. Such aggregates cannot be
+// represented by SPIR-V. Only fold when every element can be resolved through
+// static scalar inserts, so this is semantics-preserving for arbitrary source
+// vectors (the chain does not need to start at poison).
+struct FoldExtractFromScalarInsertChain final
+    : OpRewritePattern<vector::ExtractOp> {
+  using Base::Base;
+
+  LogicalResult matchAndRewrite(vector::ExtractOp extractOp,
+                                PatternRewriter &rewriter) const override {
+    auto resultType = dyn_cast<VectorType>(extractOp.getType());
+    VectorType sourceType = extractOp.getSourceVectorType();
+    if (!resultType || resultType.getRank() != 1 || resultType.isScalable() ||
+        sourceType.isScalable() || resultType.getNumElements() > 4 ||
+        sourceType.getNumElements() <= 4 || extractOp.hasDynamicPosition() ||
+        extractOp.getNumIndices() + 1 != sourceType.getRank()) {
+      return failure();
+    }
+
+    SmallVector<Value> elements;
+    elements.reserve(resultType.getNumElements());
+    for (int64_t elementIndex = 0; elementIndex < resultType.getNumElements();
+         ++elementIndex) {
+      SmallVector<int64_t> desiredPosition(
+          extractOp.getStaticPosition().begin(),
+          extractOp.getStaticPosition().end());
+      desiredPosition.push_back(elementIndex);
+
+      Value source = extractOp.getSource();
+      Value element;
+      while (auto insertOp = source.getDefiningOp<vector::InsertOp>()) {
+        if (insertOp.hasDynamicPosition() ||
+            isa<VectorType>(insertOp.getValueToStore().getType())) {
+          return failure();
+        }
+        ArrayRef<int64_t> insertPosition = insertOp.getStaticPosition();
+        if (insertPosition.size() != desiredPosition.size() ||
+            llvm::any_of(insertPosition,
+                         [](int64_t position) { return position < 0; })) {
+          return failure();
+        }
+        if (insertPosition == ArrayRef<int64_t>(desiredPosition)) {
+          element = insertOp.getValueToStore();
+          break;
+        }
+        source = insertOp.getDest();
+      }
+      if (!element) {
+        return failure();
+      }
+      elements.push_back(element);
+    }
+
+    rewriter.replaceOpWithNewOp<vector::FromElementsOp>(extractOp, resultType,
+                                                        elements);
+    return success();
+  }
+};
+
 struct SPIRVBreakDownLargeVectorPass final
     : impl::SPIRVBreakDownLargeVectorPassBase<SPIRVBreakDownLargeVectorPass> {
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
-    patterns.add<BreakDownCastExtractExtend>(context, /*benefits=*/10);
+    patterns.add<BreakDownCastExtractExtend, FoldExtractFromScalarInsertChain>(
+        context, /*benefits=*/10);
     // Convert vector.extract_strided_slice into a chain of vector.extract and
     // then a chain of vector.insert ops. This helps to cancel with previous
     // vector.insert/extract ops, especially for fP16 cases where we have

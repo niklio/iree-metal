@@ -151,10 +151,13 @@ static void addTileAndDistributeToWorkgroupsPasses(
 }
 
 /// Adds passes to lower vector ops to meet SPIR-V requirements.
-void addSPIRVVectorLoweringPasses(OpPassManager &funcPassManager) {
+void addSPIRVVectorLoweringPasses(OpPassManager &funcPassManager,
+                                  bool dropUnitDims) {
   funcPassManager.addPass(createSPIRVInitialVectorLoweringPass());
   funcPassManager.addPass(createOptimizeTensorInsertExtractSlicesPass());
-  funcPassManager.addPass(createSPIRVFinalVectorLoweringPass());
+  SPIRVFinalVectorLoweringPassOptions options;
+  options.dropUnitDims = dropUnitDims;
+  funcPassManager.addPass(createSPIRVFinalVectorLoweringPass(options));
 }
 
 static void addBufferizePasses(OpPassManager &funcPassManager,
@@ -249,15 +252,11 @@ static void addMemRefLoweringPasses(OpPassManager &modulePassManager) {
   modulePassManager.addPass(createFlattenMemRefSubspanPass());
 
   FunctionLikeNest funcNest(modulePassManager);
-  // Coop-attention WIP: flattening the per-workgroup O/scratch views emits 1-D
-  // subviews of the storage buffer that feed gpu.subgroup_mma_load/store. Fold
-  // them into the mma ops here (absorbing the base offset into the access
-  // indices) so nothing strided survives to ConvertToSPIRV. Gated to keep the
-  // default (deployed) pipeline byte-for-byte unchanged.
-  if (getenv("IREE_METAL_COOP_ATTENTION_WIP")) {
-    funcNest.addPass(memref::createFoldMemRefAliasOpsPass);
-  }
-  funcNest.addPass(createSPIRVEraseStorageBufferStaticShapePass)
+  // Flattening can expose new one-dimensional subviews after the earlier alias
+  // fold. Absorb them into their users so no strided aliases survive to the
+  // descriptor-free SPIR-V conversion.
+  funcNest.addPass(memref::createFoldMemRefAliasOpsPass)
+      .addPass(createSPIRVEraseStorageBufferStaticShapePass)
       .addPass(createCSEPass);
 }
 
@@ -845,28 +844,6 @@ struct QkScoreBarrierPass
 
 void addSPIRVVectorDistributeAttentionPassPipeline(
     OpPassManager &funcPassManager) {
-  // iree-metal (IREE_METAL_ATTN_VDIST, attn port M0): run the full LLVMGPU vector-distribute
-  // attention pipeline on the metal path (reused via a temporary SPIRV->LLVMGPU dep;
-  // roadmap #1 moves those passes to Common/GPU). It does its own workgroup tiling +
-  // tile levels + ConfigureTensorLayouts + VectorDistribute, so short-circuit the SPIRV
-  // coop-tile path entirely. The Apple fragment layout (getSingleSubgroupLayout NV_WMMA
-  // @545) + terminal (createMmaOp Apple branch) are what make it reach the simdgroup
-  // matrix units with the softmax co-located on-fragment (no smem round-trip).
-  if (getenv("IREE_METAL_ATTN_VDIST")) {
-    IREE::GPU::GPUPipelineOptions options;
-    addGPUVectorDistributePassPipeline(funcPassManager, options,
-                                       /*forROCDL=*/false);
-    // The LLVMGPU pipeline targets NVVM/ROCDL, which accept multi-dim vectors;
-    // SPIR-V needs rank-1 vectors + its own vector lowering. Break down the
-    // distributed vectors and run the SPIR-V vector-lowering tail so the generic
-    // (thread-distributed) attention legalizes to SPIR-V.
-    funcPassManager.addPass(createSPIRVBreakDownLargeVectorPass());
-    addSPIRVVectorLoweringPasses(funcPassManager);
-    funcPassManager.addPass(createSPIRVBreakDownLargeVectorPass());
-    funcPassManager.addPass(createCanonicalizerPass());
-    funcPassManager.addPass(createCSEPass());
-    return;
-  }
   addTileAndDistributeToWorkgroupsPasses(
       funcPassManager, /*useFuseTensorPadWithConsumerPass=*/true);
   funcPassManager.addPass(createFoldAffineMinInDistributedLoopsPass());
@@ -1174,6 +1151,38 @@ void addSPIRVVectorDistributeAttentionPassPipeline(
   }
   addLoopMaterializationPasses(funcPassManager);
   funcPassManager.addPass(createOptimizeVectorTransferPass());
+}
+
+void addSPIRVAppleVectorDistributeAttentionPassPipeline(
+    OpPassManager &funcPassManager) {
+  // Reuse the intrinsic-based vector-distribute attention pipeline while its
+  // target-independent passes are being moved out of LLVMGPU. It performs its
+  // own tiling, layout configuration, intrinsic packing, and distribution.
+  IREE::GPU::GPUPipelineOptions options;
+  addGPUVectorDistributePassPipeline(funcPassManager, options,
+                                     /*forROCDL=*/false);
+
+  // Distributed softmax uses clustered subgroup reductions (for example, two
+  // independent 16-lane rows in an Apple 32-lane simdgroup). Metal's SPIR-V
+  // target has subgroup arithmetic but not GroupNonUniformClustered; expand
+  // clustered reductions into XOR shuffles while preserving cluster bounds.
+  funcPassManager.addPass(createExpandGPUOpsPass());
+
+  // LLVMGPU accepts multi-dimensional vectors. SPIR-V needs rank-one native
+  // vectors, so break distributed fragments down and run two explicit lowering
+  // sweeps. The first folds unit dimensions introduced by nested layouts; the
+  // second unrolls the resulting vector<8> softmax fragments.
+  funcPassManager.addPass(createSPIRVBreakDownLargeVectorPass());
+  addSPIRVVectorLoweringPasses(funcPassManager, /*dropUnitDims=*/true);
+  funcPassManager.addPass(createSPIRVBreakDownLargeVectorPass());
+  funcPassManager.addPass(createCanonicalizerPass());
+  funcPassManager.addPass(createCSEPass());
+  addSPIRVVectorLoweringPasses(funcPassManager, /*dropUnitDims=*/true);
+  ForOpCanonicalizationPassOptions forOptions;
+  forOptions.explodeLargeVectors = true;
+  funcPassManager.addPass(createForOpCanonicalizationPass(forOptions));
+  funcPassManager.addPass(createCanonicalizerPass());
+  funcPassManager.addPass(createCSEPass());
 }
 
 void addSPIRVWinogradVectorizePassPipeline(OpPassManager &funcPassManager) {

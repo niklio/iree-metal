@@ -69,3 +69,16 @@ func.func @dynamic_alloc_collapse_consumer(%id : index) {
 //       CHECK:   %[[COLLAPSE:.+]] = memref.collapse_shape %[[SUBVIEW]] {{\[}}[0, 1]]
 //  CHECK-SAME:     : memref<?x32xf32, strided<[32, 1]>, 3> into memref<?xf32, strided<[1]>, 3>
 //       CHECK:   memref.store {{.*}} %[[COLLAPSE]]{{.*}} : memref<?xf32, strided<[1]>, 3>
+
+// -----
+
+func.func @dynamic_alloc_dealloc(%id : index) {
+  %0 = util.assume.int %id<umin = 0, umax = 1024> : index
+  %1 = memref.alloc(%0) : memref<?xf32, 3>
+  memref.dealloc %1 : memref<?xf32, 3>
+  return
+}
+// CHECK-LABEL: func @dynamic_alloc_dealloc(
+//       CHECK:   %[[ALLOC:.+]] = memref.alloc() : memref<1024xf32, 3>
+//       CHECK:   memref.subview %[[ALLOC]][0] [%{{.+}}] [1]
+//       CHECK:   memref.dealloc %[[ALLOC]] : memref<1024xf32, 3>

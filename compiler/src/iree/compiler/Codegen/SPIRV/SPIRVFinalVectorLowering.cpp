@@ -47,6 +47,8 @@ class SPIRVFinalVectorLoweringPass final
     : public impl::SPIRVFinalVectorLoweringPassBase<
           SPIRVFinalVectorLoweringPass> {
 public:
+  using Base::Base;
+
   void getDependentDialects(DialectRegistry &registry) const override {
     // vector.gather lowering patterns target scf ops.
     registry.insert<scf::SCFDialect, vector::VectorDialect, ub::UBDialect>();
@@ -117,6 +119,13 @@ public:
     {
       RewritePatternSet patterns(context);
       vector::populateCastAwayVectorLeadingOneDimPatterns(patterns);
+      // Vector-distributed attention can leave online-softmax fragments shaped
+      // like vector<1x1x1x8x1x1>. SPIR-V accepts only rank-one native vectors,
+      // so its serialized pipeline enables folding unit dimensions through
+      // shape_casts before the second vector-lowering sweep.
+      if (dropUnitDims) {
+        vector::populateDropUnitDimWithShapeCastPatterns(patterns);
+      }
       vector::InsertOp::getCanonicalizationPatterns(patterns, context);
       vector::ExtractOp::getCanonicalizationPatterns(patterns, context);
       vector::TransferReadOp::getCanonicalizationPatterns(patterns, context);

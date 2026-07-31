@@ -32,7 +32,8 @@ void addSPIRVBaseDistributePassPipeline(OpPassManager &funcPassManager);
 void addSPIRVBaseVectorizePassPipeline(OpPassManager &funcPassManager);
 
 /// Adds passes to lower vector ops to meet SPIR-V requirements.
-void addSPIRVVectorLoweringPasses(OpPassManager &funcPassManager);
+void addSPIRVVectorLoweringPasses(OpPassManager &funcPassManager,
+                                  bool dropUnitDims = false);
 
 void addSPIRVCooperativeMatrixVectorizePassPipeline(
     OpPassManager &funcPassManager, unsigned pipelineDepth,
@@ -57,6 +58,10 @@ void addSPIRVWinogradVectorizePassPipeline(OpPassManager &funcPassManager);
 /// form) within codegen and tiles/vectorizes the per-tile qk/pv matmuls onto the
 /// coop matrix units, keeping the [T,T] scores un-materialized.
 void addSPIRVVectorDistributeAttentionPassPipeline(OpPassManager &funcPassManager);
+
+/// Apple/Metal intrinsic-based vector-distributed attention pipeline.
+void addSPIRVAppleVectorDistributeAttentionPassPipeline(
+    OpPassManager &funcPassManager);
 
 /// Populates passes needed to preprocess the input variant before lowering
 /// and select lowering strategies.

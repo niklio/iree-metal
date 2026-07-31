@@ -1,3 +1,21 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 707c9de..5694fc5 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -573,6 +573,13 @@ if (SPIRV_CROSS_CLI)
+ 						COMMAND $<TARGET_FILE:spirv-cross-msl-ycbcr-conversion-test> ${CMAKE_CURRENT_SOURCE_DIR}/tests-other/msl_ycbcr_conversion_test_2.spv)
+ 				add_test(NAME spirv-cross-typed-id-test
+ 						COMMAND $<TARGET_FILE:spirv-cross-typed-id-test>)
++				add_test(NAME spirv-cross-msl-apple-cooperative-matrix-test
++						COMMAND ${PYTHON_EXECUTABLE}
++						${CMAKE_CURRENT_SOURCE_DIR}/tests-other/apple_cooperative_matrix_test.py
++						--spirv-cross $<TARGET_FILE:spirv-cross>
++						--spirv-as "${spirv-cross-spirv-as}"
++						--spirv-val "${spirv-cross-spirv-val}"
++						--shader-dir ${CMAKE_CURRENT_SOURCE_DIR}/shaders-msl-no-opt/asm/comp)
+ 				add_test(NAME spirv-cross-test
+ 						COMMAND ${PYTHON_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_shaders.py --parallel
+ 						${spirv-cross-externals}
 diff --git a/spirv_glsl.cpp b/spirv_glsl.cpp
 index 81fdae0..ee9a9e2 100644
 --- a/spirv_glsl.cpp
@@ -64,10 +82,10 @@ index 78bff2d..914d066 100644
  	virtual std::string constant_expression_vector(const SPIRConstant &c, uint32_t vector);
  	virtual void emit_fixup();
 diff --git a/spirv_msl.cpp b/spirv_msl.cpp
-index a5cf13f..d0e361f 100644
+index a5cf13f..5b4483b 100644
 --- a/spirv_msl.cpp
 +++ b/spirv_msl.cpp
-@@ -5837,6 +5837,21 @@ void CompilerMSL::emit_custom_templates()
+@@ -5837,6 +5837,28 @@ void CompilerMSL::emit_custom_templates()
  	{
  		switch (spv_func)
  		{
@@ -80,8 +98,15 @@ index a5cf13f..d0e361f 100644
 +			statement("spvCoopMat() thread {}");
 +			statement("spvCoopMat(T v) thread { for (uint i = 0; i < N; i++) t[i] = "
 +			          "make_filled_simdgroup_matrix<T, 8, 8>(v); }");
-+			statement("thread simdgroup_matrix<T, 8, 8>& operator[](uint i) thread { return t[i]; }");
-+			statement("const thread simdgroup_matrix<T, 8, 8>& operator[](uint i) const thread { return t[i]; }");
++			// SPIR-V CompositeExtract/CompositeInsert index the invocation-local
++			// scalar components of a cooperative matrix, not its backing Metal
++			// tiles. Each Apple 8x8 simdgroup_matrix contributes two scalars per
++			// lane, and multi-tile cooperative matrices concatenate those pairs
++			// in tile order.
++			statement("thread T& operator[](uint i) thread { return "
++			          "reinterpret_cast<thread T *>(&t[i / 2])[i % 2]; }");
++			statement("T operator[](uint i) const thread { return "
++			          "reinterpret_cast<const thread T *>(&t[i / 2])[i % 2]; }");
 +			end_scope_decl();
 +			statement("");
 +			break;
@@ -89,24 +114,133 @@ index a5cf13f..d0e361f 100644
  		case SPVFuncImplUnsafeArray:
  			statement("template<typename T, size_t Num>");
  			statement("struct spvUnsafeArray");
-@@ -9386,6 +9401,116 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+@@ -9376,6 +9398,7 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 
+ 	auto ops = stream(instruction);
+ 	auto opcode = static_cast<Op>(instruction.op);
++	uint32_t length = instruction.length;
+ 
+ 	opcode = get_remapped_spirv_op(opcode);
+ 
+@@ -9386,6 +9409,262 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
  
  	switch (opcode)
  	{
-+	// nlearn: SPIR-V cooperative matrix -> MSL simdgroup_matrix over (R/8)x(C/8) 8x8 tiles.
-+	// A coop matrix value is array<simdgroup_matrix<T,8,8>, tr*tc>; tile (r,c) is index r*tc+c.
++	case OpCompositeConstruct:
++	{
++		auto &result_type = get<SPIRType>(ops[0]);
++		if (result_type.op != OpTypeCooperativeMatrixKHR)
++		{
++			CompilerGLSL::emit_instruction(instruction);
++			break;
++		}
++
++		auto info = validate_apple_cooperative_matrix_type(result_type);
++		validate_apple_cooperative_matrix_role(info);
++		if (length != 3)
++			SPIRV_CROSS_THROW("Apple cooperative matrices only support a one-scalar replicated "
++			                  "OpCompositeConstruct.");
++		auto &scalar_type = expression_type(ops[2]);
++		if (scalar_type.vecsize != 1 || scalar_type.columns != 1 ||
++		    scalar_type.basetype != info.element_type)
++			SPIRV_CROSS_THROW("Apple cooperative-matrix replicated construction requires a matching scalar.");
++		CompilerGLSL::emit_instruction(instruction);
++		break;
++	}
++
++	case OpCompositeExtract:
++	{
++		auto &composite_type = expression_type(ops[2]);
++		if (composite_type.op != OpTypeCooperativeMatrixKHR)
++		{
++			CompilerGLSL::emit_instruction(instruction);
++			break;
++		}
++
++		auto info = validate_apple_cooperative_matrix_type(composite_type);
++		validate_apple_cooperative_matrix_role(info);
++		if (length != 4)
++			SPIRV_CROSS_THROW("Apple cooperative-matrix OpCompositeExtract requires exactly one literal index.");
++		if (ops[3] >= info.fragment_count)
++			SPIRV_CROSS_THROW("Apple cooperative-matrix OpCompositeExtract index exceeds the per-lane "
++			                  "fragment count.");
++		if (apple_cooperative_matrix_conversion_source_types.count(ops[2]) != 0)
++			SPIRV_CROSS_THROW("A widened Apple cooperative-matrix view may only be consumed by "
++			                  "OpCooperativeMatrixMulAddKHR.");
++		CompilerGLSL::emit_instruction(instruction);
++		break;
++	}
++
++	case OpCompositeInsert:
++	{
++		auto &result_type = get<SPIRType>(ops[0]);
++		if (result_type.op != OpTypeCooperativeMatrixKHR)
++		{
++			CompilerGLSL::emit_instruction(instruction);
++			break;
++		}
++
++		auto result_info = validate_apple_cooperative_matrix_type(result_type);
++		validate_apple_cooperative_matrix_role(result_info);
++		if (length != 5)
++			SPIRV_CROSS_THROW("Apple cooperative-matrix OpCompositeInsert requires exactly one literal index.");
++		if (ops[4] >= result_info.fragment_count)
++			SPIRV_CROSS_THROW("Apple cooperative-matrix OpCompositeInsert index exceeds the per-lane "
++			                  "fragment count.");
++
++		auto &composite_type = expression_type(ops[3]);
++		auto composite_info = validate_apple_cooperative_matrix_type(composite_type);
++		if (result_info.rows != composite_info.rows || result_info.columns != composite_info.columns ||
++		    result_info.use != composite_info.use || result_info.element_type != composite_info.element_type)
++			SPIRV_CROSS_THROW("Apple cooperative-matrix OpCompositeInsert source and result types must match.");
++		if (apple_cooperative_matrix_conversion_source_types.count(ops[3]) != 0)
++			SPIRV_CROSS_THROW("A widened Apple cooperative-matrix view may only be consumed by "
++			                  "OpCooperativeMatrixMulAddKHR.");
++
++		auto &object_type = expression_type(ops[2]);
++		if (object_type.vecsize != 1 || object_type.columns != 1 ||
++		    object_type.basetype != result_info.element_type)
++			SPIRV_CROSS_THROW("Apple cooperative-matrix OpCompositeInsert requires a matching scalar.");
++		CompilerGLSL::emit_instruction(instruction);
++		break;
++	}
++
++	case OpVectorExtractDynamic:
++		if (expression_type(ops[2]).op == OpTypeCooperativeMatrixKHR)
++			SPIRV_CROSS_THROW("Dynamic indexing of Apple cooperative-matrix fragments is not supported.");
++		CompilerGLSL::emit_instruction(instruction);
++		break;
++
++	case OpVectorInsertDynamic:
++		if (get<SPIRType>(ops[0]).op == OpTypeCooperativeMatrixKHR)
++			SPIRV_CROSS_THROW("Dynamic indexing of Apple cooperative-matrix fragments is not supported.");
++		CompilerGLSL::emit_instruction(instruction);
++		break;
++
++	case OpCooperativeMatrixLengthKHR:
++	{
++		if (length != 3)
++			SPIRV_CROSS_THROW("Invalid OpCooperativeMatrixLengthKHR operand count.");
++		auto info = validate_apple_cooperative_matrix_type(get<SPIRType>(ops[2]));
++		validate_apple_cooperative_matrix_role(info);
++		emit_op(ops[0], ops[1], convert_to_string(info.fragment_count), true);
++		break;
++	}
++
++	// SPIR-V cooperative matrix -> MSL simdgroup_matrix over 8x8 tiles.
 +	case OpCooperativeMatrixLoadKHR:
 +	{
++		validate_apple_cooperative_matrix_optional_operands(ops, length, 5,
++		                                                   "OpCooperativeMatrixLoadKHR");
 +		uint32_t result_type = ops[0], id = ops[1];
 +		auto &mt = get<SPIRType>(result_type);
++		auto info = validate_apple_cooperative_matrix_type(mt);
++		validate_apple_cooperative_matrix_role(info);
 +		auto &elem = get<SPIRType>(mt.parent_type);
-+		uint32_t rows = get<SPIRConstant>(mt.ext.cooperative.rows_id).scalar();
-+		uint32_t cols = get<SPIRConstant>(mt.ext.cooperative.columns_id).scalar();
-+		uint32_t tr = rows / 8, tc = cols / 8;
-+		bool transpose = maybe_get<SPIRConstant>(ops[3]) &&
-+		                 get<SPIRConstant>(ops[3]).scalar() == CooperativeMatrixLayoutColumnMajorKHR;
-+		auto &ptr_type = expression_type(ops[2]);
-+		const char *aspace = ptr_type.storage == StorageClassWorkgroup ? "threadgroup" : "device";
++		uint32_t tr = info.rows / 8, tc = info.columns / 8;
++		bool transpose =
++		    validate_apple_cooperative_matrix_layout(ops[3]) == CooperativeMatrixLayoutColumnMajorKHR;
++		const char *aspace = validate_apple_cooperative_matrix_pointer(ops[2]);
 +		string stride = coop_stride_in_elems(ops[2], ops[4], elem);
 +		string eptr = join("reinterpret_cast<", aspace, " ", type_to_glsl(elem), " *>(&(", to_expression(ops[2]), "))");
 +		emit_uninitialized_temporary_expression(result_type, id);
@@ -117,7 +251,7 @@ index a5cf13f..d0e361f 100644
 +		// bug that forced the nlearn coop backward to materialise explicit .T transposes.
 +		for (uint32_t r = 0; r < tr; r++)
 +			for (uint32_t c = 0; c < tc; c++)
-+				statement("simdgroup_load(", mat, "[", r * tc + c, "], ", eptr, ", ", stride, ", ulong2(",
++				statement("simdgroup_load(", mat, ".t[", r * tc + c, "], ", eptr, ", ", stride, ", ulong2(",
 +				          transpose ? r * 8 : c * 8, ", ", transpose ? c * 8 : r * 8, ")",
 +				          transpose ? ", true" : "", ");");
 +		register_read(id, ops[2], false);
@@ -126,22 +260,26 @@ index a5cf13f..d0e361f 100644
 +
 +	case OpCooperativeMatrixStoreKHR:
 +	{
++		validate_apple_cooperative_matrix_optional_operands(ops, length, 4,
++		                                                   "OpCooperativeMatrixStoreKHR");
++		if (apple_cooperative_matrix_conversion_source_types.count(ops[1]) != 0)
++			SPIRV_CROSS_THROW("A widened Apple cooperative-matrix view may only be consumed by "
++			                  "OpCooperativeMatrixMulAddKHR.");
 +		auto &mt = expression_type(ops[1]);
++		auto info = validate_apple_cooperative_matrix_type(mt);
++		validate_apple_cooperative_matrix_role(info);
 +		auto &elem = get<SPIRType>(mt.parent_type);
-+		uint32_t rows = get<SPIRConstant>(mt.ext.cooperative.rows_id).scalar();
-+		uint32_t cols = get<SPIRConstant>(mt.ext.cooperative.columns_id).scalar();
-+		uint32_t tr = rows / 8, tc = cols / 8;
-+		bool transpose = maybe_get<SPIRConstant>(ops[2]) &&
-+		                 get<SPIRConstant>(ops[2]).scalar() == CooperativeMatrixLayoutColumnMajorKHR;
-+		auto &ptr_type = expression_type(ops[0]);
-+		const char *aspace = ptr_type.storage == StorageClassWorkgroup ? "threadgroup" : "device";
++		uint32_t tr = info.rows / 8, tc = info.columns / 8;
++		bool transpose =
++		    validate_apple_cooperative_matrix_layout(ops[2]) == CooperativeMatrixLayoutColumnMajorKHR;
++		const char *aspace = validate_apple_cooperative_matrix_pointer(ops[0]);
 +		string stride = coop_stride_in_elems(ops[0], ops[3], elem);
 +		string eptr = join("reinterpret_cast<", aspace, " ", type_to_glsl(elem), " *>(&(", to_expression(ops[0]), "))");
 +		string mat = to_expression(ops[1]);
 +		// nlearn: `mat` may be a COMPOUND expression (e.g. a fused coop*scalar multiply
 +		// from a softmax-scale epilogue). MSL parses subscript `[]` tighter than `*`, so
-+		// `mat[i]` would subscript the scalar operand, not the matrix ("subscripted value
-+		// is not an array"). Bind to a temp so `[i]` applies to the whole spvCoopMat.
++		// `mat.t[i]` would select a member of only one operand. Bind to a temp so
++		// `.t[i]` applies to the whole spvCoopMat.
 +		if (mat.find_first_of(" *+-/") != string::npos)
 +		{
 +			string matvar = join("_coopst_", ops[1]);
@@ -150,20 +288,47 @@ index a5cf13f..d0e361f 100644
 +		}
 +		for (uint32_t r = 0; r < tr; r++)
 +			for (uint32_t c = 0; c < tc; c++)
-+				statement("simdgroup_store(", mat, "[", r * tc + c, "], ", eptr, ", ", stride, ", ulong2(",
++				statement("simdgroup_store(", mat, ".t[", r * tc + c, "], ", eptr, ", ", stride, ", ulong2(",
 +				          transpose ? r * 8 : c * 8, ", ", transpose ? c * 8 : r * 8, ")",
 +				          transpose ? ", true" : "", ");");
++		register_write(ops[0]);
 +		break;
 +	}
 +
 +	case OpCooperativeMatrixMulAddKHR:
 +	{
++		validate_apple_cooperative_matrix_optional_operands(ops, length, 5,
++		                                                   "OpCooperativeMatrixMulAddKHR");
 +		uint32_t result_type = ops[0], id = ops[1];
 +		auto &rt = get<SPIRType>(result_type);
-+		uint32_t M = get<SPIRConstant>(rt.ext.cooperative.rows_id).scalar();
-+		uint32_t N = get<SPIRConstant>(rt.ext.cooperative.columns_id).scalar();
-+		auto &at = expression_type(ops[2]); // A is M x K
-+		uint32_t K = get<SPIRConstant>(at.ext.cooperative.columns_id).scalar();
++		auto result_info = validate_apple_cooperative_matrix_type(rt);
++		auto &at = apple_cooperative_matrix_physical_type(ops[2]);
++		auto &bt = apple_cooperative_matrix_physical_type(ops[3]);
++		auto &ct = apple_cooperative_matrix_physical_type(ops[4]);
++		auto a_info = validate_apple_cooperative_matrix_type(at);
++		auto b_info = validate_apple_cooperative_matrix_type(bt);
++		auto c_info = validate_apple_cooperative_matrix_type(ct);
++		if (a_info.use != CooperativeMatrixUseMatrixAKHR ||
++		    b_info.use != CooperativeMatrixUseMatrixBKHR ||
++		    c_info.use != CooperativeMatrixUseMatrixAccumulatorKHR ||
++		    result_info.use != CooperativeMatrixUseMatrixAccumulatorKHR)
++			SPIRV_CROSS_THROW("Apple cooperative-matrix MMA requires MatrixA, MatrixB, and f32 "
++			                  "MatrixAccumulator roles.");
++		if ((a_info.element_type != SPIRType::Half && a_info.element_type != SPIRType::BFloat16) ||
++		    b_info.element_type != a_info.element_type ||
++		    c_info.element_type != SPIRType::Float || result_info.element_type != SPIRType::Float)
++			SPIRV_CROSS_THROW("Apple cooperative-matrix MMA only supports matching f16 or bf16 A/B "
++			                  "with f32 accumulator and result.");
++		if (a_info.rows != a_info.columns || b_info.rows != b_info.columns ||
++		    c_info.rows != c_info.columns || result_info.rows != result_info.columns ||
++		    a_info.rows != b_info.rows || a_info.rows != c_info.rows ||
++		    a_info.rows != result_info.rows)
++			SPIRV_CROSS_THROW("Apple cooperative-matrix MMA only supports exact 8x8x8 or "
++			                  "16x16x16 shapes.");
++
++		uint32_t M = result_info.rows;
++		uint32_t N = result_info.columns;
++		uint32_t K = a_info.columns;
 +		uint32_t tm = M / 8, tn = N / 8, tk = K / 8;
 +		string A = to_expression(ops[2]), B = to_expression(ops[3]), C = to_expression(ops[4]);
 +		emit_uninitialized_temporary_expression(result_type, id);
@@ -171,31 +336,45 @@ index a5cf13f..d0e361f 100644
 +		for (uint32_t i = 0; i < tm; i++)
 +			for (uint32_t j = 0; j < tn; j++)
 +			{
-+				statement(D, "[", i * tn + j, "] = ", C, "[", i * tn + j, "];");
++				statement(D, ".t[", i * tn + j, "] = ", C, ".t[", i * tn + j, "];");
 +				for (uint32_t k = 0; k < tk; k++)
-+					statement("simdgroup_multiply_accumulate(", D, "[", i * tn + j, "], ", A, "[", i * tk + k,
-+					          "], ", B, "[", k * tn + j, "], ", D, "[", i * tn + j, "]);");
++					statement("simdgroup_multiply_accumulate(", D, ".t[", i * tn + j, "], ", A, ".t[",
++					          i * tk + k, "], ", B, ".t[", k * tn + j, "], ", D, ".t[", i * tn + j,
++					          "]);");
 +			}
 +		break;
 +	}
 +
 +	case OpFConvert:
 +	{
-+		// nlearn: an f16->f32 (etc.) convert of a COOP MATRIX. Metal has no simdgroup_matrix element
-+		// conversion; alias the source and let simdgroup_multiply_accumulate do mixed precision (half
-+		// inputs, float accumulate — Metal's native tensor path). Non-coop converts go to the base.
 +		auto &rt = get<SPIRType>(ops[0]);
 +		if (rt.op == OpTypeCooperativeMatrixKHR)
 +		{
-+			// nlearn: an f16->f32 (etc.) convert of a COOP MATRIX. Metal has no simdgroup_matrix element
-+			// conversion; alias the source and let simdgroup_multiply_accumulate do mixed precision (half
-+			// inputs, float accumulate — Metal's native tensor path). Non-coop converts go to the base.
-+			// NOTE (2026-07-13): the NARROWING case (f32->bf16 C store-downcast) is INVALID here and must
-+			// be prevented on the IREE side (C-promotion), because Metal's simdgroup_store requires the
-+			// matrix and pointer element types to MATCH (no cross-type store) — registering the bf16 result
-+			// type makes the store emit `bfloat*` for the f32 matrix -> MSL won't compile. See the GQA
-+			// hard-blocker notes in ~/nlearn/.coopmatrix_progress.log.
-+			emit_op(expression_type_id(ops[2]), ops[1], to_expression(ops[2]), true);
++			if (length != 3)
++				SPIRV_CROSS_THROW("Invalid cooperative-matrix OpFConvert operand count.");
++			if (apple_cooperative_matrix_conversion_source_types.count(ops[2]) != 0)
++				SPIRV_CROSS_THROW("Chained Apple cooperative-matrix conversions are not supported.");
++			auto &source_type = expression_type(ops[2]);
++			auto source_info = validate_apple_cooperative_matrix_type(source_type);
++			auto result_info = validate_apple_cooperative_matrix_type(rt);
++			if ((source_info.use != CooperativeMatrixUseMatrixAKHR &&
++			     source_info.use != CooperativeMatrixUseMatrixBKHR) ||
++			    result_info.use != source_info.use ||
++			    (source_info.element_type != SPIRType::Half &&
++			     source_info.element_type != SPIRType::BFloat16) ||
++			    result_info.element_type != SPIRType::Float ||
++			    source_info.rows != result_info.rows ||
++			    source_info.columns != result_info.columns)
++				SPIRV_CROSS_THROW("Apple cooperative-matrix OpFConvert only supports an exact f16/bf16 "
++				                  "to f32 widening view of MatrixA or MatrixB.");
++
++			// Metal has no element-wise simdgroup_matrix conversion. Keep the
++			// physical f16/bf16 value and let mixed-precision MMA consume it,
++			// while retaining the logical SPIR-V result type and dependencies.
++			uint32_t source_type_id = expression_type_id(ops[2]);
++			auto &expression = emit_op(source_type_id, ops[1], to_expression(ops[2]), true);
++			expression.expression_type = ops[0];
++			apple_cooperative_matrix_conversion_source_types[ops[1]] = source_type_id;
 +			inherit_expression_dependencies(ops[1], ops[2]);
 +			break;
 +		}
@@ -206,7 +385,61 @@ index a5cf13f..d0e361f 100644
  	case OpLoad:
  	{
  		uint32_t id = ops[1];
-@@ -16490,10 +16615,68 @@ string CompilerMSL::to_qualifiers_glsl(uint32_t id)
+@@ -9785,7 +10064,7 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 		uint32_t coord_id = ops[1];
+ 		uint32_t texel_id = ops[2];
+ 		const uint32_t *opt = &ops[3];
+-		uint32_t length = instruction.length - 3;
++		uint32_t image_length = instruction.length - 3;
+ 
+ 		// Bypass pointers because we need the real image struct
+ 		auto &type = expression_type(img_id);
+@@ -9805,17 +10084,17 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 		uint32_t lod = 0;
+ 		uint32_t flags = 0;
+ 
+-		if (length)
++		if (image_length)
+ 		{
+ 			flags = *opt++;
+-			length--;
++			image_length--;
+ 		}
+ 
+ 		auto test = [&](uint32_t &v, uint32_t flag) {
+-			if (length && (flags & flag))
++			if (image_length && (flags & flag))
+ 			{
+ 				v = *opt++;
+-				length--;
++				image_length--;
+ 			}
+ 		};
+ 
+@@ -10007,6 +10286,14 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 	case OpInBoundsAccessChain:
+ 	case OpAccessChain:
+ 	case OpPtrAccessChain:
++	{
++		auto &base_type = expression_type(ops[2]);
++		const SPIRType *pointee_type = &base_type;
++		if (pointee_type->pointer)
++			pointee_type = &get<SPIRType>(pointee_type->parent_type);
++		if (pointee_type->op == OpTypeCooperativeMatrixKHR)
++			SPIRV_CROSS_THROW("Dynamic or pointer-based indexing of Apple cooperative-matrix fragments "
++			                  "is not supported.");
+ 		if (is_tessellation_shader())
+ 		{
+ 			if (!emit_tessellation_access_chain(ops, instruction.length))
+@@ -10016,6 +10303,7 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 			CompilerGLSL::emit_instruction(instruction);
+ 		fix_up_interpolant_access_chain(ops, instruction.length);
+ 		break;
++	}
+ 
+ 	case OpStore:
+ 	{
+@@ -16490,10 +16778,166 @@ string CompilerMSL::to_qualifiers_glsl(uint32_t id)
  // The optional id parameter indicates the object whose type we are trying
  // to find the description for. It is optional. Most type descriptions do not
  // depend on a specific object's use of that type.
@@ -215,22 +448,124 @@ index a5cf13f..d0e361f 100644
 +// (a self-contained MSL value type; no custom struct needed). Tile (r,c) is at index r*(C/8)+c.
 +// nlearn: a replicated (splat) coop-matrix constant (e.g. the zero-initialized accumulator) -> an
 +// array of tiles each built with make_filled_simdgroup_matrix (base GLSL emits an invalid scalar ctor).
++CompilerMSL::AppleCooperativeMatrixInfo
++CompilerMSL::validate_apple_cooperative_matrix_type(const SPIRType &type) const
++{
++	if (!msl_options.supports_msl_version(3, 1))
++		SPIRV_CROSS_THROW("Apple cooperative matrices require MSL 3.1 or later.");
++	if (type.op != OpTypeCooperativeMatrixKHR)
++		SPIRV_CROSS_THROW("Expected an OpTypeCooperativeMatrixKHR type.");
++
++	auto constant_value = [this](uint32_t id, const char *description) -> uint32_t {
++		auto *constant = maybe_get<SPIRConstant>(id);
++		if (!constant || constant->specialization)
++			SPIRV_CROSS_THROW(join("Apple cooperative matrices require a literal ", description, "."));
++		return constant->scalar();
++	};
++
++	uint32_t scope = constant_value(type.ext.cooperative.scope_id, "Subgroup scope");
++	uint32_t rows = constant_value(type.ext.cooperative.rows_id, "row count");
++	uint32_t columns = constant_value(type.ext.cooperative.columns_id, "column count");
++	uint32_t use = constant_value(type.ext.cooperative.use_id, "matrix use");
++	if (scope != ScopeSubgroup)
++		SPIRV_CROSS_THROW("Apple cooperative matrices only support Subgroup scope.");
++	if (rows != columns || (rows != 8 && rows != 16))
++		SPIRV_CROSS_THROW("Apple cooperative matrices only support exact 8x8 or 16x16 shapes.");
++	if (use != CooperativeMatrixUseMatrixAKHR && use != CooperativeMatrixUseMatrixBKHR &&
++	    use != CooperativeMatrixUseMatrixAccumulatorKHR)
++		SPIRV_CROSS_THROW("Apple cooperative matrices require MatrixA, MatrixB, or MatrixAccumulator use.");
++
++	auto &element_type = get<SPIRType>(type.parent_type);
++	if (element_type.pointer || !element_type.array.empty() || element_type.vecsize != 1 ||
++	    element_type.columns != 1 ||
++	    (element_type.basetype != SPIRType::Half &&
++	     element_type.basetype != SPIRType::BFloat16 &&
++	     element_type.basetype != SPIRType::Float))
++		SPIRV_CROSS_THROW("Apple cooperative matrices only support scalar f16, bf16, or f32 elements.");
++
++	uint32_t tile_count = (rows / 8) * (columns / 8);
++	uint32_t fragment_count = (rows * columns) / 32;
++	if ((tile_count != 1 && tile_count != 4) ||
++	    (fragment_count != 2 && fragment_count != 8))
++		SPIRV_CROSS_THROW("Unsupported Apple cooperative-matrix tile or per-lane fragment count.");
++
++	return { rows, columns, use, element_type.basetype, tile_count, fragment_count };
++}
++
++const SPIRType &CompilerMSL::apple_cooperative_matrix_physical_type(uint32_t id) const
++{
++	auto conversion = apple_cooperative_matrix_conversion_source_types.find(id);
++	if (conversion != apple_cooperative_matrix_conversion_source_types.end())
++		return get<SPIRType>(conversion->second);
++	return expression_type(id);
++}
++
++void CompilerMSL::validate_apple_cooperative_matrix_role(const AppleCooperativeMatrixInfo &info) const
++{
++	if (info.use == CooperativeMatrixUseMatrixAccumulatorKHR)
++	{
++		if (info.element_type != SPIRType::Float)
++			SPIRV_CROSS_THROW("Apple MatrixAccumulator cooperative matrices must use f32 elements.");
++	}
++	else if (info.element_type != SPIRType::Half && info.element_type != SPIRType::BFloat16)
++	{
++		SPIRV_CROSS_THROW("Apple MatrixA and MatrixB cooperative matrices must use f16 or bf16 elements.");
++	}
++}
++
++uint32_t CompilerMSL::validate_apple_cooperative_matrix_layout(uint32_t id) const
++{
++	auto *layout = maybe_get<SPIRConstant>(id);
++	if (!layout || layout->specialization)
++		SPIRV_CROSS_THROW("Apple cooperative-matrix load/store layout must be a literal constant.");
++	uint32_t value = layout->scalar();
++	if (value != CooperativeMatrixLayoutRowMajorKHR &&
++	    value != CooperativeMatrixLayoutColumnMajorKHR)
++		SPIRV_CROSS_THROW("Apple cooperative matrices only support RowMajorKHR or ColumnMajorKHR layout.");
++	return value;
++}
++
++const char *CompilerMSL::validate_apple_cooperative_matrix_pointer(uint32_t id) const
++{
++	auto &pointer_type = expression_type(id);
++	if (!pointer_type.pointer)
++		SPIRV_CROSS_THROW("Apple cooperative-matrix load/store requires a pointer operand.");
++	if (pointer_type.storage == StorageClassWorkgroup)
++		return "threadgroup";
++	if (pointer_type.storage == StorageClassStorageBuffer)
++		return "device";
++	SPIRV_CROSS_THROW("Apple cooperative-matrix load/store only supports Workgroup or StorageBuffer memory.");
++}
++
++void CompilerMSL::validate_apple_cooperative_matrix_optional_operands(const uint32_t *ops,
++                                                                      uint32_t length,
++                                                                      uint32_t required_length,
++                                                                      const char *operation) const
++{
++	if (length < required_length || length > required_length + 1)
++		SPIRV_CROSS_THROW(join("Invalid ", operation, " operand count."));
++	if (length == required_length + 1 && ops[required_length] != 0)
++		SPIRV_CROSS_THROW(join(operation, " only supports zero optional operands or flags on Metal."));
++}
++
 +string CompilerMSL::cooperative_matrix_replicated_constant(const SPIRConstant &c)
 +{
 +	auto &type = get<SPIRType>(c.constant_type);
-+	auto &elem = get<SPIRType>(type.parent_type);
-+	uint32_t rows = get<SPIRConstant>(type.ext.cooperative.rows_id).scalar();
-+	uint32_t cols = get<SPIRConstant>(type.ext.cooperative.columns_id).scalar();
-+	uint32_t tiles = (rows / 8) * (cols / 8);
-+	if (tiles == 0)
-+		tiles = 1;
-+	string val = to_expression(c.subconstants[0]);
-+	string tile = join("make_filled_simdgroup_matrix<", type_to_glsl(elem), ", 8, 8>(", val, ")");
-+	string res = type_to_glsl(type) + "({ ";
-+	for (uint32_t i = 0; i < tiles; i++)
-+		res += (i ? ", " : "") + tile;
-+	res += " })";
-+	return res;
++	auto info = validate_apple_cooperative_matrix_type(type);
++	validate_apple_cooperative_matrix_role(info);
++	if (c.subconstants.size() != 1)
++		SPIRV_CROSS_THROW("Apple cooperative-matrix replicated constants require exactly one scalar.");
++	return join(type_to_glsl(type), "(", to_expression(c.subconstants[0]), ")");
++}
++
++string CompilerMSL::constant_expression(const SPIRConstant &c,
++                                        bool inside_block_like_struct_scope,
++                                        bool inside_struct_scope)
++{
++	auto &type = get<SPIRType>(c.constant_type);
++	if (type.op == OpTypeCooperativeMatrixKHR && (!c.replicated || c.subconstants.size() != 1))
++		SPIRV_CROSS_THROW("Apple cooperative-matrix constants require exactly one replicated scalar.");
++	return CompilerGLSL::constant_expression(c, inside_block_like_struct_scope, inside_struct_scope);
 +}
 +
 +// nlearn: SPIR-V coop-matrix Stride is in units of the pointer's pointee type; simdgroup_load/store
@@ -242,25 +577,21 @@ index a5cf13f..d0e361f 100644
 +	auto &ptee = pt.pointer ? get<SPIRType>(pt.parent_type) : pt;
 +	uint32_t pbytes = (ptee.width / 8) * (ptee.vecsize ? ptee.vecsize : 1);
 +	uint32_t ebytes = elem.width / 8;
-+	uint32_t factor = (ebytes && pbytes >= ebytes) ? pbytes / ebytes : 1;
-+	if (factor == 0)
-+		factor = 1;
++	if (!pbytes || !ebytes || pbytes < ebytes || pbytes % ebytes != 0)
++		SPIRV_CROSS_THROW("Apple cooperative-matrix load/store pointer pointee byte width must be an integer multiple "
++		                  "of the matrix element byte width.");
++	uint32_t factor = pbytes / ebytes;
 +	return factor == 1 ? to_expression(stride_op) : join("(", to_expression(stride_op), " * ", factor, ")");
 +}
 +
 +string CompilerMSL::cooperative_matrix_type_name(const SPIRType &type)
 +{
++	auto info = validate_apple_cooperative_matrix_type(type);
++	validate_apple_cooperative_matrix_role(info);
 +	auto &elem = get<SPIRType>(type.parent_type);
-+	uint32_t rows = get<SPIRConstant>(type.ext.cooperative.rows_id).scalar();
-+	uint32_t cols = get<SPIRConstant>(type.ext.cooperative.columns_id).scalar();
-+	uint32_t tiles = (rows / 8) * (cols / 8);
-+	if (tiles == 0)
-+		tiles = 1;
-+	// spvCoopMat<T,N> (emitted helper) gives operator[] (so mat[i] tile access works) + a scalar
-+	// constructor (so a splat constant like spvCoopMat<float,4>(0.0) is valid MSL).
 +	if (spv_function_implementations.count(SPVFuncImplCooperativeMatrix) == 0)
 +		add_spv_func_and_recompile(SPVFuncImplCooperativeMatrix);
-+	return join("spvCoopMat<", type_to_glsl(elem), ", ", tiles, ">");
++	return join("spvCoopMat<", type_to_glsl(elem), ", ", info.tile_count, ">");
 +}
 +
  string CompilerMSL::type_to_glsl(const SPIRType &type, uint32_t id, bool member)
@@ -275,19 +606,20 @@ index a5cf13f..d0e361f 100644
  	// Pointer?
  	if (is_pointer(type) || type_is_array_of_pointers(type))
  	{
-@@ -16649,6 +16832,10 @@ string CompilerMSL::type_to_glsl(const SPIRType &type, uint32_t id, bool member)
+@@ -16649,6 +17093,11 @@ string CompilerMSL::type_to_glsl(const SPIRType &type, uint32_t id, bool member)
  	case SPIRType::Half:
  		type_name = "half";
  		break;
 +	case SPIRType::BFloat16:
-+		// Metal's native bfloat (MSL 3.1+). nlearn trains in bf16.
++		if (!msl_options.supports_msl_version(3, 1))
++			SPIRV_CROSS_THROW("Metal bfloat requires MSL 3.1 or later.");
 +		type_name = "bfloat";
 +		break;
  	case SPIRType::Float:
  		type_name = "float";
  		break;
 diff --git a/spirv_msl.hpp b/spirv_msl.hpp
-index 1d17c20..38beef2 100644
+index 1d17c20..90ed4d7 100644
 --- a/spirv_msl.hpp
 +++ b/spirv_msl.hpp
 @@ -805,6 +805,7 @@ protected:
@@ -298,13 +630,774 @@ index 1d17c20..38beef2 100644
  		SPVFuncImplStorageMatrix, // Allow threadgroup construction of matrices
  		SPVFuncImplInverse4x4,
  		SPVFuncImplInverse3x3,
-@@ -922,6 +923,9 @@ protected:
+@@ -922,6 +923,29 @@ protected:
  	void emit_struct_padding_target(const SPIRType &type) override;
  	std::string type_to_glsl(const SPIRType &type, uint32_t id, bool member);
  	std::string type_to_glsl(const SPIRType &type, uint32_t id = 0) override;
-+	std::string cooperative_matrix_type_name(const SPIRType &type); // nlearn: coop matrix -> simdgroup tiles
-+	std::string coop_stride_in_elems(uint32_t ptr_op, uint32_t stride_op, const SPIRType &elem); // nlearn
-+	std::string cooperative_matrix_replicated_constant(const SPIRConstant &c) override; // nlearn
++	struct AppleCooperativeMatrixInfo
++	{
++		uint32_t rows;
++		uint32_t columns;
++		uint32_t use;
++		SPIRType::BaseType element_type;
++		uint32_t tile_count;
++		uint32_t fragment_count;
++	};
++	AppleCooperativeMatrixInfo validate_apple_cooperative_matrix_type(const SPIRType &type) const;
++	const SPIRType &apple_cooperative_matrix_physical_type(uint32_t id) const;
++	void validate_apple_cooperative_matrix_role(const AppleCooperativeMatrixInfo &info) const;
++	uint32_t validate_apple_cooperative_matrix_layout(uint32_t id) const;
++	const char *validate_apple_cooperative_matrix_pointer(uint32_t id) const;
++	void validate_apple_cooperative_matrix_optional_operands(const uint32_t *ops, uint32_t length,
++	                                                         uint32_t required_length,
++	                                                         const char *operation) const;
++	std::string cooperative_matrix_type_name(const SPIRType &type);
++	std::string coop_stride_in_elems(uint32_t ptr_op, uint32_t stride_op, const SPIRType &elem);
++	std::string constant_expression(const SPIRConstant &c,
++	                                bool inside_block_like_struct_scope = false,
++	                                bool inside_struct_scope = false) override;
++	std::string cooperative_matrix_replicated_constant(const SPIRConstant &c) override;
  	void emit_block_hints(const SPIRBlock &block) override;
  	void emit_mesh_entry_point();
  	void emit_mesh_outputs();
+@@ -1212,6 +1236,11 @@ protected:
+ 
+ 	Options msl_options;
+ 	std::set<SPVFuncImpl> spv_function_implementations;
++	// OpFConvert cannot physically convert a Metal simdgroup_matrix. The only
++	// supported conversion is a widening A/B view consumed directly by MMA.
++	// Track its physical source type while keeping the SPIR-V result type on
++	// the expression for normal type bookkeeping.
++	std::unordered_map<uint32_t, uint32_t> apple_cooperative_matrix_conversion_source_types;
+ 	// Must be ordered to ensure declarations are in a specific order.
+ 	std::map<LocationComponentPair, MSLShaderInterfaceVariable> inputs_by_location;
+ 	std::unordered_map<uint32_t, MSLShaderInterfaceVariable> inputs_by_builtin;
+diff --git a/reference/shaders-msl-no-opt/asm/comp/apple-cooperative-matrix-bf16-16.msl31.spv16.asm.comp b/reference/shaders-msl-no-opt/asm/comp/apple-cooperative-matrix-bf16-16.msl31.spv16.asm.comp
+new file mode 100644
+index 0000000..807ac59
+--- /dev/null
++++ b/reference/shaders-msl-no-opt/asm/comp/apple-cooperative-matrix-bf16-16.msl31.spv16.asm.comp
+@@ -0,0 +1,34 @@
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
++
++#include <metal_stdlib>
++#include <simd/simd.h>
++
++using namespace metal;
++
++template<typename T, uint N>
++struct spvCoopMat
++{
++    simdgroup_matrix<T, 8, 8> t[N];
++    spvCoopMat() thread {}
++    spvCoopMat(T v) thread { for (uint i = 0; i < N; i++) t[i] = make_filled_simdgroup_matrix<T, 8, 8>(v); }
++    thread T& operator[](uint i) thread { return reinterpret_cast<thread T *>(&t[i / 2])[i % 2]; }
++    T operator[](uint i) const thread { return reinterpret_cast<const thread T *>(&t[i / 2])[i % 2]; }
++};
++
++kernel void main0()
++{
++    spvCoopMat<float, 4> _21;
++    _21.t[0] = spvCoopMat<float, 4>(0.0).t[0];
++    simdgroup_multiply_accumulate(_21.t[0], spvCoopMat<bfloat, 4>(bfloat(0.0)).t[0], spvCoopMat<bfloat, 4>(bfloat(0.0)).t[0], _21.t[0]);
++    simdgroup_multiply_accumulate(_21.t[0], spvCoopMat<bfloat, 4>(bfloat(0.0)).t[1], spvCoopMat<bfloat, 4>(bfloat(0.0)).t[2], _21.t[0]);
++    _21.t[1] = spvCoopMat<float, 4>(0.0).t[1];
++    simdgroup_multiply_accumulate(_21.t[1], spvCoopMat<bfloat, 4>(bfloat(0.0)).t[0], spvCoopMat<bfloat, 4>(bfloat(0.0)).t[1], _21.t[1]);
++    simdgroup_multiply_accumulate(_21.t[1], spvCoopMat<bfloat, 4>(bfloat(0.0)).t[1], spvCoopMat<bfloat, 4>(bfloat(0.0)).t[3], _21.t[1]);
++    _21.t[2] = spvCoopMat<float, 4>(0.0).t[2];
++    simdgroup_multiply_accumulate(_21.t[2], spvCoopMat<bfloat, 4>(bfloat(0.0)).t[2], spvCoopMat<bfloat, 4>(bfloat(0.0)).t[0], _21.t[2]);
++    simdgroup_multiply_accumulate(_21.t[2], spvCoopMat<bfloat, 4>(bfloat(0.0)).t[3], spvCoopMat<bfloat, 4>(bfloat(0.0)).t[2], _21.t[2]);
++    _21.t[3] = spvCoopMat<float, 4>(0.0).t[3];
++    simdgroup_multiply_accumulate(_21.t[3], spvCoopMat<bfloat, 4>(bfloat(0.0)).t[2], spvCoopMat<bfloat, 4>(bfloat(0.0)).t[1], _21.t[3]);
++    simdgroup_multiply_accumulate(_21.t[3], spvCoopMat<bfloat, 4>(bfloat(0.0)).t[3], spvCoopMat<bfloat, 4>(bfloat(0.0)).t[3], _21.t[3]);
++}
++
+diff --git a/reference/shaders-msl-no-opt/asm/comp/apple-cooperative-matrix-bf16-8.msl31.spv16.asm.comp b/reference/shaders-msl-no-opt/asm/comp/apple-cooperative-matrix-bf16-8.msl31.spv16.asm.comp
+new file mode 100644
+index 0000000..fbfc262
+--- /dev/null
++++ b/reference/shaders-msl-no-opt/asm/comp/apple-cooperative-matrix-bf16-8.msl31.spv16.asm.comp
+@@ -0,0 +1,24 @@
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
++
++#include <metal_stdlib>
++#include <simd/simd.h>
++
++using namespace metal;
++
++template<typename T, uint N>
++struct spvCoopMat
++{
++    simdgroup_matrix<T, 8, 8> t[N];
++    spvCoopMat() thread {}
++    spvCoopMat(T v) thread { for (uint i = 0; i < N; i++) t[i] = make_filled_simdgroup_matrix<T, 8, 8>(v); }
++    thread T& operator[](uint i) thread { return reinterpret_cast<thread T *>(&t[i / 2])[i % 2]; }
++    T operator[](uint i) const thread { return reinterpret_cast<const thread T *>(&t[i / 2])[i % 2]; }
++};
++
++kernel void main0()
++{
++    spvCoopMat<float, 1> _21;
++    _21.t[0] = spvCoopMat<float, 1>(0.0).t[0];
++    simdgroup_multiply_accumulate(_21.t[0], spvCoopMat<bfloat, 1>(bfloat(0.0)).t[0], spvCoopMat<bfloat, 1>(bfloat(0.0)).t[0], _21.t[0]);
++}
++
+diff --git a/reference/shaders-msl-no-opt/asm/comp/apple-cooperative-matrix-f16-16.msl31.spv16.asm.comp b/reference/shaders-msl-no-opt/asm/comp/apple-cooperative-matrix-f16-16.msl31.spv16.asm.comp
+new file mode 100644
+index 0000000..a0be848
+--- /dev/null
++++ b/reference/shaders-msl-no-opt/asm/comp/apple-cooperative-matrix-f16-16.msl31.spv16.asm.comp
+@@ -0,0 +1,34 @@
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
++
++#include <metal_stdlib>
++#include <simd/simd.h>
++
++using namespace metal;
++
++template<typename T, uint N>
++struct spvCoopMat
++{
++    simdgroup_matrix<T, 8, 8> t[N];
++    spvCoopMat() thread {}
++    spvCoopMat(T v) thread { for (uint i = 0; i < N; i++) t[i] = make_filled_simdgroup_matrix<T, 8, 8>(v); }
++    thread T& operator[](uint i) thread { return reinterpret_cast<thread T *>(&t[i / 2])[i % 2]; }
++    T operator[](uint i) const thread { return reinterpret_cast<const thread T *>(&t[i / 2])[i % 2]; }
++};
++
++kernel void main0()
++{
++    spvCoopMat<float, 4> _21;
++    _21.t[0] = spvCoopMat<float, 4>(0.0).t[0];
++    simdgroup_multiply_accumulate(_21.t[0], spvCoopMat<half, 4>(half(0.0)).t[0], spvCoopMat<half, 4>(half(0.0)).t[0], _21.t[0]);
++    simdgroup_multiply_accumulate(_21.t[0], spvCoopMat<half, 4>(half(0.0)).t[1], spvCoopMat<half, 4>(half(0.0)).t[2], _21.t[0]);
++    _21.t[1] = spvCoopMat<float, 4>(0.0).t[1];
++    simdgroup_multiply_accumulate(_21.t[1], spvCoopMat<half, 4>(half(0.0)).t[0], spvCoopMat<half, 4>(half(0.0)).t[1], _21.t[1]);
++    simdgroup_multiply_accumulate(_21.t[1], spvCoopMat<half, 4>(half(0.0)).t[1], spvCoopMat<half, 4>(half(0.0)).t[3], _21.t[1]);
++    _21.t[2] = spvCoopMat<float, 4>(0.0).t[2];
++    simdgroup_multiply_accumulate(_21.t[2], spvCoopMat<half, 4>(half(0.0)).t[2], spvCoopMat<half, 4>(half(0.0)).t[0], _21.t[2]);
++    simdgroup_multiply_accumulate(_21.t[2], spvCoopMat<half, 4>(half(0.0)).t[3], spvCoopMat<half, 4>(half(0.0)).t[2], _21.t[2]);
++    _21.t[3] = spvCoopMat<float, 4>(0.0).t[3];
++    simdgroup_multiply_accumulate(_21.t[3], spvCoopMat<half, 4>(half(0.0)).t[2], spvCoopMat<half, 4>(half(0.0)).t[1], _21.t[3]);
++    simdgroup_multiply_accumulate(_21.t[3], spvCoopMat<half, 4>(half(0.0)).t[3], spvCoopMat<half, 4>(half(0.0)).t[3], _21.t[3]);
++}
++
+diff --git a/reference/shaders-msl-no-opt/asm/comp/apple-cooperative-matrix-f16-8.msl31.spv16.asm.comp b/reference/shaders-msl-no-opt/asm/comp/apple-cooperative-matrix-f16-8.msl31.spv16.asm.comp
+new file mode 100644
+index 0000000..b1b75ed
+--- /dev/null
++++ b/reference/shaders-msl-no-opt/asm/comp/apple-cooperative-matrix-f16-8.msl31.spv16.asm.comp
+@@ -0,0 +1,24 @@
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
++
++#include <metal_stdlib>
++#include <simd/simd.h>
++
++using namespace metal;
++
++template<typename T, uint N>
++struct spvCoopMat
++{
++    simdgroup_matrix<T, 8, 8> t[N];
++    spvCoopMat() thread {}
++    spvCoopMat(T v) thread { for (uint i = 0; i < N; i++) t[i] = make_filled_simdgroup_matrix<T, 8, 8>(v); }
++    thread T& operator[](uint i) thread { return reinterpret_cast<thread T *>(&t[i / 2])[i % 2]; }
++    T operator[](uint i) const thread { return reinterpret_cast<const thread T *>(&t[i / 2])[i % 2]; }
++};
++
++kernel void main0()
++{
++    spvCoopMat<float, 1> _21;
++    _21.t[0] = spvCoopMat<float, 1>(0.0).t[0];
++    simdgroup_multiply_accumulate(_21.t[0], spvCoopMat<half, 1>(half(0.0)).t[0], spvCoopMat<half, 1>(half(0.0)).t[0], _21.t[0]);
++}
++
+diff --git a/shaders-msl-no-opt/asm/comp/apple-cooperative-matrix-bf16-16.msl31.spv16.asm.comp b/shaders-msl-no-opt/asm/comp/apple-cooperative-matrix-bf16-16.msl31.spv16.asm.comp
+new file mode 100644
+index 0000000..759a5c7
+--- /dev/null
++++ b/shaders-msl-no-opt/asm/comp/apple-cooperative-matrix-bf16-16.msl31.spv16.asm.comp
+@@ -0,0 +1,50 @@
++; SPIR-V
++; Version: 1.6
++; Generator: Khronos SPIR-V Tools Assembler; 0
++; Bound: 0
++; Schema: 0
++               OpCapability Shader
++               OpCapability BFloat16TypeKHR
++               OpCapability BFloat16CooperativeMatrixKHR
++               OpCapability CooperativeMatrixKHR
++               OpCapability Matrix
++               OpCapability VulkanMemoryModel
++               OpExtension "SPV_KHR_bfloat16"
++               OpExtension "SPV_KHR_cooperative_matrix"
++               OpExtension "SPV_KHR_vulkan_memory_model"
++               OpMemoryModel Logical Vulkan
++               OpEntryPoint GLCompute %main "main"
++               OpExecutionMode %main LocalSize 32 1 1
++
++       %void = OpTypeVoid
++         %fn = OpTypeFunction %void
++       %uint = OpTypeInt 32 0
++    %subgroup = OpConstant %uint 3
++      %dim16 = OpConstant %uint 16
++       %useA = OpConstant %uint 0
++       %useB = OpConstant %uint 1
++     %useAcc = OpConstant %uint 2
++   %bfloat16 = OpTypeFloat 16 BFloat16KHR
++      %float = OpTypeFloat 32
++  %bf16_zero = OpConstant %bfloat16 0x0p+0
++ %float_zero = OpConstant %float 0
++       %matA = OpTypeCooperativeMatrixKHR %bfloat16 %subgroup %dim16 %dim16 %useA
++       %matB = OpTypeCooperativeMatrixKHR %bfloat16 %subgroup %dim16 %dim16 %useB
++     %matAcc = OpTypeCooperativeMatrixKHR %float %subgroup %dim16 %dim16 %useAcc
++
++       %main = OpFunction %void None %fn
++      %entry = OpLabel
++          %a = OpCompositeConstruct %matA %bf16_zero
++          %b = OpCompositeConstruct %matB %bf16_zero
++          %c = OpCompositeConstruct %matAcc %float_zero
++          %d = OpCooperativeMatrixMulAddKHR %matAcc %a %b %c
++         %d0 = OpCompositeExtract %float %d 0
++         %d1 = OpCompositeExtract %float %d 1
++         %d2 = OpCompositeExtract %float %d 2
++         %d3 = OpCompositeExtract %float %d 3
++         %d4 = OpCompositeExtract %float %d 4
++         %d5 = OpCompositeExtract %float %d 5
++         %d6 = OpCompositeExtract %float %d 6
++         %d7 = OpCompositeExtract %float %d 7
++               OpReturn
++               OpFunctionEnd
+diff --git a/shaders-msl-no-opt/asm/comp/apple-cooperative-matrix-bf16-8.msl31.spv16.asm.comp b/shaders-msl-no-opt/asm/comp/apple-cooperative-matrix-bf16-8.msl31.spv16.asm.comp
+new file mode 100644
+index 0000000..4e806ed
+--- /dev/null
++++ b/shaders-msl-no-opt/asm/comp/apple-cooperative-matrix-bf16-8.msl31.spv16.asm.comp
+@@ -0,0 +1,44 @@
++; SPIR-V
++; Version: 1.6
++; Generator: Khronos SPIR-V Tools Assembler; 0
++; Bound: 0
++; Schema: 0
++               OpCapability Shader
++               OpCapability BFloat16TypeKHR
++               OpCapability BFloat16CooperativeMatrixKHR
++               OpCapability CooperativeMatrixKHR
++               OpCapability Matrix
++               OpCapability VulkanMemoryModel
++               OpExtension "SPV_KHR_bfloat16"
++               OpExtension "SPV_KHR_cooperative_matrix"
++               OpExtension "SPV_KHR_vulkan_memory_model"
++               OpMemoryModel Logical Vulkan
++               OpEntryPoint GLCompute %main "main"
++               OpExecutionMode %main LocalSize 32 1 1
++
++       %void = OpTypeVoid
++         %fn = OpTypeFunction %void
++       %uint = OpTypeInt 32 0
++    %subgroup = OpConstant %uint 3
++       %dim8 = OpConstant %uint 8
++       %useA = OpConstant %uint 0
++       %useB = OpConstant %uint 1
++     %useAcc = OpConstant %uint 2
++   %bfloat16 = OpTypeFloat 16 BFloat16KHR
++      %float = OpTypeFloat 32
++  %bf16_zero = OpConstant %bfloat16 0x0p+0
++ %float_zero = OpConstant %float 0
++       %matA = OpTypeCooperativeMatrixKHR %bfloat16 %subgroup %dim8 %dim8 %useA
++       %matB = OpTypeCooperativeMatrixKHR %bfloat16 %subgroup %dim8 %dim8 %useB
++     %matAcc = OpTypeCooperativeMatrixKHR %float %subgroup %dim8 %dim8 %useAcc
++
++       %main = OpFunction %void None %fn
++      %entry = OpLabel
++          %a = OpCompositeConstruct %matA %bf16_zero
++          %b = OpCompositeConstruct %matB %bf16_zero
++          %c = OpCompositeConstruct %matAcc %float_zero
++          %d = OpCooperativeMatrixMulAddKHR %matAcc %a %b %c
++         %d0 = OpCompositeExtract %float %d 0
++         %d1 = OpCompositeExtract %float %d 1
++               OpReturn
++               OpFunctionEnd
+diff --git a/shaders-msl-no-opt/asm/comp/apple-cooperative-matrix-f16-16.msl31.spv16.asm.comp b/shaders-msl-no-opt/asm/comp/apple-cooperative-matrix-f16-16.msl31.spv16.asm.comp
+new file mode 100644
+index 0000000..1b9cd1a
+--- /dev/null
++++ b/shaders-msl-no-opt/asm/comp/apple-cooperative-matrix-f16-16.msl31.spv16.asm.comp
+@@ -0,0 +1,48 @@
++; SPIR-V
++; Version: 1.6
++; Generator: Khronos SPIR-V Tools Assembler; 0
++; Bound: 0
++; Schema: 0
++               OpCapability Shader
++               OpCapability Float16
++               OpCapability CooperativeMatrixKHR
++               OpCapability Matrix
++               OpCapability VulkanMemoryModel
++               OpExtension "SPV_KHR_cooperative_matrix"
++               OpExtension "SPV_KHR_vulkan_memory_model"
++               OpMemoryModel Logical Vulkan
++               OpEntryPoint GLCompute %main "main"
++               OpExecutionMode %main LocalSize 32 1 1
++
++       %void = OpTypeVoid
++         %fn = OpTypeFunction %void
++       %uint = OpTypeInt 32 0
++    %subgroup = OpConstant %uint 3
++      %dim16 = OpConstant %uint 16
++       %useA = OpConstant %uint 0
++       %useB = OpConstant %uint 1
++     %useAcc = OpConstant %uint 2
++       %half = OpTypeFloat 16
++      %float = OpTypeFloat 32
++  %half_zero = OpConstant %half 0x0p+0
++ %float_zero = OpConstant %float 0
++       %matA = OpTypeCooperativeMatrixKHR %half %subgroup %dim16 %dim16 %useA
++       %matB = OpTypeCooperativeMatrixKHR %half %subgroup %dim16 %dim16 %useB
++     %matAcc = OpTypeCooperativeMatrixKHR %float %subgroup %dim16 %dim16 %useAcc
++
++       %main = OpFunction %void None %fn
++      %entry = OpLabel
++          %a = OpCompositeConstruct %matA %half_zero
++          %b = OpCompositeConstruct %matB %half_zero
++          %c = OpCompositeConstruct %matAcc %float_zero
++          %d = OpCooperativeMatrixMulAddKHR %matAcc %a %b %c
++         %d0 = OpCompositeExtract %float %d 0
++         %d1 = OpCompositeExtract %float %d 1
++         %d2 = OpCompositeExtract %float %d 2
++         %d3 = OpCompositeExtract %float %d 3
++         %d4 = OpCompositeExtract %float %d 4
++         %d5 = OpCompositeExtract %float %d 5
++         %d6 = OpCompositeExtract %float %d 6
++         %d7 = OpCompositeExtract %float %d 7
++               OpReturn
++               OpFunctionEnd
+diff --git a/shaders-msl-no-opt/asm/comp/apple-cooperative-matrix-f16-8.msl31.spv16.asm.comp b/shaders-msl-no-opt/asm/comp/apple-cooperative-matrix-f16-8.msl31.spv16.asm.comp
+new file mode 100644
+index 0000000..e7e934c
+--- /dev/null
++++ b/shaders-msl-no-opt/asm/comp/apple-cooperative-matrix-f16-8.msl31.spv16.asm.comp
+@@ -0,0 +1,42 @@
++; SPIR-V
++; Version: 1.6
++; Generator: Khronos SPIR-V Tools Assembler; 0
++; Bound: 0
++; Schema: 0
++               OpCapability Shader
++               OpCapability Float16
++               OpCapability CooperativeMatrixKHR
++               OpCapability Matrix
++               OpCapability VulkanMemoryModel
++               OpExtension "SPV_KHR_cooperative_matrix"
++               OpExtension "SPV_KHR_vulkan_memory_model"
++               OpMemoryModel Logical Vulkan
++               OpEntryPoint GLCompute %main "main"
++               OpExecutionMode %main LocalSize 32 1 1
++
++       %void = OpTypeVoid
++         %fn = OpTypeFunction %void
++       %uint = OpTypeInt 32 0
++    %subgroup = OpConstant %uint 3
++       %dim8 = OpConstant %uint 8
++       %useA = OpConstant %uint 0
++       %useB = OpConstant %uint 1
++     %useAcc = OpConstant %uint 2
++       %half = OpTypeFloat 16
++      %float = OpTypeFloat 32
++  %half_zero = OpConstant %half 0x0p+0
++ %float_zero = OpConstant %float 0
++       %matA = OpTypeCooperativeMatrixKHR %half %subgroup %dim8 %dim8 %useA
++       %matB = OpTypeCooperativeMatrixKHR %half %subgroup %dim8 %dim8 %useB
++     %matAcc = OpTypeCooperativeMatrixKHR %float %subgroup %dim8 %dim8 %useAcc
++
++       %main = OpFunction %void None %fn
++      %entry = OpLabel
++          %a = OpCompositeConstruct %matA %half_zero
++          %b = OpCompositeConstruct %matB %half_zero
++          %c = OpCompositeConstruct %matAcc %float_zero
++          %d = OpCooperativeMatrixMulAddKHR %matAcc %a %b %c
++         %d0 = OpCompositeExtract %float %d 0
++         %d1 = OpCompositeExtract %float %d 1
++               OpReturn
++               OpFunctionEnd
+diff --git a/tests-other/apple_cooperative_matrix_test.py b/tests-other/apple_cooperative_matrix_test.py
+new file mode 100644
+index 0000000..f28f2b2
+--- /dev/null
++++ b/tests-other/apple_cooperative_matrix_test.py
+@@ -0,0 +1,375 @@
++#!/usr/bin/env python3
++
++# Copyright 2026 The IREE Authors
++# SPDX-License-Identifier: Apache-2.0
++
++import argparse
++import pathlib
++import subprocess
++import tempfile
++
++
++def replace_once(source, old, new):
++    if source.count(old) != 1:
++        raise RuntimeError("Expected exactly one occurrence of: " + old)
++    return source.replace(old, new, 1)
++
++
++def assemble(spirv_as, source, directory, name):
++    asm_path = directory / (name + ".spvasm")
++    spv_path = directory / (name + ".spv")
++    asm_path.write_text(source)
++    subprocess.run(
++        [spirv_as, "--target-env", "spv1.6", str(asm_path), "-o", str(spv_path)],
++        check=True,
++        text=True,
++        capture_output=True,
++    )
++    return spv_path
++
++
++def compile_msl(spirv_cross, spv_path, directory, name, version="30100"):
++    output_path = directory / (name + ".metal")
++    return subprocess.run(
++        [
++            spirv_cross,
++            str(spv_path),
++            "--msl",
++            "--msl-version",
++            version,
++            "--entry",
++            "main",
++            "--output",
++            str(output_path),
++        ],
++        text=True,
++        capture_output=True,
++    ), output_path
++
++
++def expect_failure(spirv_as, spirv_cross, source, directory, name, diagnostic, version="30100"):
++    spv_path = assemble(spirv_as, source, directory, name)
++    result, _ = compile_msl(spirv_cross, spv_path, directory, name, version)
++    if result.returncode == 0:
++        raise RuntimeError(name + " unexpectedly compiled successfully")
++    if diagnostic not in result.stderr:
++        raise RuntimeError(
++            name + " produced the wrong diagnostic:\n" + result.stderr
++        )
++
++
++def make_store_case(source, layout):
++    source = replace_once(
++        source,
++        'OpEntryPoint GLCompute %main "main"',
++        'OpEntryPoint GLCompute %main "main" %buffer',
++    )
++    source = replace_once(
++        source,
++        "               OpExecutionMode %main LocalSize 32 1 1\n",
++        """               OpExecutionMode %main LocalSize 32 1 1
++               OpDecorate %runtime_half ArrayStride 2
++               OpMemberDecorate %buffer_block 0 Offset 0
++               OpDecorate %buffer_block Block
++               OpDecorate %buffer Binding 0
++               OpDecorate %buffer DescriptorSet 0
++""",
++    )
++    source = replace_once(
++        source,
++        "     %matAcc = OpTypeCooperativeMatrixKHR %float %subgroup %dim8 %dim8 %useAcc\n",
++        f"""     %matAcc = OpTypeCooperativeMatrixKHR %float %subgroup %dim8 %dim8 %useAcc
++%runtime_half = OpTypeRuntimeArray %half
++%buffer_block = OpTypeStruct %runtime_half
++%ptr_buffer_block = OpTypePointer StorageBuffer %buffer_block
++      %buffer = OpVariable %ptr_buffer_block StorageBuffer
++    %ptr_half = OpTypePointer StorageBuffer %half
++      %index0 = OpConstant %uint 0
++      %layout = OpConstant %uint {layout}
++      %stride = OpConstant %uint 8
++""",
++    )
++    return replace_once(
++        source,
++        "          %a = OpCompositeConstruct %matA %half_zero\n",
++        """          %a = OpCompositeConstruct %matA %half_zero
++        %ptr = OpAccessChain %ptr_half %buffer %index0 %index0
++               OpCooperativeMatrixStoreKHR %ptr %a %layout %stride
++""",
++    )
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--spirv-cross", required=True)
++    parser.add_argument("--spirv-as", required=True)
++    parser.add_argument("--spirv-val", required=True)
++    parser.add_argument("--shader-dir", required=True)
++    args = parser.parse_args()
++
++    shader_dir = pathlib.Path(args.shader_dir)
++    positive_cases = [
++        ("apple-cooperative-matrix-f16-8.msl31.spv16.asm.comp", "half", 1, 1),
++        ("apple-cooperative-matrix-f16-16.msl31.spv16.asm.comp", "half", 4, 8),
++        ("apple-cooperative-matrix-bf16-8.msl31.spv16.asm.comp", "bfloat", 1, 1),
++        ("apple-cooperative-matrix-bf16-16.msl31.spv16.asm.comp", "bfloat", 4, 8),
++    ]
++
++    with tempfile.TemporaryDirectory() as tmp:
++        directory = pathlib.Path(tmp)
++        for filename, element, tiles, mma_count in positive_cases:
++            source = (shader_dir / filename).read_text()
++            name = filename.replace(".", "_")
++            spv_path = assemble(args.spirv_as, source, directory, name)
++            subprocess.run(
++                [args.spirv_val, "--target-env", "spv1.6", str(spv_path)],
++                check=True,
++                text=True,
++                capture_output=True,
++            )
++            result, output_path = compile_msl(
++                args.spirv_cross, spv_path, directory, name
++            )
++            if result.returncode != 0:
++                raise RuntimeError(filename + " failed to compile:\n" + result.stderr)
++            output = output_path.read_text()
++            expected_type = "spvCoopMat<%s, %d>" % (element, tiles)
++            if expected_type not in output:
++                raise RuntimeError(filename + " did not emit " + expected_type)
++            if output.count("simdgroup_multiply_accumulate(") != mma_count:
++                raise RuntimeError(filename + " emitted the wrong MMA tile count")
++
++        base = (
++            shader_dir
++            / "apple-cooperative-matrix-f16-8.msl31.spv16.asm.comp"
++        ).read_text()
++
++        # Both representable memory layouts compile, while extension layouts
++        # must not silently fall back to row-major.
++        for layout in (0, 1):
++            source = make_store_case(base, layout)
++            name = "supported_layout_%d" % layout
++            spv_path = assemble(args.spirv_as, source, directory, name)
++            result, output_path = compile_msl(
++                args.spirv_cross, spv_path, directory, name
++            )
++            if result.returncode != 0:
++                raise RuntimeError(name + " failed to compile:\n" + result.stderr)
++            output = output_path.read_text()
++            if "simdgroup_store(" not in output:
++                raise RuntimeError(name + " did not emit simdgroup_store")
++            if layout == 1 and ", true);" not in output:
++                raise RuntimeError(name + " did not emit a transposed store")
++
++        byte_pointer = make_store_case(base, 0)
++        byte_pointer = replace_once(
++            byte_pointer,
++            "               OpDecorate %runtime_half ArrayStride 2",
++            "               OpDecorate %runtime_half ArrayStride 1",
++        )
++        byte_pointer = replace_once(
++            byte_pointer,
++            "%runtime_half = OpTypeRuntimeArray %half",
++            """      %uchar = OpTypeInt 8 0
++%runtime_half = OpTypeRuntimeArray %uchar""",
++        )
++        byte_pointer = replace_once(
++            byte_pointer,
++            "    %ptr_half = OpTypePointer StorageBuffer %half",
++            "    %ptr_half = OpTypePointer StorageBuffer %uchar",
++        )
++        expect_failure(
++            args.spirv_as,
++            args.spirv_cross,
++            byte_pointer,
++            directory,
++            "unsupported_pointer_element_width",
++            "pointer pointee byte width must be an integer multiple",
++        )
++
++        nondivisible_pointer = make_store_case(base, 0)
++        nondivisible_pointer = replace_once(
++            nondivisible_pointer,
++            "               OpDecorate %runtime_half ArrayStride 2",
++            "               OpDecorate %runtime_half ArrayStride 3",
++        )
++        nondivisible_pointer = replace_once(
++            nondivisible_pointer,
++            "%runtime_half = OpTypeRuntimeArray %half",
++            """      %uchar = OpTypeInt 8 0
++     %uchar3 = OpTypeVector %uchar 3
++%runtime_half = OpTypeRuntimeArray %uchar3""",
++        )
++        nondivisible_pointer = replace_once(
++            nondivisible_pointer,
++            "    %ptr_half = OpTypePointer StorageBuffer %half",
++            "    %ptr_half = OpTypePointer StorageBuffer %uchar3",
++        )
++        expect_failure(
++            args.spirv_as,
++            args.spirv_cross,
++            nondivisible_pointer,
++            directory,
++            "unsupported_nondivisible_pointer_element_width",
++            "pointer pointee byte width must be an integer multiple",
++        )
++
++        # The only legal cooperative FConvert alias is a widening A/B view
++        # consumed by mixed-precision MMA.
++        widening = replace_once(
++            base,
++            "     %matAcc = OpTypeCooperativeMatrixKHR %float %subgroup %dim8 %dim8 %useAcc\n",
++            """     %matAcc = OpTypeCooperativeMatrixKHR %float %subgroup %dim8 %dim8 %useAcc
++  %matAFloat = OpTypeCooperativeMatrixKHR %float %subgroup %dim8 %dim8 %useA
++""",
++        )
++        widening = replace_once(
++            widening,
++            "          %a = OpCompositeConstruct %matA %half_zero\n",
++            """          %a = OpCompositeConstruct %matA %half_zero
++     %a_wide = OpFConvert %matAFloat %a
++""",
++        )
++        widening = replace_once(
++            widening,
++            "          %d = OpCooperativeMatrixMulAddKHR %matAcc %a %b %c\n",
++            "          %d = OpCooperativeMatrixMulAddKHR %matAcc %a_wide %b %c\n",
++        )
++        spv_path = assemble(args.spirv_as, widening, directory, "supported_widening")
++        result, output_path = compile_msl(
++            args.spirv_cross, spv_path, directory, "supported_widening"
++        )
++        if result.returncode != 0:
++            raise RuntimeError("supported widening failed:\n" + result.stderr)
++        output = output_path.read_text()
++        if "spvCoopMat<half, 1>" not in output or "simdgroup_multiply_accumulate(" not in output:
++            raise RuntimeError("supported widening lost its physical f16 MMA operand")
++
++        expect_failure(
++            args.spirv_as,
++            args.spirv_cross,
++            base,
++            directory,
++            "unsupported_version",
++            "require MSL 3.1 or later",
++            "30000",
++        )
++        expect_failure(
++            args.spirv_as,
++            args.spirv_cross,
++            replace_once(
++                base,
++                "    %subgroup = OpConstant %uint 3",
++                "    %subgroup = OpConstant %uint 2",
++            ),
++            directory,
++            "unsupported_scope",
++            "only support Subgroup scope",
++        )
++        expect_failure(
++            args.spirv_as,
++            args.spirv_cross,
++            replace_once(
++                base,
++                "       %half = OpTypeFloat 16",
++                "       %half = OpTypeFloat 32",
++            ),
++            directory,
++            "unsupported_type",
++            "MatrixA and MatrixB cooperative matrices must use f16 or bf16",
++        )
++        expect_failure(
++            args.spirv_as,
++            args.spirv_cross,
++            replace_once(
++                base,
++                "       %dim8 = OpConstant %uint 8",
++                "       %dim8 = OpConstant %uint 12",
++            ),
++            directory,
++            "unsupported_dimension",
++            "only support exact 8x8 or 16x16 shapes",
++        )
++        expect_failure(
++            args.spirv_as,
++            args.spirv_cross,
++            make_store_case(base, 4202),
++            directory,
++            "unsupported_layout",
++            "only support RowMajorKHR or ColumnMajorKHR layout",
++        )
++        expect_failure(
++            args.spirv_as,
++            args.spirv_cross,
++            replace_once(
++                base,
++                "          %d = OpCooperativeMatrixMulAddKHR %matAcc %a %b %c",
++                "          %d = OpCooperativeMatrixMulAddKHR %matAcc %a %b %c SaturatingAccumulationKHR",
++            ),
++            directory,
++            "unsupported_flags",
++            "only supports zero optional operands or flags",
++        )
++        expect_failure(
++            args.spirv_as,
++            args.spirv_cross,
++            replace_once(
++                base,
++                "         %d1 = OpCompositeExtract %float %d 1",
++                "         %d1 = OpCompositeExtract %float %d 2",
++            ),
++            directory,
++            "unsupported_fragment_index",
++            "index exceeds the per-lane fragment count",
++        )
++        expect_failure(
++            args.spirv_as,
++            args.spirv_cross,
++            replace_once(
++                base,
++                "         %d1 = OpCompositeExtract %float %d 1",
++                "         %d1 = OpVectorExtractDynamic %float %d %useAcc",
++            ),
++            directory,
++            "unsupported_dynamic_fragment_index",
++            "Dynamic indexing of Apple cooperative-matrix fragments is not supported",
++        )
++        expect_failure(
++            args.spirv_as,
++            args.spirv_cross,
++            replace_once(
++                base,
++                "          %a = OpCompositeConstruct %matA %half_zero",
++                "          %a = OpCompositeConstruct %matA %half_zero %half_zero",
++            ),
++            directory,
++            "unsupported_fragment_count",
++            "only support a one-scalar replicated OpCompositeConstruct",
++        )
++
++        narrowing = replace_once(
++            base,
++            "     %matAcc = OpTypeCooperativeMatrixKHR %float %subgroup %dim8 %dim8 %useAcc\n",
++            """     %matAcc = OpTypeCooperativeMatrixKHR %float %subgroup %dim8 %dim8 %useAcc
++ %matAccHalf = OpTypeCooperativeMatrixKHR %half %subgroup %dim8 %dim8 %useAcc
++""",
++        )
++        narrowing = replace_once(
++            narrowing,
++            "          %c = OpCompositeConstruct %matAcc %float_zero\n",
++            """          %c = OpCompositeConstruct %matAcc %float_zero
++   %c_narrow = OpFConvert %matAccHalf %c
++""",
++        )
++        expect_failure(
++            args.spirv_as,
++            args.spirv_cross,
++            narrowing,
++            directory,
++            "unsupported_fconvert",
++            "OpFConvert only supports an exact f16/bf16 to f32 widening view",
++        )
++
++
++if __name__ == "__main__":
++    main()

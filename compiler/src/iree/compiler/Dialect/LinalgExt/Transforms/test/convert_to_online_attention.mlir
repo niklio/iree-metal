@@ -40,3 +40,47 @@ func.func @attention(%q: tensor<2x10x4096x128xf16>, %k: tensor<2x10x4096x128xf16
 // CHECK: arith.mulf
 // CHECK: arith.truncf
 // CHECK: linalg.yield
+
+// -----
+
+#mapQ = affine_map<(b, h, m, n, k1, k2) -> (b, h, m, k1)>
+#mapK = affine_map<(b, h, m, n, k1, k2) -> (b, h, k2, k1)>
+#mapV = affine_map<(b, h, m, n, k1, k2) -> (b, h, k2, n)>
+#mapS = affine_map<(b, h, m, n, k1, k2) -> ()>
+#mapM = affine_map<(b, h, m, n, k1, k2) -> (b, h, m, k2)>
+#mapO = affine_map<(b, h, m, n, k1, k2) -> (b, h, m, n)>
+
+func.func @attention_i1_mask(
+    %q: tensor<1x1x2x1xf32>,
+    %k: tensor<1x1x2x1xf32>,
+    %v: tensor<1x1x2x1xf32>) -> tensor<1x1x2x1xf32> {
+  %scale = arith.constant 1.0 : f32
+  %mask = arith.constant dense<false> : tensor<1x1x2x2xi1>
+  %acc = tensor.empty() : tensor<1x1x2x1xf32>
+  %out = iree_linalg_ext.attention
+      {indexing_maps = [#mapQ, #mapK, #mapV, #mapS, #mapM, #mapO]}
+      ins(%q, %k, %v, %scale, %mask :
+          tensor<1x1x2x1xf32>, tensor<1x1x2x1xf32>,
+          tensor<1x1x2x1xf32>, f32, tensor<1x1x2x2xi1>)
+      outs(%acc : tensor<1x1x2x1xf32>) {
+    ^bb0(%score: f32):
+      iree_linalg_ext.yield %score : f32
+  } -> tensor<1x1x2x1xf32>
+  return %out : tensor<1x1x2x1xf32>
+}
+
+// CHECK-LABEL: func.func @attention_i1_mask
+// CHECK: %[[MASK:.+]] = arith.constant dense<false> : tensor<1x1x2x2xi1>
+// CHECK: %[[ONLINE:.+]]:3 = iree_linalg_ext.online_attention
+// CHECK-SAME: ins(%{{.+}}, %{{.+}}, %{{.+}}, %{{.+}}, %[[MASK]]
+// CHECK: linalg.generic
+// CHECK-SAME: ins(%[[ONLINE]]#2, %[[ONLINE]]#0
+// CHECK: ^bb0(%[[SUM:.+]]: f32, %[[X:.+]]: f32, %{{.+}}: f32):
+// CHECK-NEXT: %[[ONE:.+]] = arith.constant 1.000000e+00 : f32
+// CHECK-NEXT: %[[ZERO:.+]] = arith.constant 0.000000e+00 : f32
+// CHECK-NEXT: %[[SUM_IS_ZERO:.+]] = arith.cmpf oeq, %[[SUM]], %[[ZERO]] : f32
+// CHECK-NEXT: %[[SAFE_SUM:.+]] = arith.select %[[SUM_IS_ZERO]], %[[ONE]], %[[SUM]] : f32
+// CHECK-NEXT: %[[RECIPROCAL:.+]] = arith.divf %[[ONE]], %[[SAFE_SUM]] : f32
+// CHECK-NEXT: %[[SCALED:.+]] = arith.mulf %[[RECIPROCAL]], %[[X]] : f32
+// CHECK-NEXT: %[[ZERO_IF_EMPTY:.+]] = arith.select %[[SUM_IS_ZERO]], %[[ZERO]], %[[SCALED]] : f32
+// CHECK-NEXT: linalg.yield %[[ZERO_IF_EMPTY]] : f32
