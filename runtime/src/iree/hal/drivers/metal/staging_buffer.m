@@ -96,13 +96,22 @@ void iree_hal_metal_staging_buffer_reset(iree_hal_metal_staging_buffer_t* stagin
 
 void iree_hal_metal_staging_buffer_increase_command_buffer_refcount(
     iree_hal_metal_staging_buffer_t* staging_buffer) {
-  iree_atomic_fetch_add(&staging_buffer->pending_command_buffers, 1, iree_memory_order_relaxed);
+  // Serialize the zero-to-one transition with reservations and the matching
+  // one-to-zero reset. Otherwise an old command buffer can decrement to zero,
+  // a new command buffer can reserve argument data, and the old completion can
+  // then reset the offset underneath that live reservation.
+  iree_slim_mutex_lock(&staging_buffer->offset_mutex);
+  iree_atomic_fetch_add(&staging_buffer->pending_command_buffers, 1,
+                        iree_memory_order_relaxed);
+  iree_slim_mutex_unlock(&staging_buffer->offset_mutex);
 }
 
 void iree_hal_metal_staging_buffer_decrease_command_buffer_refcount(
     iree_hal_metal_staging_buffer_t* staging_buffer) {
+  iree_slim_mutex_lock(&staging_buffer->offset_mutex);
   if (iree_atomic_fetch_sub(&staging_buffer->pending_command_buffers, 1,
                             iree_memory_order_acq_rel) == 1) {
-    iree_hal_metal_staging_buffer_reset(staging_buffer);
+    staging_buffer->offset = 0;
   }
+  iree_slim_mutex_unlock(&staging_buffer->offset_mutex);
 }
