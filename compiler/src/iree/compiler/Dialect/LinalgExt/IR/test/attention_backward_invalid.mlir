@@ -213,3 +213,36 @@ func.func @non_boolean_use_exp2(
       -> tensor<1x2x3xf32>, tensor<1x4x3xf32>, tensor<1x4x5xf32>
   return
 }
+
+// -----
+
+#q = affine_map<(b, m, k1, k2, n) -> (b, m, k1)>
+#k = affine_map<(b, m, k1, k2, n) -> (b, k2, k1)>
+#v = affine_map<(b, m, k1, k2, n) -> (b, k2, n)>
+#o = affine_map<(b, m, k1, k2, n) -> (b, m, n)>
+#lse = affine_map<(b, m, k1, k2, n) -> (b, m)>
+#scalar = affine_map<(b, m, k1, k2, n) -> ()>
+
+func.func @non_dictionary_contraction_attrs(
+    %query: tensor<1x2x3xbf16>, %key: tensor<1x4x3xbf16>,
+    %value: tensor<1x4x5xbf16>, %output: tensor<1x2x5xbf16>,
+    %output_grad: tensor<1x2x5xbf16>, %logsumexp: tensor<1x2xf32>) {
+  %scale = arith.constant 0.5 : bf16
+  %query_grad = tensor.empty() : tensor<1x2x3xbf16>
+  %key_grad = tensor.empty() : tensor<1x4x3xbf16>
+  %value_grad = tensor.empty() : tensor<1x4x5xbf16>
+  // expected-error @+1 {{expected decomposition_config entry 'qk_attrs' to be a dictionary}}
+  %result:3 = iree_linalg_ext.attention_backward {
+      decomposition_config = {qk_attrs = 1 : i32},
+      indexing_maps = [#q, #k, #v, #o, #o, #lse, #scalar, #q, #k, #v]}
+      ins(%query, %key, %value, %output, %output_grad, %logsumexp, %scale :
+          tensor<1x2x3xbf16>, tensor<1x4x3xbf16>,
+          tensor<1x4x5xbf16>, tensor<1x2x5xbf16>,
+          tensor<1x2x5xbf16>, tensor<1x2xf32>, bf16)
+      outs(%query_grad, %key_grad, %value_grad :
+          tensor<1x2x3xbf16>, tensor<1x4x3xbf16>,
+          tensor<1x4x5xbf16>)
+      -> tensor<1x2x3xbf16>, tensor<1x4x3xbf16>,
+         tensor<1x4x5xbf16>
+  return
+}

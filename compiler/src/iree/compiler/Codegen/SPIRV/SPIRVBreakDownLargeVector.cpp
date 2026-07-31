@@ -165,7 +165,8 @@ struct FoldExtractFromScalarInsertChain final
     VectorType sourceType = extractOp.getSourceVectorType();
     if (!resultType || resultType.getRank() != 1 || resultType.isScalable() ||
         sourceType.isScalable() || resultType.getNumElements() > 4 ||
-        sourceType.getNumElements() <= 4 || extractOp.hasDynamicPosition() ||
+        (sourceType.getNumElements() <= 4 && sourceType.getRank() == 1) ||
+        extractOp.hasDynamicPosition() ||
         extractOp.getNumIndices() + 1 != sourceType.getRank()) {
       return failure();
     }

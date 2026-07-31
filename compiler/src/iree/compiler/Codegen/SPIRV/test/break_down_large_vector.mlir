@@ -76,6 +76,22 @@ func.func @extract_from_scalar_insert_chain(%x: f16, %y: f16, %unrelated: f16) -
 
 // -----
 
+// CHECK-LABEL: func @extract_from_small_ranked_insert_chain
+//  CHECK-SAME: (%[[X:.+]]: f16, %[[Y:.+]]: f16)
+//   CHECK-NOT: vector<2x1x1x2xf16>
+//       CHECK: %[[RESULT:.+]] = vector.from_elements %[[X]], %[[Y]] : vector<2xf16>
+//   CHECK-NOT: vector<2x1x1x2xf16>
+//       CHECK: return %[[RESULT]] : vector<2xf16>
+func.func @extract_from_small_ranked_insert_chain(%x: f16, %y: f16) -> vector<2xf16> {
+  %poison = ub.poison : vector<2x1x1x2xf16>
+  %0 = vector.insert %x, %poison [0, 0, 0, 0] : f16 into vector<2x1x1x2xf16>
+  %1 = vector.insert %y, %0 [0, 0, 0, 1] : f16 into vector<2x1x1x2xf16>
+  %result = vector.extract %1[0, 0, 0] : vector<2xf16> from vector<2x1x1x2xf16>
+  return %result : vector<2xf16>
+}
+
+// -----
+
 func.func @bitcast_extract_extend_1(%input: vector<4xi32>) -> vector<4xi32> {
   %bitcast = vector.bitcast %input : vector<4xi32> to vector<32xi4>
   %extract = vector.extract_strided_slice %bitcast {offsets = [20], sizes = [4], strides = [1]} : vector<32xi4> to vector<4xi4>

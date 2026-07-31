@@ -12,7 +12,13 @@
 
 namespace mlir::iree_compiler::stablehlo {
 
-struct StableHloOptions : PassPipelineOptions<StableHloOptions> {};
+struct StableHloOptions : PassPipelineOptions<StableHloOptions> {
+  Option<bool> enableNativeAttention{
+      *this, "enable-native-attention",
+      llvm::cl::desc("Raise supported StableHLO attention forward/VJP graphs "
+                     "to native IREE attention operations"),
+      llvm::cl::init(false)};
+};
 
 //===----------------------------------------------------------------------===//
 // Pipelines

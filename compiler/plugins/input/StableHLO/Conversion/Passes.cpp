@@ -43,6 +43,9 @@ void registerStableHLOConversionPassPipeline() {
 // Prepare HLO for use as an input to the Flow dialect.
 void buildStableHLOInputConversionPassPipelineImpl(
     OpPassManager &passManager, const StableHloOptions &options, bool detuple) {
+  const bool nativeAttentionEnabled =
+      options.enableNativeAttention &&
+      !std::getenv("IREE_METAL_DISABLE_NATIVE_ATTENTION");
   // Having both StableHLO and VHLO in the same module is not supported.
   // If the input is VHLO, then it is automatically converted to StableHLO.
   // If the input is StableHLO, this pass is considered a NOP.
@@ -53,7 +56,11 @@ void buildStableHLOInputConversionPassPipelineImpl(
   passManager.addNestedPass<func::FuncOp>(mlir::createCSEPass());
   // Lower @flash_attention_* custom calls to external Metal kernel dispatches
   // before the generic custom-call legalization (which would reject them).
-  passManager.addPass(createConvertFlashAttentionDispatch());
+  ConvertFlashAttentionDispatchOptions initialAttentionOptions;
+  initialAttentionOptions.suppressLegacyAttentionRaise =
+      nativeAttentionEnabled;
+  passManager.addPass(
+      createConvertFlashAttentionDispatch(initialAttentionOptions));
   passManager.addNestedPass<func::FuncOp>(createLegalizeStableHLOCustomCalls());
   passManager.addNestedPass<func::FuncOp>(
       stablehlo::createLegalizeControlFlow());
@@ -63,7 +70,7 @@ void buildStableHLOInputConversionPassPipelineImpl(
     passManager.addPass(createFlattenTuplesInCFG());
   }
 
-  if (std::getenv("IREE_STABLEHLO_RAISE_ATTENTION")) {
+  if (nativeAttentionEnabled) {
     // The paired native attention raiser needs the outlined JAX mask helpers
     // inlined and the forward/VJP graph canonicalized, but it must run before
     // StableHLO preprocessing collapses the rank-4 batched attention dots

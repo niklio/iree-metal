@@ -1120,6 +1120,11 @@ collapseDimensionsForDispatch(IRRewriter &rewriter,
               if (failed(maybeReplacements)) {
                 return failure();
               }
+              // collapseOpIterationDims rebuilds the Linalg op and only
+              // carries inherent properties. Preserve codegen annotations and
+              // other discardable attributes on the collapsed root.
+              maybeReplacements->collapsedOp->setDiscardableAttrs(
+                  genericOp->getDiscardableAttrDictionary());
               return maybeReplacements->results;
             })
             .Case([&, &info = info](

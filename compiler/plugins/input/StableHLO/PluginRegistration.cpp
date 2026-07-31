@@ -21,7 +21,15 @@ namespace mlir::iree_compiler::stablehlo {
 namespace {
 
 struct StableHLOOptions {
-  void bindOptions(OptionsBinder &binder) {}
+  bool enableNativeAttention = false;
+  void bindOptions(OptionsBinder &binder) {
+    static llvm::cl::OptionCategory category("StableHLO Input");
+    binder.opt<bool>(
+        "iree-stablehlo-enable-native-attention", enableNativeAttention,
+        llvm::cl::cat(category),
+        llvm::cl::desc("Raise supported attention forward/VJP graphs to native "
+                       "IREE attention operations"));
+  }
 };
 
 static bool checkOpForTuples(Operation *op) {
@@ -77,6 +85,7 @@ struct StableHLOSession
   bool extendCustomInputConversionPassPipeline(
       OpPassManager &passManager, std::string_view typeMnemonic) override {
     StableHloOptions stableHloOptions;
+    stableHloOptions.enableNativeAttention = options.enableNativeAttention;
 
     // VHLO is converted to StableHLO. The conversion function is called
     // automatically, and if the input is fully stablehlo the function

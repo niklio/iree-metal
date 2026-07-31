@@ -58,7 +58,11 @@ def ConvertFlashAttentionDispatch :
     Option<"raiseNativeAttention", "raise-native-attention", "bool",
            /*default=*/"false",
            "Allow the late pipeline invocation to raise a matched StableHLO "
-           "forward/VJP pair to native attention operations">
+           "forward/VJP pair to native attention operations">,
+    Option<"suppressLegacyAttentionRaise", "suppress-legacy-attention-raise", "bool",
+           /*default=*/"false",
+           "Suppress the legacy external-Metal automatic attention matcher "
+           "because a later native attention pass will run">
   ];
 }
 

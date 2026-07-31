@@ -160,6 +160,21 @@ def SimplifyPackUnpackPass : Pass<"iree-global-opt-simplify-pack-unpack", ""> {
   let summary = "Simplifies tensor pack and unpack ops.";
 }
 
+def SplitAttentionBackwardForMetalPass :
+    Pass<"iree-global-opt-split-attention-backward-for-metal", "mlir::ModuleOp"> {
+  let summary = "Configures materialized attention backward for native Metal MMA";
+  let description = [{
+    Tags the five contractions produced by portable attention-backward
+    decomposition when every executable target required by the operation uses
+    the metal-spirv backend. This retains one logical contraction per dispatch
+    while selecting native Apple MMA codegen. Operations with unknown, empty,
+    or mixed target sets are left unchanged.
+  }];
+  let dependentDialects = [
+    "IREE::LinalgExt::IREELinalgExtDialect",
+  ];
+}
+
 def GlobalLoopInvariantCodeMotionPass : InterfacePass<"iree-global-opt-loop-invariant-code-motion", "mlir::FunctionOpInterface"> {
   let summary = "Hoist loop invariants out of loops with zero-trip-check.";
 }

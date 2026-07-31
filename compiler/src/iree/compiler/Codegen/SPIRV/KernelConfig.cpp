@@ -1245,10 +1245,10 @@ setCooperativeMatrixConfig(IREE::GPU::TargetAttr target, linalg::LinalgOp op,
 static LogicalResult setAttentionOpConfig(IREE::GPU::TargetAttr target,
                                           IREE::LinalgExt::AttentionOp op) {
   LLVM_DEBUG(llvm::dbgs() << "trying to deduce config as attention...\n");
-  // The Apple vector-distribute prototype is a self-contained opt-in. Reuse
-  // the intrinsic-based schedule configuration, but serialize a distinct
-  // pipeline so lowering no longer depends on this environment variable.
-  if (target.isApple() && getenv("IREE_METAL_ATTN_VDIST")) {
+  // Native Apple attention is the default and can be disabled as one coherent
+  // emergency rollback across raising, decomposition, and configuration.
+  if (target.isApple() &&
+      !getenv("IREE_METAL_DISABLE_NATIVE_ATTENTION")) {
     return setAttentionIntrinsicBasedVectorDistributionConfig(
         target, op->getParentOfType<mlir::FunctionOpInterface>(), op,
         CodeGenPipeline::SPIRVAppleVectorDistributeAttention);
@@ -2174,6 +2174,19 @@ static bool dispatchHasTransposeOutput(mlir::FunctionOpInterface funcOp) {
 static LogicalResult setSPIRVOpConfig(IREE::GPU::TargetAttr target,
                                       mlir::FunctionOpInterface entryPointFn,
                                       Operation *rootOp) {
+  if (target.isApple() &&
+      !getenv("IREE_METAL_DISABLE_NATIVE_ATTENTION") &&
+      rootOp->hasAttr("iree_codegen.apple_attention_backward_role")) {
+    auto linalgOp = dyn_cast<linalg::LinalgOp>(rootOp);
+    if (linalgOp &&
+        succeeded(setMatmulVectorDistributionConfig(
+            target, entryPointFn, linalgOp,
+            CodeGenPipeline::SPIRVAppleVectorDistributeAttention,
+            /*appleSimdgroupOnly=*/true))) {
+      return success();
+    }
+  }
+
   // First try to find a proper CodeGen configuration to tile and vectorize for
   // the current target architecture.
   if (target.isAMD() &&

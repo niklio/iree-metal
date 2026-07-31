@@ -282,11 +282,20 @@ void buildGlobalOptimizationPassPipeline(
       .addPass(mlir::createCSEPass)
       // After running const-eval to a fixed point and folding unit extent dims,
       // try any new raising opportunities.
-      .addPass(createRaiseSpecialOpsPass)
+      .addPass(createRaiseSpecialOpsPass);
+
+  // The pass itself requires an unambiguous, Metal-only target set per
+  // operation and otherwise no-ops. Keep the shared rollback coherent with
+  // native raising and Apple configuration.
+  if (!std::getenv("IREE_METAL_DISABLE_NATIVE_ATTENTION")) {
+    mainPassManager.addPass(createSplitAttentionBackwardForMetalPass());
+  }
+
+  FunctionLikeNest(mainPassManager)
       // Attention backward's three gradient results require incompatible
       // iterator classifications, so the aggregate intentionally has no single
-      // tiling interface. Decompose it into independently tileable linalg
-      // operations before dispatch formation attempts to select roots.
+      // tiling interface. Decompose it into portable linalg operations before
+      // dispatch formation; Metal role metadata controls selected contractions.
       .addPass([]() {
         IREE::LinalgExt::DecomposeAggregatedOpPassOptions options;
         options.filterOps = "iree_linalg_ext.attention_backward";

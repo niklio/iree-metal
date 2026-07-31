@@ -658,3 +658,57 @@ util.func public @fuse_transpose_with_index_flip(%arg0: tensor<64x3x3x64xbf16>) 
 //       CHECK:       %[[EXTRACT:.+]] = tensor.extract %[[ARG0]][%[[IDX0]], %[[SUB0]], %[[SUB1]], %[[IDX1]]] : tensor<64x3x3x64xbf16>
 //       CHECK:       linalg.yield %[[EXTRACT]] : bf16
 //       CHECK:   util.return %[[RESULT]]
+
+// -----
+
+util.func public @preserve_consumer_discardable_attrs(
+    %arg0: tensor<16x8xbf16>, %arg1: tensor<4x16xbf16>)
+    -> tensor<8x4xf32> {
+  %transpose_init = tensor.empty() : tensor<8x16xbf16>
+  %transposed = linalg.generic {
+      indexing_maps = [
+        affine_map<(d0, d1) -> (d0, d1)>,
+        affine_map<(d0, d1) -> (d1, d0)>],
+      iterator_types = ["parallel", "parallel"]}
+      ins(%arg0 : tensor<16x8xbf16>)
+      outs(%transpose_init : tensor<8x16xbf16>) {
+    ^bb0(%in: bf16, %out: bf16):
+      linalg.yield %in : bf16
+  } -> tensor<8x16xbf16>
+  %zero = arith.constant 0.0 : f32
+  %result_init = tensor.empty() : tensor<8x4xf32>
+  %filled = linalg.fill ins(%zero : f32)
+      outs(%result_init : tensor<8x4xf32>) -> tensor<8x4xf32>
+  %result = linalg.generic {
+      indexing_maps = [
+        affine_map<(d0, d1, d2) -> (d0, d2)>,
+        affine_map<(d0, d1, d2) -> (d1, d2)>,
+        affine_map<(d0, d1, d2) -> (d0, d1)>],
+      iterator_types = ["parallel", "parallel", "reduction"]}
+      ins(%transposed, %arg1 : tensor<8x16xbf16>, tensor<4x16xbf16>)
+      outs(%filled : tensor<8x4xf32>)
+      attrs = {
+        iree_codegen.apple_attention_backward_role = "dp_attrs"} {
+    ^bb0(%lhs: bf16, %rhs: bf16, %acc: f32):
+      %lhs_f32 = arith.extf %lhs : bf16 to f32
+      %rhs_f32 = arith.extf %rhs : bf16 to f32
+      %product = arith.mulf %lhs_f32, %rhs_f32 : f32
+      %sum = arith.addf %product, %acc : f32
+      linalg.yield %sum : f32
+  } -> tensor<8x4xf32>
+  util.return %result : tensor<8x4xf32>
+}
+
+// CHECK-LABEL: util.func public @preserve_consumer_discardable_attrs
+// CHECK-SAME: %[[ARG0:[A-Za-z0-9]+]]: tensor<16x8xbf16>
+// CHECK-SAME: %[[ARG1:[A-Za-z0-9]+]]: tensor<4x16xbf16>
+// CHECK-NOT:  linalg.generic
+// CHECK:      %[[RESULT:.+]] = linalg.generic
+// CHECK-SAME:   affine_map<(d0, d1, d2) -> (d2, d0)>
+// CHECK-SAME:   affine_map<(d0, d1, d2) -> (d1, d2)>
+// CHECK-SAME:   affine_map<(d0, d1, d2) -> (d0, d1)>
+// CHECK-SAME:   ins(%[[ARG0]], %[[ARG1]]
+// CHECK-SAME:   attrs = {iree_codegen.apple_attention_backward_role = "dp_attrs"}
+// CHECK:        ^bb0(%[[LHS:.+]]: bf16, %[[RHS:.+]]: bf16, %{{.+}}: f32):
+// CHECK:          arith.extf %[[LHS]] : bf16 to f32
+// CHECK:      util.return %[[RESULT]]

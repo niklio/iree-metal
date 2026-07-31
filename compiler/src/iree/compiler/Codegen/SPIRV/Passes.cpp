@@ -1183,6 +1183,11 @@ void addSPIRVAppleVectorDistributeAttentionPassPipeline(
   funcPassManager.addPass(createForOpCanonicalizationPass(forOptions));
   funcPassManager.addPass(createCanonicalizerPass());
   funcPassManager.addPass(createCSEPass());
+  // The second vector-lowering sweep can expose fresh scalar-insert chains
+  // rooted at a rank-N poison aggregate (notably for the native Apple 8x8
+  // operand fragments). Fold their final subvector extracts after that sweep
+  // so no non-SPIR-V rank-N vector remains at conversion time.
+  funcPassManager.addPass(createSPIRVBreakDownLargeVectorPass());
 }
 
 void addSPIRVWinogradVectorizePassPipeline(OpPassManager &funcPassManager) {

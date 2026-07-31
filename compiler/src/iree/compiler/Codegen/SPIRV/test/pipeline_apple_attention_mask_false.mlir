@@ -1,4 +1,4 @@
-// RUN: env IREE_METAL_ATTN_VDIST=1 \
+// RUN: env -u IREE_METAL_DISABLE_NATIVE_ATTENTION \
 // RUN:   iree-opt --iree-gpu-test-target=apple@metal \
 // RUN:   --pass-pipeline='builtin.module(iree-spirv-select-lowering-strategy-pass,func.func(iree-spirv-lower-executable-target-pass))' \
 // RUN:   %s -o /dev/null

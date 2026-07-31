@@ -129,6 +129,50 @@ struct GatherFusionPattern final : OpRewritePattern<tensor::ExtractOp> {
     return success();
   }
 };
+
+// MLIR's generic elementwise fusion rebuilds the consumer op but only copies
+// its inherent properties. Keep IREE codegen annotations and other
+// discardable attributes on the fused consumer.
+class FuseElementwiseOpsPreservingAttrs final
+    : public OpRewritePattern<linalg::GenericOp> {
+public:
+  FuseElementwiseOpsPreservingAttrs(
+      MLIRContext *context, linalg::ControlFusionFn controlFn)
+      : OpRewritePattern<linalg::GenericOp>(context, /*benefit=*/2),
+        controlFn(std::move(controlFn)) {}
+
+  LogicalResult matchAndRewrite(linalg::GenericOp genericOp,
+                                PatternRewriter &rewriter) const override {
+    for (OpOperand &opOperand : genericOp->getOpOperands()) {
+      if (!linalg::areElementwiseOpsFusable(&opOperand) ||
+          !controlFn(&opOperand)) {
+        continue;
+      }
+
+      Operation *producer = opOperand.get().getDefiningOp();
+      DictionaryAttr discardableAttrs =
+          genericOp->getDiscardableAttrDictionary();
+      FailureOr<linalg::ElementwiseOpFusionResult> fusionResult =
+          linalg::fuseElementwiseOps(rewriter, &opOperand);
+      if (failed(fusionResult)) {
+        return rewriter.notifyMatchFailure(genericOp, "fusion failed");
+      }
+      fusionResult->fusedOp->setDiscardableAttrs(discardableAttrs);
+
+      for (auto [original, replacement] : fusionResult->replacements) {
+        rewriter.replaceUsesWithIf(original, replacement, [&](OpOperand &use) {
+          return use.get().getDefiningOp() != producer;
+        });
+      }
+      rewriter.eraseOp(genericOp);
+      return success();
+    }
+    return failure();
+  }
+
+private:
+  linalg::ControlFusionFn controlFn;
+};
 } // namespace
 
 void ElementwiseOpFusionPass::runOnOperation() {
@@ -175,6 +219,8 @@ void ElementwiseOpFusionPass::runOnOperation() {
 
   RewritePatternSet linalgFusionPatterns(context);
   linalgFusionPatterns.insert<GatherFusionPattern>(context);
+  linalgFusionPatterns.add<FuseElementwiseOpsPreservingAttrs>(
+      context, fuseElementwiseOpsControlFn);
   linalg::populateElementwiseOpsFusionPatterns(linalgFusionPatterns,
                                                fuseElementwiseOpsControlFn);
 

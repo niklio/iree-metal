@@ -453,10 +453,10 @@ debugPrintContractionInfo(StringRef label, unsigned numLoops,
   DBGS() << label << ": " << llvm::interleaved_array(sizes) << "\n";
 }
 
-static LogicalResult
-setMatmulVectorDistributionConfig(IREE::GPU::TargetAttr target,
-                                  mlir::FunctionOpInterface entryPoint,
-                                  linalg::LinalgOp op) {
+LogicalResult setMatmulVectorDistributionConfig(
+    IREE::GPU::TargetAttr target, mlir::FunctionOpInterface entryPoint,
+    linalg::LinalgOp op, CodeGenPipeline pipeline,
+    bool appleSimdgroupOnly) {
   if (target.getWgp().getMma().empty()) {
     return failure();
   }
@@ -547,10 +547,26 @@ setMatmulVectorDistributionConfig(IREE::GPU::TargetAttr target,
     intrinsics.emplace_back(mSize, nSize, kSize, aType, bType, cType, mma);
   };
 
+  auto isAppleSimdgroupIntrinsic = [](IREE::GPU::MMAIntrinsic intrinsic) {
+    switch (intrinsic) {
+    case IREE::GPU::MMAIntrinsic::APPLE_SIMDGROUP_F32_8x8x8_F16:
+    case IREE::GPU::MMAIntrinsic::APPLE_SIMDGROUP_F32_16x16x16_F16:
+    case IREE::GPU::MMAIntrinsic::APPLE_SIMDGROUP_F32_8x8x8_BF16:
+    case IREE::GPU::MMAIntrinsic::APPLE_SIMDGROUP_F32_16x16x16_BF16:
+      return true;
+    default:
+      return false;
+    }
+  };
+
   SmallVector<GPUIntrinsicType> intrinsics;
   intrinsics.reserve(target.getWgp().getMma().size());
   MLIRContext *context = op.getContext();
   for (IREE::GPU::MMAAttr mma : target.getWgp().getMma()) {
+    if (appleSimdgroupOnly &&
+        !isAppleSimdgroupIntrinsic(mma.getIntrinsic())) {
+      continue;
+    }
     if (mma.getSubgroupSize() != targetSubgroupSize) {
       continue;
     }
@@ -590,8 +606,6 @@ setMatmulVectorDistributionConfig(IREE::GPU::TargetAttr target,
   int64_t maxSharedMemoryBytes = target.getWgp().getMaxWorkgroupMemoryBytes();
 
   LDBG() << "Matmul Vector Distribution Config";
-
-  auto pipeline = CodeGenPipeline::LLVMGPUVectorDistribute;
 
   // Infer if lhs or rhs is transposed to help generate better schedule.
   SmallVector<AffineMap> maps = op.getIndexingMapsArray();
@@ -700,6 +714,12 @@ setMatmulVectorDistributionConfig(IREE::GPU::TargetAttr target,
       StringAttr::get(context,
                       IREE::GPU::GPUPipelineOptionsAttr::getDictKeyName()),
       pipelineOptions);
+  if (pipeline == CodeGenPipeline::SPIRVAppleVectorDistributeAttention) {
+    pipelineAttrs.emplace_back(
+        IREE::Codegen::DenormalFpMathAttr::getFP32DictKeyName(),
+        IREE::Codegen::DenormalFpMathAttr::get(
+            context, IREE::Codegen::DenormalFpMath::PreserveSign));
+  }
 
   auto pipelineConfig = DictionaryAttr::get(context, pipelineAttrs);
 

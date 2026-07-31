@@ -463,7 +463,7 @@ util.func public @multi_reduce_dim(%arg0: tensor<2x32x10x4096xf32>) -> tensor<2x
   %cst = arith.constant -0.000000e+00 : f32
   %1 = tensor.empty() : tensor<2x32xf32>
   %2 = linalg.fill ins(%cst : f32) outs(%1 : tensor<2x32xf32>) -> tensor<2x32xf32>
-  %3 = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, affine_map<(d0, d1, d2, d3) -> (d0, d1)>], iterator_types = ["parallel", "parallel", "reduction", "reduction"]} ins(%arg0 : tensor<2x32x10x4096xf32>) outs(%2 : tensor<2x32xf32>) {
+  %3 = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, affine_map<(d0, d1, d2, d3) -> (d0, d1)>], iterator_types = ["parallel", "parallel", "reduction", "reduction"]} ins(%arg0 : tensor<2x32x10x4096xf32>) outs(%2 : tensor<2x32xf32>) attrs = {iree_codegen.test_collapse_marker = "keep"} {
   ^bb0(%arg1: f32, %arg2: f32):
     %6 = arith.addf %arg1, %arg2 : f32
     linalg.yield %6 : f32
@@ -483,6 +483,7 @@ util.func public @multi_reduce_dim(%arg0: tensor<2x32x10x4096xf32>) -> tensor<2x
 //       CHECK:     %[[GENERIC:.+]] = linalg.generic
 //  CHECK-SAME:         ins(%[[COLLAPSE]] :
 //  CHECK-SAME:         outs(%[[FILL]] :
+//  CHECK-SAME:         attrs = {iree_codegen.test_collapse_marker = "keep"}
 //       CHECK:      flow.return %[[GENERIC]]
 //       CHECK:   %[[EXPAND:.+]] = tensor.expand_shape %[[DISPATCH]] {{\[}}[0, 1]{{\]}}
 

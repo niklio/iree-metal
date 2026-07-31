@@ -460,9 +460,6 @@ static std::string buildCeWrapper(StringRef target, StringRef exe, StringRef fn,
 // attention and its VJP as one transaction. This deliberately does not share
 // the legacy external-Metal flash gate below: these ops stay in IREE and use
 // the normal Attention/AttentionBackward lowering paths.
-static constexpr StringLiteral kRaiseAttentionEnv =
-    "IREE_STABLEHLO_RAISE_ATTENTION";
-
 static bool hasI64Values(ArrayRef<int64_t> actual,
                          std::initializer_list<int64_t> expected) {
   return actual.size() == expected.size() &&
@@ -794,6 +791,15 @@ matchPairedAttention(mlir::stablehlo::DotGeneralOp outputDot) {
   Type bf16 = queryType.getElementType();
   Type f32 = Float32Type::get(outputDot.getContext());
   Type i1 = IntegerType::get(outputDot.getContext(), 1);
+  // The paired raise is only enabled by the native Metal pipeline, whose
+  // forward aggregate has no portable codegen fallback. Preserve the original
+  // StableHLO graph unless both contractions fit the default Apple 8x8x8
+  // simdgroup inventory. Backward role tagging independently verifies all five
+  // of its materialized contractions after target selection.
+  if (!bf16.isBF16() || sequence < 8 || sequence % 8 != 0 || headDim < 8 ||
+      headDim % 8 != 0) {
+    return std::nullopt;
+  }
   // Broadcast dimensions alone do not prove that the denominator is a row
   // value: e.g. [B,H,1,S] can also broadcast to the score shape. Pin every
   // conversion and reshape so the reduction remains row-wise.
@@ -1173,9 +1179,6 @@ static void rewritePairedAttention(PairedAttentionMatch match) {
 }
 
 static void raisePairedAttention(ModuleOp module) {
-  if (!std::getenv(kRaiseAttentionEnv.data())) {
-    return;
-  }
   SmallVector<mlir::stablehlo::DotGeneralOp> candidates;
   module.walk(
       [&](mlir::stablehlo::DotGeneralOp dot) { candidates.push_back(dot); });
@@ -1436,12 +1439,14 @@ struct ConvertFlashAttentionDispatch final
     MLIRContext *ctx = &getContext();
 
     // The native paired raise and the legacy external-Metal forward raise are
-    // intentionally mutually exclusive. Both explicit flash custom calls and
-    // any custom calls created by the legacy path are still lowered below.
+    // intentionally mutually exclusive. An explicitly requested native pass
+    // remains authoritative; the rollback controls pipeline construction.
+    // Both explicit flash custom calls and any custom calls created by the
+    // legacy path are still lowered below.
     if (raiseNativeAttention) {
       raisePairedAttention(module);
     }
-    if (!std::getenv(kRaiseAttentionEnv.data())) {
+    if (!raiseNativeAttention && !suppressLegacyAttentionRaise) {
       raiseFlashAttentionFwd(module);
     }
 

@@ -16,6 +16,16 @@ namespace mlir::iree_compiler {
 
 LogicalResult initGPULaunchConfig(mlir::FunctionOpInterface funcOp);
 
+// Configures a standalone contraction for intrinsic-based vector
+// distribution. SPIR-V targets can override the pipeline, and Apple callers
+// can restrict selection to first-class simdgroup intrinsics.
+LogicalResult setMatmulVectorDistributionConfig(
+    IREE::GPU::TargetAttr target, mlir::FunctionOpInterface entryPoint,
+    linalg::LinalgOp op,
+    IREE::Codegen::DispatchLoweringPassPipeline pipeline =
+        IREE::Codegen::DispatchLoweringPassPipeline::LLVMGPUVectorDistribute,
+    bool appleSimdgroupOnly = false);
+
 // iree-metal (attn vdist port): exposed so the metal-spirv attention pipeline
 // can reuse the LLVMGPU intrinsic-based vector-distribute attention config. The
 // pipeline param lets the caller route to SPIRVVectorDistributeAttention

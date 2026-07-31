@@ -6,6 +6,8 @@
 
 #include "iree_pjrt/metal/client.h"
 
+#include <cstdlib>
+
 #include "iree/hal/drivers/metal/registration/driver_module.h"
 
 namespace iree::pjrt::metal {
@@ -29,7 +31,14 @@ iree_status_t MetalClientInstance::CreateDriver(iree_hal_driver_t** out_driver) 
 }
 
 bool MetalClientInstance::SetDefaultCompilerFlags(CompilerJob* compiler_job) {
-  return compiler_job->SetFlag("--iree-hal-target-device=metal");
+  if (!compiler_job->SetFlag("--iree-hal-target-device=metal")) {
+    return false;
+  }
+  if (std::getenv("IREE_METAL_DISABLE_NATIVE_ATTENTION")) {
+    return true;
+  }
+  return compiler_job->SetFlag(
+      "--iree-stablehlo-enable-native-attention=true");
 }
 
 }  // namespace iree::pjrt::metal

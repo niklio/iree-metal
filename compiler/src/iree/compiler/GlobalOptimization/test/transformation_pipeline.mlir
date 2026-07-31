@@ -1,4 +1,10 @@
 // RUN: iree-opt --split-input-file --iree-global-optimization-transformation-pipeline %s | FileCheck %s
+// RUN: env -u IREE_METAL_DISABLE_NATIVE_ATTENTION iree-opt --iree-global-optimization-transformation-pipeline --dump-pass-pipeline %s -o /dev/null 2>&1 | FileCheck %s --check-prefix=ATTN-DEFAULT
+// RUN: env IREE_METAL_DISABLE_NATIVE_ATTENTION=1 iree-opt --iree-global-optimization-transformation-pipeline --dump-pass-pipeline %s -o /dev/null 2>&1 | FileCheck %s --check-prefix=ATTN-DISABLED
+
+// ATTN-DEFAULT: iree-global-opt-split-attention-backward-for-metal
+// ATTN-DISABLED: Pass Manager with
+// ATTN-DISABLED-NOT: iree-global-opt-split-attention-backward-for-metal
 
 // CHECK-LABEL: @empty
 util.func public @empty() {

@@ -1,8 +1,8 @@
-// RUN: env -u IREE_METAL_ATTN_VDIST -u IREE_METAL_COOP_ATTENTION_WIP \
+// RUN: env -u IREE_METAL_COOP_ATTENTION_WIP IREE_METAL_DISABLE_NATIVE_ATTENTION=1 \
 // RUN:   iree-opt --iree-gpu-test-target=apple@metal \
 // RUN:   --pass-pipeline='builtin.module(iree-spirv-select-lowering-strategy-pass)' \
 // RUN:   %s | FileCheck %s
-// RUN: env -u IREE_METAL_COOP_ATTENTION_WIP IREE_METAL_ATTN_VDIST=1 \
+// RUN: env -u IREE_METAL_DISABLE_NATIVE_ATTENTION -u IREE_METAL_COOP_ATTENTION_WIP \
 // RUN:   iree-opt --iree-gpu-test-target=apple@metal \
 // RUN:   --pass-pipeline='builtin.module(iree-spirv-select-lowering-strategy-pass)' \
 // RUN:   %s | FileCheck %s

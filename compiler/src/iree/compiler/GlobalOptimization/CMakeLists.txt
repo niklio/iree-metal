@@ -63,6 +63,7 @@ iree_cc_library(
     "RaiseSpecialOps.cpp"
     "RemoveZeroExtentTensors.cpp"
     "SimplifyPackUnpack.cpp"
+    "SplitAttentionBackwardForMetal.cpp"
     "Utils.cpp"
     "WarnOnUninitializedValues.cpp"
   DEPS
@@ -105,6 +106,7 @@ iree_cc_library(
     iree::compiler::Dialect::LinalgExt::IR
     iree::compiler::Dialect::LinalgExt::Transforms
     iree::compiler::Dialect::LinalgExt::Utils
+    iree::compiler::Dialect::Stream::Analysis
     iree::compiler::Dialect::TensorExt::IR
     iree::compiler::Dialect::Util::Analysis
     iree::compiler::Dialect::Util::Analysis::Attributes

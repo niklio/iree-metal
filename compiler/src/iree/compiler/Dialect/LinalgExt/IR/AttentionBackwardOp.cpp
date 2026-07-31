@@ -37,6 +37,39 @@ static SmallVector<utils::IteratorType> getIteratorTypes(AffineMap outputMap) {
   return iteratorTypes;
 }
 
+// Renumber the iteration domain so result dimensions appear in result-tensor
+// order, followed by reduction dimensions. Apple vector distribution relies on
+// this canonical order when mapping accumulator fragments back to a tensor.
+static void canonicalizeLoopOrderForOutput(SmallVectorImpl<AffineMap> &maps) {
+  AffineMap outputMap = maps.back();
+  int64_t numDims = outputMap.getNumDims();
+  SmallVector<int64_t> oldDimsInNewOrder;
+  SmallVector<bool> seen(numDims, false);
+  for (AffineExpr expr : outputMap.getResults()) {
+    int64_t oldDim = cast<AffineDimExpr>(expr).getPosition();
+    if (!seen[oldDim]) {
+      seen[oldDim] = true;
+      oldDimsInNewOrder.push_back(oldDim);
+    }
+  }
+  for (int64_t oldDim = 0; oldDim < numDims; ++oldDim) {
+    if (!seen[oldDim]) {
+      oldDimsInNewOrder.push_back(oldDim);
+    }
+  }
+
+  SmallVector<AffineExpr> replacements(numDims);
+  MLIRContext *context = outputMap.getContext();
+  for (auto [newDim, oldDim] : llvm::enumerate(oldDimsInNewOrder)) {
+    replacements[oldDim] = getAffineDimExpr(newDim, context);
+  }
+  for (AffineMap &map : maps) {
+    map = map.replaceDimsAndSymbols(
+        replacements, /*symReplacements=*/ArrayRef<AffineExpr>{}, numDims,
+        /*numResultSyms=*/0);
+  }
+}
+
 static Value createZeroTensor(OpBuilder &builder, Location loc, AffineMap map,
                               ArrayRef<OpFoldResult> domainSizes,
                               Type elementType) {
@@ -53,9 +86,13 @@ static Value createZeroTensor(OpBuilder &builder, Location loc, AffineMap map,
 
 static Value computeMatmul(OpBuilder &builder, Location loc, AffineMap lhsMap,
                            AffineMap rhsMap, AffineMap outputMap, Value lhs,
-                           Value rhs, Value output) {
+                           Value rhs, Value output, DictionaryAttr attrs = {},
+                           bool canonicalizeLoopOrder = false) {
   SmallVector<AffineMap> maps =
       compressUnusedDims(SmallVector<AffineMap>{lhsMap, rhsMap, outputMap});
+  if (canonicalizeLoopOrder) {
+    canonicalizeLoopOrderForOutput(maps);
+  }
   auto genericOp = linalg::GenericOp::create(
       builder, loc, output.getType(), ValueRange{lhs, rhs}, output, maps,
       getIteratorTypes(maps.back()),
@@ -73,6 +110,9 @@ static Value computeMatmul(OpBuilder &builder, Location loc, AffineMap lhsMap,
             arith::AddFOp::create(nestedBuilder, nestedLoc, product, args[2]);
         linalg::YieldOp::create(nestedBuilder, nestedLoc, sum);
       });
+  if (attrs) {
+    genericOp->setDiscardableAttrs(attrs);
+  }
   return genericOp.getResult(0);
 }
 
@@ -145,6 +185,28 @@ static Value convertTensor(OpBuilder &builder, Location loc, AffineMap inputMap,
   return genericOp.getResult(0);
 }
 
+// Native backward contractions consume score intermediates in the same
+// low-precision type as their primal operand while accumulating in f32.
+static Value castContractionLhsToRhsType(OpBuilder &builder, Location loc,
+                                         AffineMap lhsMap, Value lhs,
+                                         Value rhs) {
+  Type lhsElementType = getElementTypeOrSelf(lhs.getType());
+  Type rhsElementType = getElementTypeOrSelf(rhs.getType());
+  if (lhsElementType == rhsElementType ||
+      (!rhsElementType.isF16() && !rhsElementType.isBF16())) {
+    return lhs;
+  }
+  Value converted = tensor::EmptyOp::create(
+      builder, loc, tensor::getMixedSizes(builder, loc, lhs), rhsElementType);
+  return convertTensor(builder, loc, lhsMap, lhsMap, lhs, converted);
+}
+
+static bool hasAppleAttentionBackwardRole(DictionaryAttr attrs) {
+  return attrs &&
+         static_cast<bool>(attrs.getAs<StringAttr>(
+             "iree_codegen.apple_attention_backward_role"));
+}
+
 static Value getIntegerMaskCondition(OpBuilder &builder, Location loc,
                                      Value mask) {
   auto maskType = cast<IntegerType>(mask.getType());
@@ -207,7 +269,7 @@ static Value computeProbabilities(OpBuilder &builder, Location loc,
                                   AffineMap scoreMap, AffineMap logsumexpMap,
                                   Value scores, Value logsumexp, Value mask,
                                   std::optional<AffineMap> maskMap,
-                                  bool useExp2) {
+                                  Type probabilityElementType, bool useExp2) {
   bool useIntegerMask = hasIntegerMask(mask);
   SmallVector<AffineMap> maps{logsumexpMap};
   SmallVector<Value> inputs{logsumexp};
@@ -224,10 +286,10 @@ static Value computeProbabilities(OpBuilder &builder, Location loc,
   SmallVector<OpFoldResult> probabilitySizes =
       tensor::getMixedSizes(builder, loc, scores);
   Value probabilityInit = tensor::EmptyOp::create(
-      builder, loc, probabilitySizes, getElementTypeOrSelf(scores.getType()));
+      builder, loc, probabilitySizes, probabilityElementType);
   unsigned scoreOperandIndex = inputs.size() - 1;
   auto genericOp = linalg::GenericOp::create(
-      builder, loc, scores.getType(), inputs, probabilityInit, maps,
+      builder, loc, probabilityInit.getType(), inputs, probabilityInit, maps,
       iteratorTypes,
       [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
         Value score = args[scoreOperandIndex];
@@ -270,6 +332,9 @@ static Value computeProbabilities(OpBuilder &builder, Location loc,
           probability = arith::SelectOp::create(nestedBuilder, nestedLoc,
                                                 condition, probability, zero);
         }
+        probability = convertScalarToDtype(
+            nestedBuilder, nestedLoc, probability, args.back().getType(),
+            /*isUnsignedCast=*/false);
         linalg::YieldOp::create(nestedBuilder, nestedLoc, probability);
       });
   return genericOp.getResult(0);
@@ -344,6 +409,15 @@ LogicalResult AttentionBackwardOp::verify() {
         useExp2 && !isa<BoolAttr>(useExp2)) {
       return emitOpError(
           "expected decomposition_config entry 'use_exp2' to be a boolean");
+    }
+    for (StringRef attrName :
+         {getQKAttrStr(), getDPAttrStr(), getDQAttrStr(), getDKAttrStr(),
+          getDVAttrStr()}) {
+      if (Attribute attrs = config.get(attrName);
+          attrs && !isa<DictionaryAttr>(attrs)) {
+        return emitOpError() << "expected decomposition_config entry '"
+                             << attrName << "' to be a dictionary";
+      }
     }
   }
 
@@ -597,12 +671,23 @@ AttentionBackwardOp::decomposeOperation(OpBuilder &builder) {
 
   Type f32Type = builder.getF32Type();
   DictionaryAttr config = getDecompositionConfigAttr();
+  DictionaryAttr qkAttrs, dpAttrs, dqAttrs, dkAttrs, dvAttrs;
   bool useExp2 = true;
   if (config) {
+    qkAttrs = config.getAs<DictionaryAttr>(getQKAttrStr());
+    dpAttrs = config.getAs<DictionaryAttr>(getDPAttrStr());
+    dqAttrs = config.getAs<DictionaryAttr>(getDQAttrStr());
+    dkAttrs = config.getAs<DictionaryAttr>(getDKAttrStr());
+    dvAttrs = config.getAs<DictionaryAttr>(getDVAttrStr());
     if (auto useExp2Attr = config.getAs<BoolAttr>(getUseExp2AttrStr())) {
       useExp2 = useExp2Attr.getValue();
     }
   }
+  bool nativeQK = hasAppleAttentionBackwardRole(qkAttrs);
+  bool nativeDP = hasAppleAttentionBackwardRole(dpAttrs);
+  bool nativeDQ = hasAppleAttentionBackwardRole(dqAttrs);
+  bool nativeDK = hasAppleAttentionBackwardRole(dkAttrs);
+  bool nativeDV = hasAppleAttentionBackwardRole(dvAttrs);
 
   // Recompute scores and normalized probabilities without materializing any
   // forward intermediates. LSE is supplied by the paired forward operation.
@@ -616,24 +701,51 @@ AttentionBackwardOp::decomposeOperation(OpBuilder &builder) {
                                          getQuery(), scoreScale);
   Value scores = createZeroTensor(builder, loc, scoreMap, domainSizes, f32Type);
   scores = computeMatmul(builder, loc, getQueryMap(), getKeyMap(), scoreMap,
-                         scaledQuery, getKey(), scores);
-  if (Value mask = getMask()) {
-    // CPU contraction-root codegen cannot yet distribute a fused score
-    // epilogue. Materialize the QK contraction before applying the mask.
-    auto scoreMatmulBarrier = IREE::Util::OptimizationBarrierOp::create(
-        builder, loc, ValueRange{scores});
-    scores = scoreMatmulBarrier.getResult(0);
-    scores = applyMaskToScores(builder, loc, scoreMap, *getMaskMap(), scores,
-                               mask, useExp2);
+                         scaledQuery, getKey(), scores, qkAttrs);
+  Value probabilityMask = getMask();
+  if (probabilityMask && nativeQK) {
+    // Keep causal-mask construction out of the vector-distributed QK shader.
+    // A 512x512 iota/compare producer otherwise expands dramatically during
+    // SPIR-V vector lowering even though its i1 materialization is tiny.
+    probabilityMask = IREE::Util::OptimizationBarrierOp::create(
+                          builder, loc, ValueRange{probabilityMask})
+                          .getResult(0);
   }
-  // Keep the masked score tensor separate from the probability epilogue as
-  // well. Native attention-backward lowering bypasses both boundaries.
-  auto scoreBarrier = IREE::Util::OptimizationBarrierOp::create(
-      builder, loc, ValueRange{scores});
-  scores = scoreBarrier.getResult(0);
-  Value probabilities =
-      computeProbabilities(builder, loc, scoreMap, getLogsumexpMap(), scores,
-                           getLogsumexp(), getMask(), getMaskMap(), useExp2);
+  // Integer masks are applied directly in computeProbabilities. Reapplying
+  // them to an intermediate score tensor would leave a dead, score-sized
+  // second result in the fused native QK epilogue.
+  bool applyMaskToIntermediate =
+      probabilityMask && (!nativeQK || !hasIntegerMask(probabilityMask));
+  if (applyMaskToIntermediate) {
+    // CPU contraction-root codegen cannot yet distribute a fused score
+    // epilogue. The native Metal path deliberately keeps scale, mask, and
+    // probability normalization fused with its isolated QK contraction.
+    if (!nativeQK) {
+      auto scoreMatmulBarrier = IREE::Util::OptimizationBarrierOp::create(
+          builder, loc, ValueRange{scores});
+      scores = scoreMatmulBarrier.getResult(0);
+    }
+    scores = applyMaskToScores(builder, loc, scoreMap, *getMaskMap(), scores,
+                               probabilityMask, useExp2);
+  }
+  // The portable path retains its explicit score boundary. On native Metal,
+  // materialize only probabilities: this removes one score-sized f32 tensor
+  // without adding another logical MMA to the QK shader.
+  if (!nativeQK) {
+    auto scoreBarrier = IREE::Util::OptimizationBarrierOp::create(
+        builder, loc, ValueRange{scores});
+    scores = scoreBarrier.getResult(0);
+  }
+  Type probabilityElementType =
+      nativeQK ? getElementTypeOrSelf(getQuery().getType()) : f32Type;
+  Value probabilities = computeProbabilities(
+      builder, loc, scoreMap, getLogsumexpMap(), scores, getLogsumexp(),
+      probabilityMask, getMaskMap(), probabilityElementType, useExp2);
+  if (nativeQK) {
+    probabilities = IREE::Util::OptimizationBarrierOp::create(
+                        builder, loc, ValueRange{probabilities})
+                        .getResult(0);
+  }
 
   // D = rowsum(dO * O), expressed as a contraction so it can share the same
   // f32 accumulation path as the other backward matmuls.
@@ -642,18 +754,34 @@ AttentionBackwardOp::decomposeOperation(OpBuilder &builder) {
   rowDot =
       computeMatmul(builder, loc, getOutputGradMap(), getOutputMap(),
                     getLogsumexpMap(), getOutputGrad(), getOutput(), rowDot);
+  if (nativeDP) {
+    // Materialize the score-row reduction, which is tiny compared to dP. If
+    // left fusible, dispatch formation groups the dS epilogue with rowDot and
+    // forces the score-sized f32 dP tensor across a dispatch boundary. Keeping
+    // rowDot separate instead lets dP own and fuse the epilogue, so only the
+    // final low-precision dS tensor is materialized.
+    rowDot = IREE::Util::OptimizationBarrierOp::create(
+                 builder, loc, ValueRange{rowDot})
+                 .getResult(0);
+  }
 
   // dP = dO @ V^T.
   Value probabilityGrad =
       createZeroTensor(builder, loc, scoreMap, domainSizes, f32Type);
   probabilityGrad =
       computeMatmul(builder, loc, getOutputGradMap(), getValueMap(), scoreMap,
-                    getOutputGrad(), getValue(), probabilityGrad);
+                    getOutputGrad(), getValue(), probabilityGrad, dpAttrs);
 
   // dS = P * (dP - D) * scale.
+  // Do not reuse dP as the destination. A fresh destination makes dP a
+  // single-use producer so dispatch formation can fuse this pointwise
+  // epilogue and materialize only the final low-precision dS tensor.
+  Value scoreGradInit = tensor::EmptyOp::create(
+      builder, loc, tensor::getMixedSizes(builder, loc, probabilityGrad),
+      f32Type);
   Value scoreGrad = computePointwise<arith::SubFOp>(
       builder, loc, scoreMap, getLogsumexpMap(), scoreMap, probabilityGrad,
-      rowDot, probabilityGrad);
+      rowDot, scoreGradInit);
   scoreGrad = computePointwise<arith::MulFOp>(builder, loc, scoreMap, scoreMap,
                                               scoreMap, probabilities,
                                               scoreGrad, scoreGrad);
@@ -663,20 +791,48 @@ AttentionBackwardOp::decomposeOperation(OpBuilder &builder) {
 
   Value queryGradF32 =
       createZeroTensor(builder, loc, getQueryMap(), domainSizes, f32Type);
+  Value queryScoreGrad =
+      nativeDQ ? castContractionLhsToRhsType(builder, loc, scoreMap, scoreGrad,
+                                             getKey())
+               : scoreGrad;
+  if (nativeDQ) {
+    queryScoreGrad = IREE::Util::OptimizationBarrierOp::create(
+                         builder, loc, ValueRange{queryScoreGrad})
+                         .getResult(0);
+  }
   queryGradF32 =
       computeMatmul(builder, loc, scoreMap, getKeyMap(), getQueryMap(),
-                    scoreGrad, getKey(), queryGradF32);
+                    queryScoreGrad, getKey(), queryGradF32, dqAttrs);
 
   Value keyGradF32 =
       createZeroTensor(builder, loc, getKeyMap(), domainSizes, f32Type);
+  Value keyScoreGrad = nativeDK
+                           ? castContractionLhsToRhsType(builder, loc, scoreMap,
+                                                         scoreGrad, getQuery())
+                           : scoreGrad;
+  if (nativeDK) {
+    keyScoreGrad = IREE::Util::OptimizationBarrierOp::create(
+                       builder, loc, ValueRange{keyScoreGrad})
+                       .getResult(0);
+  }
   keyGradF32 = computeMatmul(builder, loc, scoreMap, getQueryMap(), getKeyMap(),
-                             scoreGrad, getQuery(), keyGradF32);
+                             keyScoreGrad, getQuery(), keyGradF32, dkAttrs,
+                             /*canonicalizeLoopOrder=*/nativeDK);
 
   Value valueGradF32 =
       createZeroTensor(builder, loc, getValueMap(), domainSizes, f32Type);
+  Value valueProbabilities =
+      nativeDV ? castContractionLhsToRhsType(builder, loc, scoreMap,
+                                             probabilities, getOutputGrad())
+               : probabilities;
+  if (nativeDV) {
+    valueProbabilities = IREE::Util::OptimizationBarrierOp::create(
+                             builder, loc, ValueRange{valueProbabilities})
+                             .getResult(0);
+  }
   valueGradF32 =
       computeMatmul(builder, loc, scoreMap, getOutputGradMap(), getValueMap(),
-                    probabilities, getOutputGrad(), valueGradF32);
+                    valueProbabilities, getOutputGrad(), valueGradF32, dvAttrs);
 
   Value queryGrad =
       convertTensor(builder, loc, getQueryMap(), getQueryGradMap(),

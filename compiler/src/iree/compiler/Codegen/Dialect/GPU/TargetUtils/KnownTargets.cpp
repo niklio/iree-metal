@@ -814,8 +814,9 @@ std::optional<TargetDetails> getAppleTargetDetails() {
       {0xffff, 0xffff, 0xffff}};
   // clang-format on
 
-  return TargetDetails{std::getenv("IREE_METAL_ATTN_VDIST") ? &vdistWgp : &wgp,
-                       nullptr};
+  return TargetDetails{
+      std::getenv("IREE_METAL_DISABLE_NATIVE_ATTENTION") ? &wgp : &vdistWgp,
+      nullptr};
 }
 
 //===----------------------------------------------------------------------===//
