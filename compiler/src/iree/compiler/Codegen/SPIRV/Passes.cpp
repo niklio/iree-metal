@@ -21,6 +21,12 @@
 
 #include "iree-dialects/Dialect/LinalgTransform/Passes.h"
 #include "iree/compiler/Codegen/Common/GPU/Passes.h"
+// iree-metal (attn vector-distribute port, M0): reuse the LLVMGPU vector-distribute
+// passes on the metal-spirv attention pipeline (temporary dep; roadmap #1 moves them
+// to Common/GPU). Declares addGPUVectorDistributePassPipeline (full LLVMGPU attn chain).
+#include "iree/compiler/Codegen/LLVMGPU/Passes.h"
+// Declares IREE::GPU::GPUPipelineOptions (arg to the pipeline builder above).
+#include "iree/compiler/Codegen/Dialect/GPU/TargetUtils/ConfigUtils.h"
 #include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Codegen/SPIRV/KernelConfig.h"
 #include "iree/compiler/Codegen/SPIRV/Passes.h"
@@ -839,6 +845,28 @@ struct QkScoreBarrierPass
 
 void addSPIRVVectorDistributeAttentionPassPipeline(
     OpPassManager &funcPassManager) {
+  // iree-metal (IREE_METAL_ATTN_VDIST, attn port M0): run the full LLVMGPU vector-distribute
+  // attention pipeline on the metal path (reused via a temporary SPIRV->LLVMGPU dep;
+  // roadmap #1 moves those passes to Common/GPU). It does its own workgroup tiling +
+  // tile levels + ConfigureTensorLayouts + VectorDistribute, so short-circuit the SPIRV
+  // coop-tile path entirely. The Apple fragment layout (getSingleSubgroupLayout NV_WMMA
+  // @545) + terminal (createMmaOp Apple branch) are what make it reach the simdgroup
+  // matrix units with the softmax co-located on-fragment (no smem round-trip).
+  if (getenv("IREE_METAL_ATTN_VDIST")) {
+    IREE::GPU::GPUPipelineOptions options;
+    addGPUVectorDistributePassPipeline(funcPassManager, options,
+                                       /*forROCDL=*/false);
+    // The LLVMGPU pipeline targets NVVM/ROCDL, which accept multi-dim vectors;
+    // SPIR-V needs rank-1 vectors + its own vector lowering. Break down the
+    // distributed vectors and run the SPIR-V vector-lowering tail so the generic
+    // (thread-distributed) attention legalizes to SPIR-V.
+    funcPassManager.addPass(createSPIRVBreakDownLargeVectorPass());
+    addSPIRVVectorLoweringPasses(funcPassManager);
+    funcPassManager.addPass(createSPIRVBreakDownLargeVectorPass());
+    funcPassManager.addPass(createCanonicalizerPass());
+    funcPassManager.addPass(createCSEPass());
+    return;
+  }
   addTileAndDistributeToWorkgroupsPasses(
       funcPassManager, /*useFuseTensorPadWithConsumerPass=*/true);
   funcPassManager.addPass(createFoldAffineMinInDistributedLoopsPass());
