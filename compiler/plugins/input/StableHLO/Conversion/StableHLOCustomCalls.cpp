@@ -11,6 +11,8 @@
 #include "compiler/plugins/input/StableHLO/Conversion/Preprocessing/Rewriters.h"
 #include "compiler/plugins/input/StableHLO/Conversion/Rewriters.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
+#include "iree/compiler/Dialect/Util/IR/UtilDialect.h"
+#include "iree/compiler/Dialect/Util/IR/UtilOps.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -19,6 +21,7 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Tensor/Utils/Utils.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/Matchers.h"
@@ -629,6 +632,7 @@ struct PairedAttentionMatch {
   Value outputGrad;
   Value mask;
   FloatAttr scale;
+  int64_t paddedSequence;
 };
 
 static std::optional<PairedAttentionMatch>
@@ -808,8 +812,28 @@ matchPairedAttention(mlir::stablehlo::DotGeneralOp outputDot) {
   // StableHLO graph unless both contractions fit the default Apple 8x8x8
   // simdgroup inventory. Backward role tagging independently verifies all five
   // of its materialized contractions after target selection.
-  if (!bf16.isBF16() || sequence < 8 || sequence % 8 != 0 || headDim < 8 ||
-      headDim % 8 != 0) {
+  int64_t paddedSequence = sequence;
+  if (!mask) {
+    // The standard ViT-base sequence is one element beyond the aligned native
+    // path. Its paired rewrite pads to the best measured physical length and
+    // masks the added keys. The environment override is also used by focused
+    // tests and schedule sweeps; zero disables the automatic padding of an
+    // otherwise unaligned sequence.
+    int64_t requestedSequence = sequence == 577 ? 592 : sequence;
+    if (const char *value = std::getenv("IREE_METAL_ATTN_PAD_SEQUENCE")) {
+      char *end = nullptr;
+      long parsed = std::strtol(value, &end, 10);
+      if (end != value && *end == '\0') {
+        requestedSequence = parsed;
+      }
+    }
+    if (requestedSequence >= sequence && requestedSequence % 8 == 0 &&
+        requestedSequence - sequence <= 128) {
+      paddedSequence = requestedSequence;
+    }
+  }
+  if (!bf16.isBF16() || sequence < 8 || paddedSequence % 8 != 0 ||
+      headDim < 8 || headDim % 8 != 0) {
     return std::nullopt;
   }
   // Broadcast dimensions alone do not prove that the denominator is a row
@@ -1112,7 +1136,46 @@ matchPairedAttention(mlir::stablehlo::DotGeneralOp outputDot) {
                               keyGradLeaf,   query,
                               key,           value,
                               outputGrad,    mask,
-                              scale};
+                              scale,         paddedSequence};
+}
+
+static Value padAttentionSequence(OpBuilder &builder, Location loc, Value value,
+                                  int64_t paddedSequence) {
+  auto type = cast<RankedTensorType>(value.getType());
+  SmallVector<int64_t> paddedShape(type.getShape());
+  paddedShape[2] = paddedSequence;
+  auto paddedType =
+      RankedTensorType::get(paddedShape, type.getElementType());
+  Value zero = arith::ConstantOp::create(
+      builder, loc, builder.getZeroAttr(type.getElementType()));
+  return tensor::createPadHighOp(paddedType, value, zero, /*nofold=*/false,
+                                 loc, builder);
+}
+
+static Value sliceAttentionSequence(OpBuilder &builder, Location loc,
+                                    Value value, RankedTensorType resultType) {
+  int64_t rank = resultType.getRank();
+  SmallVector<OpFoldResult> offsets(rank, builder.getIndexAttr(0));
+  SmallVector<OpFoldResult> sizes =
+      llvm::map_to_vector(resultType.getShape(), [&](int64_t size) {
+        return OpFoldResult(builder.getIndexAttr(size));
+      });
+  SmallVector<OpFoldResult> strides(rank, builder.getIndexAttr(1));
+  return tensor::ExtractSliceOp::create(builder, loc, resultType, value,
+                                        offsets, sizes, strides);
+}
+
+static Value createPaddedKeyMask(OpBuilder &builder, Location loc,
+                                 int64_t sequence, int64_t paddedSequence) {
+  auto maskType =
+      RankedTensorType::get({paddedSequence}, builder.getI1Type());
+  SmallVector<llvm::APInt> maskValues;
+  maskValues.reserve(paddedSequence);
+  for (int64_t index = 0; index < paddedSequence; ++index) {
+    maskValues.emplace_back(/*numBits=*/1, index < sequence);
+  }
+  auto maskAttr = DenseIntElementsAttr::get(maskType, maskValues);
+  return arith::ConstantOp::create(builder, loc, maskType, maskAttr);
 }
 
 static void rewritePairedAttention(PairedAttentionMatch match) {
@@ -1125,8 +1188,29 @@ static void rewritePairedAttention(PairedAttentionMatch match) {
   int64_t batch = queryType.getDimSize(0);
   int64_t heads = queryType.getDimSize(1);
   int64_t sequence = queryType.getDimSize(2);
+  int64_t originalSequence = sequence;
+  bool padSequence = match.paddedSequence != sequence;
 
   OpBuilder forwardBuilder(match.outputDot);
+  Value query = match.query;
+  Value key = match.key;
+  Value value = match.value;
+  Value mask = match.mask;
+  if (padSequence) {
+    query = padAttentionSequence(forwardBuilder, loc, query,
+                                 match.paddedSequence);
+    key =
+        padAttentionSequence(forwardBuilder, loc, key, match.paddedSequence);
+    value =
+        padAttentionSequence(forwardBuilder, loc, value, match.paddedSequence);
+    mask = createPaddedKeyMask(forwardBuilder, loc, originalSequence,
+                               match.paddedSequence);
+    queryType = cast<RankedTensorType>(query.getType());
+    keyType = cast<RankedTensorType>(key.getType());
+    valueType = cast<RankedTensorType>(value.getType());
+    outputType = outputType.clone(queryType.getShape());
+    sequence = match.paddedSequence;
+  }
   Value scale = arith::ConstantOp::create(forwardBuilder, loc, match.scale);
   Value outputInit = tensor::EmptyOp::create(
       forwardBuilder, loc, outputType.getShape(), outputType.getElementType());
@@ -1153,9 +1237,9 @@ static void rewritePairedAttention(PairedAttentionMatch match) {
   AffineMap outputMap = map({b, h, m, n});
   AffineMap logsumexpMap = map({b, h, m});
   AffineMap scaleMap = map({});
-  AffineMap maskMap = map({m, k2});
+  AffineMap maskMap = padSequence ? map({k2}) : map({m, k2});
   SmallVector<AffineMap> forwardMaps = {queryMap, keyMap, valueMap, scaleMap};
-  if (match.mask) {
+  if (mask) {
     forwardMaps.push_back(maskMap);
   }
   forwardMaps.append({outputMap, logsumexpMap});
@@ -1165,8 +1249,8 @@ static void rewritePairedAttention(PairedAttentionMatch match) {
           forwardBuilder.getBoolAttr(false))});
   SmallVector<Type> forwardResultTypes = {outputType, logsumexpType};
   auto attention = IREE::LinalgExt::AttentionOp::create(
-      forwardBuilder, loc, forwardResultTypes, match.query, match.key,
-      match.value, scale, match.mask, outputInit, logsumexpInit,
+      forwardBuilder, loc, forwardResultTypes, query, key, value, scale, mask,
+      outputInit, logsumexpInit,
       forwardBuilder.getAffineMapArrayAttr(forwardMaps), decompositionConfig);
   {
     OpBuilder::InsertionGuard guard(forwardBuilder);
@@ -1175,9 +1259,26 @@ static void rewritePairedAttention(PairedAttentionMatch match) {
     forwardBuilder.setInsertionPointToEnd(body);
     IREE::LinalgExt::YieldOp::create(forwardBuilder, loc, body->getArgument(0));
   }
+  Value attentionOutput = attention.getResult(0);
+  Value attentionLogsumexp = attention.getResult(1);
+  if (padSequence) {
+    auto attentionBarrier = IREE::Util::OptimizationBarrierOp::create(
+        forwardBuilder, loc,
+        ValueRange{attentionOutput, attentionLogsumexp});
+    attentionOutput = attentionBarrier.getResult(0);
+    attentionLogsumexp = attentionBarrier.getResult(1);
+  }
 
   // Insert after dO is available and before the earliest old gradient root.
   OpBuilder backwardBuilder(match.outputGradRoot);
+  Value outputGrad = match.outputGrad;
+  if (padSequence) {
+    outputGrad = padAttentionSequence(backwardBuilder, loc, outputGrad,
+                                      match.paddedSequence);
+    outputGrad = IREE::Util::OptimizationBarrierOp::create(
+                     backwardBuilder, loc, ValueRange{outputGrad})
+                     .getResult(0);
+  }
   Value queryGradInit = tensor::EmptyOp::create(
       backwardBuilder, loc, queryType.getShape(), queryType.getElementType());
   Value keyGradInit = tensor::EmptyOp::create(
@@ -1187,27 +1288,47 @@ static void rewritePairedAttention(PairedAttentionMatch match) {
   SmallVector<AffineMap> backwardMaps = {
       queryMap, keyMap,  valueMap, outputMap,
       outputMap, logsumexpMap, scaleMap};
-  if (match.mask) {
+  if (mask) {
     backwardMaps.push_back(maskMap);
   }
   backwardMaps.append({queryMap, keyMap, valueMap});
   SmallVector<Type> backwardResultTypes = {queryType, keyType, valueType};
   auto attentionBackward = IREE::LinalgExt::AttentionBackwardOp::create(
-      backwardBuilder, loc, backwardResultTypes, match.query, match.key,
-      match.value, attention.getResult(0), match.outputGrad,
-      attention.getResult(1), scale, match.mask, queryGradInit,
+      backwardBuilder, loc, backwardResultTypes, query, key, value,
+      attentionOutput, outputGrad, attentionLogsumexp, scale, mask,
+      queryGradInit,
       keyGradInit, valueGradInit,
       backwardBuilder.getAffineMapArrayAttr(backwardMaps), decompositionConfig);
 
   // Mutate only the externally visible leaves, and only after both operations
   // have been constructed. Replace the forward result last.
-  match.queryGradLeaf.getResult().replaceAllUsesWith(
-      attentionBackward.getResult(0));
-  match.keyGradLeaf.getResult().replaceAllUsesWith(
-      attentionBackward.getResult(1));
-  match.valueGradLeaf.getResult().replaceAllUsesWith(
-      attentionBackward.getResult(2));
-  match.outputDot.getResult().replaceAllUsesWith(attention.getResult(0));
+  Value queryGrad = attentionBackward.getResult(0);
+  Value keyGrad = attentionBackward.getResult(1);
+  Value valueGrad = attentionBackward.getResult(2);
+  Value output = attentionOutput;
+  if (padSequence) {
+    auto gradientBarrier = IREE::Util::OptimizationBarrierOp::create(
+        backwardBuilder, loc, ValueRange{queryGrad, keyGrad, valueGrad});
+    queryGrad = gradientBarrier.getResult(0);
+    keyGrad = gradientBarrier.getResult(1);
+    valueGrad = gradientBarrier.getResult(2);
+    queryGrad = sliceAttentionSequence(
+        backwardBuilder, loc, queryGrad,
+        cast<RankedTensorType>(match.queryGradLeaf.getType()));
+    keyGrad = sliceAttentionSequence(
+        backwardBuilder, loc, keyGrad,
+        cast<RankedTensorType>(match.keyGradLeaf.getType()));
+    valueGrad = sliceAttentionSequence(
+        backwardBuilder, loc, valueGrad,
+        cast<RankedTensorType>(match.valueGradLeaf.getType()));
+    output = sliceAttentionSequence(
+        forwardBuilder, loc, output,
+        cast<RankedTensorType>(match.outputDot.getType()));
+  }
+  match.queryGradLeaf.getResult().replaceAllUsesWith(queryGrad);
+  match.keyGradLeaf.getResult().replaceAllUsesWith(keyGrad);
+  match.valueGradLeaf.getResult().replaceAllUsesWith(valueGrad);
+  match.outputDot.getResult().replaceAllUsesWith(output);
 }
 
 static void raisePairedAttention(ModuleOp module) {
@@ -1463,6 +1584,7 @@ struct ConvertFlashAttentionDispatch final
 
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<arith::ArithDialect, IREE::LinalgExt::IREELinalgExtDialect,
+                    IREE::Util::UtilDialect,
                     mlir::stablehlo::StablehloDialect, tensor::TensorDialect>();
   }
 

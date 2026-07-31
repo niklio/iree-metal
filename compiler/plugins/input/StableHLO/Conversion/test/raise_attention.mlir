@@ -11,6 +11,7 @@
 // RUN: env -u IREE_METAL_DISABLE_NATIVE_ATTENTION iree-opt --split-input-file --iree-stablehlo-input-transformation-pipeline %s | FileCheck %s --check-prefix=PIPELINE-OFF
 // RUN: env IREE_METAL_DISABLE_NATIVE_ATTENTION=1 iree-opt --split-input-file --iree-stablehlo-input-transformation-pipeline="enable-native-attention=true" %s | FileCheck %s --check-prefix=PIPELINE-OFF
 // RUN: env -u IREE_METAL_DISABLE_NATIVE_ATTENTION iree-opt --split-input-file --iree-stablehlo-input-transformation-pipeline="enable-native-attention=true" %s | FileCheck %s --check-prefixes=PIPELINE,PIPELINE-NEGATIVE
+// RUN: env -u IREE_METAL_DISABLE_NATIVE_ATTENTION IREE_METAL_ATTN_PAD_SEQUENCE=16 iree-opt --split-input-file --iree-stablehlo-input-transformation-pipeline="enable-native-attention=true" %s | FileCheck %s --check-prefix=PADDED
 
 // This is a compact JAX 0.6.1 lowering of the bf16 causal attention used by
 // iree-fork-bench/bench.py, including its value_and_grad graph. B, H, T, and D
@@ -153,6 +154,35 @@
 // PIPELINE: iree_linalg_ext.attention_backward
 // PIPELINE-NOT: stablehlo.exponential
 // PIPELINE: return
+
+// PADDED-DAG: #[[KEY_MASK_MAP:[a-zA-Z0-9_]+]] = affine_map<(d0, d1, d2, d3, d4, d5) -> (d5)>
+// PADDED-LABEL: func.func public @unmasked_main(
+// PADDED: %[[KEY_MASK:.+]] = arith.constant dense<
+// PADDED-SAME: tensor<16xi1>
+// PADDED-DAG: %[[PAD_Q:.+]] = tensor.pad %arg0
+// PADDED-SAME: high[0, 0, 8, 0]
+// PADDED-DAG: %[[PAD_K:.+]] = tensor.pad %arg1
+// PADDED-SAME: high[0, 0, 8, 0]
+// PADDED-DAG: %[[PAD_V:.+]] = tensor.pad %arg2
+// PADDED-SAME: high[0, 0, 8, 0]
+// PADDED: %[[ATTN:.+]]:2 = iree_linalg_ext.attention
+// PADDED-SAME: indexing_maps = [{{.*}}#[[KEY_MASK_MAP]], {{.*}}]
+// PADDED-SAME: ins(%[[PAD_Q]], %[[PAD_K]], %[[PAD_V]],
+// PADDED-SAME: %[[KEY_MASK]]
+// PADDED-SAME: tensor<2x2x16x8xbf16>
+// PADDED-SAME: tensor<16xi1>
+// PADDED: %[[ATTN_BARRIER:.+]]:2 = util.optimization_barrier %[[ATTN]]#0, %[[ATTN]]#1
+// PADDED: tensor.extract_slice
+// PADDED-SAME: tensor<2x2x16x8xbf16> to tensor<2x2x8x8xbf16>
+// PADDED: iree_linalg_ext.attention_backward
+// PADDED-SAME: indexing_maps = [{{.*}}#[[KEY_MASK_MAP]], {{.*}}]
+// PADDED-SAME: ins({{.*}}%[[KEY_MASK]]
+// PADDED-SAME: tensor<2x2x16x8xbf16>
+// PADDED: %[[GRAD_BARRIER:.+]]:3 = util.optimization_barrier
+// PADDED: tensor.extract_slice %[[GRAD_BARRIER]]#0
+// PADDED: tensor.extract_slice %[[GRAD_BARRIER]]#1
+// PADDED: tensor.extract_slice %[[GRAD_BARRIER]]#2
+// PADDED: return
 
 // An eligible unmasked forward without its shared VJP must remain untouched.
 // NEGATIVE-LABEL: func.func public @unmasked_incomplete_backward
