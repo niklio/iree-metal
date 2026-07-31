@@ -830,9 +830,14 @@ AttentionBackwardOp::decomposeOperation(OpBuilder &builder) {
                              builder, loc, ValueRange{valueProbabilities})
                              .getResult(0);
   }
+  // The native Apple contraction distribution expects parallel dimensions
+  // before reduction dimensions. The original dV domain orders the reduced
+  // query dimension before the value-output dimension, so canonicalize it just
+  // as we do for dK above.
   valueGradF32 =
       computeMatmul(builder, loc, scoreMap, getOutputGradMap(), getValueMap(),
-                    valueProbabilities, getOutputGrad(), valueGradF32, dvAttrs);
+                    valueProbabilities, getOutputGrad(), valueGradF32, dvAttrs,
+                    /*canonicalizeLoopOrder=*/nativeDV);
 
   Value queryGrad =
       convertTensor(builder, loc, getQueryMap(), getQueryGradMap(),

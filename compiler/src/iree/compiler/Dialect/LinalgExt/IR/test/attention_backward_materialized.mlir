@@ -40,9 +40,9 @@ func.func @materialized_backward(
       tensor<1x2x5x6xbf16>
 }
 
-// CHECK-DAG:   #[[DK_LHS:map[0-9]+]] = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d4, d2)>
-// CHECK-DAG:   #[[DK_RHS:map[0-9]+]] = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d4, d3)>
-// CHECK-DAG:   #[[DK_OUT:map[0-9]+]] = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3)>
+// CHECK-DAG:   #[[CANON_LHS:map[0-9]+]] = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d4, d2)>
+// CHECK-DAG:   #[[CANON_RHS:map[0-9]+]] = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d4, d3)>
+// CHECK-DAG:   #[[CANON_OUT:map[0-9]+]] = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3)>
 // CHECK-LABEL: func.func @materialized_backward
 // CHECK:       iree_codegen.apple_attention_backward_role = "qk_attrs"
 // CHECK:       %[[P16:[0-9]+]] = linalg.generic{{.*}} ins({{.*}} : tensor<1x2x3xf32>, tensor<1x2x3x5xf32>) outs({{.*}} : tensor<1x2x3x5xbf16>)
@@ -56,11 +56,12 @@ func.func @materialized_backward(
 // CHECK:       %[[DQ_BARRIER:[0-9]+]] = util.optimization_barrier %[[DS]]
 // CHECK:       iree_codegen.apple_attention_backward_role = "dq_attrs"
 // CHECK:       %[[DK_BARRIER:[0-9]+]] = util.optimization_barrier %[[DS]]
-// CHECK:       linalg.generic {indexing_maps = [#[[DK_LHS]], #[[DK_RHS]], #[[DK_OUT]]]
+// CHECK:       linalg.generic {indexing_maps = [#[[CANON_LHS]], #[[CANON_RHS]], #[[CANON_OUT]]]
 // CHECK-SAME:  iree_codegen.apple_attention_backward_role = "dk_attrs"
 // CHECK-NOT:   linalg.generic{{.*}} ins({{.*}} : tensor<1x2x3x5xf32>) outs({{.*}} : tensor<1x2x3x5xbf16>)
 // CHECK:       util.optimization_barrier %[[P_BARRIER]]
-// CHECK:       iree_codegen.apple_attention_backward_role = "dv_attrs"
+// CHECK:       linalg.generic {indexing_maps = [#[[CANON_LHS]], #[[CANON_RHS]], #[[CANON_OUT]]]
+// CHECK-SAME:  iree_codegen.apple_attention_backward_role = "dv_attrs"
 
 // CHECK-LABEL: func.func @portable_contraction_attrs
 // CHECK:       iree_codegen.test_marker = "preserve"
