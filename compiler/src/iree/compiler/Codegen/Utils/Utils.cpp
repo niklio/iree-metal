@@ -1365,23 +1365,36 @@ OpFoldResult convertByteOffsetToElementOffset(RewriterBase &rewriter,
                                               Location loc,
                                               OpFoldResult byteOffset,
                                               Type elementType) {
+  if (getConstantIntValue(byteOffset) == 0) {
+    return byteOffset;
+  }
   if (isa<ComplexType, FloatType, IntegerType, VectorType>(elementType)) {
     unsigned typeBitWidth = IREE::Util::getTypeBitWidth(elementType);
     assert(llvm::isPowerOf2_32(typeBitWidth) &&
            "unhandled non powers of 2 bit width while converting byte offset "
            "to element offset");
-    AffineExpr s0, s1;
-    bindSymbols(rewriter.getContext(), s0, s1);
-    return affine::makeComposedFoldedAffineApply(
-        rewriter, loc, (s0 * 8).floorDiv(typeBitWidth),
-        {byteOffset, rewriter.getIndexAttr(typeBitWidth)});
+    if (typeBitWidth < 8) {
+      AffineExpr s0;
+      bindSymbols(rewriter.getContext(), s0);
+      return affine::makeComposedFoldedAffineApply(
+          rewriter, loc, s0 * (8 / typeBitWidth), {byteOffset});
+    }
+    Value byteOffsetValue =
+        getValueOrCreateConstantIndexOp(rewriter, loc, byteOffset);
+    Value elementByteSize = arith::ConstantIndexOp::create(
+        rewriter, loc, typeBitWidth / 8);
+    // Buffer byte offsets are unsigned. Using affine floorDiv here lowers
+    // through signed arithmetic and miscomputes offsets whose low 32-bit
+    // representation is negative (for example offsets above INT32_MAX).
+    return rewriter.createOrFold<arith::DivUIOp>(
+        loc, byteOffsetValue, elementByteSize);
   } else {
-    OpFoldResult elementByteSize =
+    Value byteOffsetValue =
+        getValueOrCreateConstantIndexOp(rewriter, loc, byteOffset);
+    Value elementByteSize =
         IREE::Util::SizeOfOp::create(rewriter, loc, elementType).getResult();
-    AffineExpr s0, s1;
-    bindSymbols(rewriter.getContext(), s0, s1);
-    return affine::makeComposedFoldedAffineApply(rewriter, loc, s0.floorDiv(s1),
-                                                 {byteOffset, elementByteSize});
+    return rewriter.createOrFold<arith::DivUIOp>(
+        loc, byteOffsetValue, elementByteSize);
   }
 }
 

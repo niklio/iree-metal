@@ -110,13 +110,12 @@ func.func @resolve_binding_subspan_offset_index(%arg0 : index) -> (!util.buffer,
   %base_buffer, %offset, %sizes:2, %strides:2 = vmvx.get_buffer_descriptor %0 : memref<512x384xindex> -> !util.buffer, index, index, index, index, index
   return %base_buffer, %offset, %sizes#0, %sizes#1, %strides#0, %strides#1 : !util.buffer, index, index, index, index, index
 }
-//     CHECK: #[[MAP:.+]] = affine_map<()[s0, s1] -> (s0 floordiv s1)>
 //     CHECK: func @resolve_binding_subspan_offset_index(
 // CHECK-DAG:   %[[C512:.+]] = arith.constant 512 : index
 // CHECK-DAG:   %[[C384:.+]] = arith.constant 384 : index
 // CHECK-DAG:   %[[C1:.+]] = arith.constant 1 : index
 // CHECK-DAG:   %[[INDEX_SIZE:.+]] = util.sizeof index
-// CHECK-DAG:   %[[OFFSET:.+]] = affine.apply #map()[%arg0, %[[INDEX_SIZE]]]
+// CHECK-DAG:   %[[OFFSET:.+]] = arith.divui %arg0, %[[INDEX_SIZE]] : index
 //     CHECK:   %[[CAST:.+]] = vmvx.get_raw_interface_binding_buffer layout({{.+}}) binding(0)
 //     CHECK:   return %[[CAST]], %[[OFFSET]], %[[C512]], %[[C384]], %[[C384]], %[[C1]]
 

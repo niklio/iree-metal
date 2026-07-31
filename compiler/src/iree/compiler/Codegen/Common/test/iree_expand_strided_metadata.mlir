@@ -90,16 +90,15 @@ func.func @resolve_binding_subspan_offset_index_memref(%arg0 : index) -> (memref
   %base_buffer, %offset, %sizes:2, %strides:2 = memref.extract_strided_metadata %0 : memref<512x384xindex, strided<[384, 1], offset:?>> -> memref<index>, index, index, index, index, index
   return %base_buffer, %offset, %sizes#0, %sizes#1, %strides#0, %strides#1 : memref<index>, index, index, index, index, index
 }
-//   CHECK-DAG: #[[$MAP:.+]] = affine_map<()[s0, s1] -> (s0 floordiv s1)>
-//   CHECK-DAG: #[[$MAP1:.+]] = affine_map<()[s0, s1] -> (s0 floordiv s1 + 196608)>
+//   CHECK-DAG: #[[$MAP:.+]] = affine_map<()[s0] -> (s0 + 196608)>
 // CHECK-LABEL: func @resolve_binding_subspan_offset_index_memref(
 //   CHECK-DAG:   %[[C512:.+]] = arith.constant 512 : index
 //   CHECK-DAG:   %[[C384:.+]] = arith.constant 384 : index
 //   CHECK-DAG:   %[[C1:.+]] = arith.constant 1 : index
 //   CHECK-DAG:   %[[C0:.+]] = arith.constant 0 : index
 //       CHECK:   %[[SIZEOF:.+]] = util.sizeof index
-//       CHECK:   %[[OFFSET:.+]] = affine.apply #[[$MAP]]()[%arg0, %[[SIZEOF]]]
-//       CHECK:   %[[SUBSPAN_SIZE:.+]] = affine.apply #[[$MAP1]]()[%arg0, %[[SIZEOF]]]
+//       CHECK:   %[[OFFSET:.+]] = arith.divui %arg0, %[[SIZEOF]] : index
+//       CHECK:   %[[SUBSPAN_SIZE:.+]] = affine.apply #[[$MAP]]()[%[[OFFSET]]]
 //       CHECK:   %[[BINDING:.+]] = hal.interface.binding.subspan layout({{.+}}) binding(0) alignment(64) offset(%[[C0]]) : memref<?xindex>{%[[SUBSPAN_SIZE]]}
 //       CHECK:   %[[BASE_PTR:.+]] = memref.reinterpret_cast %[[BINDING]] to offset: [0], sizes: [], strides: []
 //       CHECK:   return %[[BASE_PTR]], %[[OFFSET]], %[[C512]], %[[C384]], %[[C384]], %[[C1]]

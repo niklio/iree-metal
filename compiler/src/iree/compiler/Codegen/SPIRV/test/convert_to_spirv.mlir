@@ -340,3 +340,32 @@ hal.executable private @interface_wg_count {
 //       INDEX64:     %[[VAL2:.+]] = spirv.Load "Input" %[[ADDR2]]
 //       INDEX64:     %[[WGIDY:.+]] = spirv.CompositeExtract %[[VAL2]][1 : i32]
 //       INDEX64:     {{.+}} = spirv.UConvert %[[WGIDY]] : i32 to i64
+
+// -----
+
+#pipeline_layout = #hal.pipeline.layout<constants = 1, bindings = []>
+hal.executable private @unsigned_div {
+  hal.executable.variant @vulkan target(<"vulkan-spirv", "vulkan-spirv-fb">) {
+    hal.executable.export public @unsigned_div layout(#pipeline_layout) attributes {
+      workgroup_size = [1: index, 1: index, 1: index]
+    }
+    builtin.module attributes {
+      spirv.target_env = #spirv.target_env<
+        #spirv.vce<v1.3, [Int64, Shader], []>, #spirv.resource_limits<>>
+    } {
+      // CHECK-LABEL: spirv.func @unsigned_div()
+      // CHECK-NOT: spirv.SDiv
+      // CHECK: %[[DIV:.+]] = spirv.UDiv %{{.+}}, %{{.+}} : i32
+      // CHECK-NOT: spirv.SDiv
+      // CHECK: spirv.ReturnValue %[[DIV]] : i32
+      func.func @unsigned_div() -> index {
+        %0 = hal.interface.constant.load
+            layout(#pipeline_layout) ordinal(0) : i32
+        %1 = arith.index_castui %0 : i32 to index
+        %c2 = arith.constant 2 : index
+        %2 = arith.divui %1, %c2 : index
+        return %2 : index
+      }
+    }
+  }
+}
