@@ -115,6 +115,59 @@
 // CURRENT: stablehlo.constant dense<0.000000e+00> : tensor<2x2x8x8xbf16>
 // CURRENT: stablehlo.select
 
+// This is the same paired forward/VJP spelling emitted by the encoder models,
+// with no causal mask. The colon immediately after the scale in each input
+// list proves that the optional mask and its indexing map are both absent.
+//
+// RAISED-LABEL: func.func public @unmasked_main(
+// RAISED-SAME: %[[UQ:[^:]+]]: tensor<2x2x8x8xbf16>,
+// RAISED-SAME: %[[UK:[^:]+]]: tensor<2x2x8x8xbf16>,
+// RAISED-SAME: %[[UV:[^:]+]]: tensor<2x2x8x8xbf16>)
+// RAISED: %[[USCALE:.+]] = arith.constant {{.*}} : bf16
+// RAISED-NOT: stablehlo.exponential
+// RAISED-NOT: stablehlo.dot_general
+// RAISED: %[[UATTN:.+]]:2 = iree_linalg_ext.attention
+// RAISED-SAME: decomposition_config = {use_exp2 = false}
+// RAISED: ins(%[[UQ]], %[[UK]], %[[UV]], %[[USCALE]] :
+// RAISED: %[[UBWD:.+]]:3 = iree_linalg_ext.attention_backward
+// RAISED-SAME: decomposition_config = {use_exp2 = false}
+// RAISED: ins(%[[UQ]], %[[UK]], %[[UV]], %[[UATTN]]#0, {{%[^,]+}}, %[[UATTN]]#1, %[[USCALE]] :
+// RAISED: return {{.*}}%[[UBWD]]#0, %[[UBWD]]#1, %[[UBWD]]#2
+
+// OPTION-OFF-LABEL: func.func public @unmasked_main(
+// OPTION-OFF-NOT: iree_linalg_ext.attention
+// OPTION-OFF: stablehlo.exponential
+// OPTION-OFF-NOT: iree_linalg_ext.attention
+// OPTION-OFF: return
+
+// PIPELINE-OFF-LABEL: func.func public @unmasked_main(
+// PIPELINE-OFF-NOT: iree_linalg_ext.attention
+// PIPELINE-OFF: linalg.batch_matmul
+// PIPELINE-OFF: math.exp
+// PIPELINE-OFF-NOT: iree_linalg_ext.attention
+// PIPELINE-OFF: return
+
+// PIPELINE-LABEL: func.func public @unmasked_main(
+// PIPELINE-NOT: stablehlo.exponential
+// PIPELINE: iree_linalg_ext.attention
+// PIPELINE: iree_linalg_ext.attention_backward
+// PIPELINE-NOT: stablehlo.exponential
+// PIPELINE: return
+
+// An eligible unmasked forward without its shared VJP must remain untouched.
+// NEGATIVE-LABEL: func.func public @unmasked_incomplete_backward
+// NEGATIVE-NOT: iree_linalg_ext.attention
+// NEGATIVE: stablehlo.dot_general
+// NEGATIVE: stablehlo.exponential
+// NEGATIVE-NOT: iree_linalg_ext.attention
+// NEGATIVE: return
+
+// PIPELINE-NEGATIVE-LABEL: func.func public @unmasked_incomplete_backward
+// PIPELINE-NEGATIVE-NOT: iree_linalg_ext.attention
+// PIPELINE-NEGATIVE: linalg.batch_matmul
+// PIPELINE-NEGATIVE-NOT: iree_linalg_ext.attention
+// PIPELINE-NEGATIVE: return
+
 module @jit_loss attributes {mhlo.num_partitions = 1 : i32, mhlo.num_replicas = 1 : i32} {
   func.func public @main(%arg0: tensor<2x2x8x8xbf16>, %arg1: tensor<2x2x8x8xbf16>, %arg2: tensor<2x2x8x8xbf16>, %arg3: tensor<2x2x8x8xbf16>) -> (tensor<f32> {jax.result_info = "result[0]"}, tensor<2x2x8x8xbf16> {jax.result_info = "result[1][0]"}, tensor<2x2x8x8xbf16> {jax.result_info = "result[1][1]"}, tensor<2x2x8x8xbf16> {jax.result_info = "result[1][2]"}) {
     %0 = stablehlo.transpose %arg1, dims = [0, 1, 3, 2] : (tensor<2x2x8x8xbf16>) -> tensor<2x2x8x8xbf16>
@@ -356,6 +409,218 @@ module @jit_loss attributes {mhlo.num_partitions = 1 : i32, mhlo.num_replicas = 
     %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<bf16>) -> tensor<2x2x8x8xbf16>
     %1 = stablehlo.select %arg0, %arg1, %0 : tensor<2x2x8x8xi1>, tensor<2x2x8x8xbf16>
     return %1 : tensor<2x2x8x8xbf16>
+  }
+}
+
+// -----
+
+module @jit_unmasked attributes {mhlo.num_partitions = 1 : i32, mhlo.num_replicas = 1 : i32} {
+  func.func public @unmasked_main(
+      %q: tensor<2x2x8x8xbf16>, %k: tensor<2x2x8x8xbf16>,
+      %v: tensor<2x2x8x8xbf16>)
+      -> (tensor<f32>, tensor<2x2x8x8xbf16>, tensor<2x2x8x8xbf16>,
+          tensor<2x2x8x8xbf16>) {
+    %kt = stablehlo.transpose %k, dims = [0, 1, 3, 2] :
+        (tensor<2x2x8x8xbf16>) -> tensor<2x2x8x8xbf16>
+    %qk = stablehlo.dot_general %q, %kt,
+        batching_dims = [0, 1] x [0, 1],
+        contracting_dims = [3] x [2],
+        precision = [DEFAULT, DEFAULT] :
+        (tensor<2x2x8x8xbf16>, tensor<2x2x8x8xbf16>)
+        -> tensor<2x2x8x8xbf16>
+    %scale_scalar = stablehlo.constant dense<3.535160e-01> : tensor<bf16>
+    %scale = stablehlo.broadcast_in_dim %scale_scalar, dims = [] :
+        (tensor<bf16>) -> tensor<2x2x8x8xbf16>
+    %scaled = stablehlo.multiply %qk, %scale : tensor<2x2x8x8xbf16>
+    %neg_inf = stablehlo.constant dense<0xFF80> : tensor<bf16>
+    %row_max = stablehlo.reduce(%scaled init: %neg_inf)
+        applies stablehlo.maximum across dimensions = [3] :
+        (tensor<2x2x8x8xbf16>, tensor<bf16>) -> tensor<2x2x8xbf16>
+    %neg_inf_scalar = stablehlo.constant dense<0xFF80> : tensor<bf16>
+    %neg_inf_rows = stablehlo.broadcast_in_dim %neg_inf_scalar, dims = [] :
+        (tensor<bf16>) -> tensor<2x2x8xbf16>
+    %clamped_max = stablehlo.maximum %neg_inf_rows, %row_max :
+        tensor<2x2x8xbf16>
+    %max_4d = stablehlo.broadcast_in_dim %clamped_max,
+        dims = [0, 1, 2] :
+        (tensor<2x2x8xbf16>) -> tensor<2x2x8x1xbf16>
+    %max_broadcast = stablehlo.broadcast_in_dim %max_4d,
+        dims = [0, 1, 2, 3] :
+        (tensor<2x2x8x1xbf16>) -> tensor<2x2x8x8xbf16>
+    %centered = stablehlo.subtract %scaled, %max_broadcast :
+        tensor<2x2x8x8xbf16>
+    %exp = stablehlo.exponential %centered : tensor<2x2x8x8xbf16>
+    %exp_f32 = stablehlo.convert %exp :
+        (tensor<2x2x8x8xbf16>) -> tensor<2x2x8x8xf32>
+    %zero_f32 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %sum = stablehlo.reduce(%exp_f32 init: %zero_f32)
+        applies stablehlo.add across dimensions = [3] :
+        (tensor<2x2x8x8xf32>, tensor<f32>) -> tensor<2x2x8xf32>
+    %sum_4d_f32 = stablehlo.broadcast_in_dim %sum, dims = [0, 1, 2] :
+        (tensor<2x2x8xf32>) -> tensor<2x2x8x1xf32>
+    %sum_4d = stablehlo.convert %sum_4d_f32 :
+        (tensor<2x2x8x1xf32>) -> tensor<2x2x8x1xbf16>
+    %denominator = stablehlo.broadcast_in_dim %sum_4d,
+        dims = [0, 1, 2, 3] :
+        (tensor<2x2x8x1xbf16>) -> tensor<2x2x8x8xbf16>
+    %probability = stablehlo.divide %exp, %denominator :
+        tensor<2x2x8x8xbf16>
+    %denominator_squared = stablehlo.multiply %sum_4d, %sum_4d :
+        tensor<2x2x8x1xbf16>
+    %one = stablehlo.constant dense<1.000000e+00> : tensor<bf16>
+    %one_4d = stablehlo.broadcast_in_dim %one, dims = [] :
+        (tensor<bf16>) -> tensor<2x2x8x1xbf16>
+    %inverse = stablehlo.divide %one_4d, %denominator_squared :
+        tensor<2x2x8x1xbf16>
+    %output = stablehlo.dot_general %probability, %v,
+        batching_dims = [0, 1] x [0, 1],
+        contracting_dims = [3] x [2],
+        precision = [DEFAULT, DEFAULT] :
+        (tensor<2x2x8x8xbf16>, tensor<2x2x8x8xbf16>)
+        -> tensor<2x2x8x8xbf16>
+    %output_f32 = stablehlo.convert %output :
+        (tensor<2x2x8x8xbf16>) -> tensor<2x2x8x8xf32>
+    %squared = stablehlo.multiply %output_f32, %output_f32 :
+        tensor<2x2x8x8xf32>
+    %two = stablehlo.constant dense<2.000000e+00> : tensor<f32>
+    %two_broadcast = stablehlo.broadcast_in_dim %two, dims = [] :
+        (tensor<f32>) -> tensor<2x2x8x8xf32>
+    %twice_output = stablehlo.multiply %two_broadcast, %output_f32 :
+        tensor<2x2x8x8xf32>
+    %loss_zero = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %loss = stablehlo.reduce(%squared init: %loss_zero)
+        applies stablehlo.add across dimensions = [0, 1, 2, 3] :
+        (tensor<2x2x8x8xf32>, tensor<f32>) -> tensor<f32>
+    %one_f32 = stablehlo.constant dense<1.000000e+00> : tensor<f32>
+    %one_broadcast = stablehlo.broadcast_in_dim %one_f32, dims = [] :
+        (tensor<f32>) -> tensor<2x2x8x8xf32>
+    %output_grad_f32 = stablehlo.multiply %one_broadcast, %twice_output :
+        tensor<2x2x8x8xf32>
+    %output_grad = stablehlo.convert %output_grad_f32 :
+        (tensor<2x2x8x8xf32>) -> tensor<2x2x8x8xbf16>
+    %dv_transposed = stablehlo.dot_general %output_grad, %probability,
+        batching_dims = [0, 1] x [0, 1],
+        contracting_dims = [2] x [2],
+        precision = [DEFAULT, DEFAULT] :
+        (tensor<2x2x8x8xbf16>, tensor<2x2x8x8xbf16>)
+        -> tensor<2x2x8x8xbf16>
+    %dv = stablehlo.transpose %dv_transposed, dims = [0, 1, 3, 2] :
+        (tensor<2x2x8x8xbf16>) -> tensor<2x2x8x8xbf16>
+    %dp = stablehlo.dot_general %output_grad, %v,
+        batching_dims = [0, 1] x [0, 1],
+        contracting_dims = [3] x [3],
+        precision = [DEFAULT, DEFAULT] :
+        (tensor<2x2x8x8xbf16>, tensor<2x2x8x8xbf16>)
+        -> tensor<2x2x8x8xbf16>
+    %inverse_broadcast = stablehlo.broadcast_in_dim %inverse,
+        dims = [0, 1, 2, 3] :
+        (tensor<2x2x8x1xbf16>) -> tensor<2x2x8x8xbf16>
+    %dp_times_inverse = stablehlo.multiply %dp, %inverse_broadcast :
+        tensor<2x2x8x8xbf16>
+    %weighted = stablehlo.multiply %dp_times_inverse, %exp :
+        tensor<2x2x8x8xbf16>
+    %zero_bf16 = stablehlo.constant dense<0.000000e+00> : tensor<bf16>
+    %weighted_reduce = stablehlo.reduce(%weighted init: %zero_bf16)
+        applies stablehlo.add across dimensions = [3] :
+        (tensor<2x2x8x8xbf16>, tensor<bf16>) -> tensor<2x2x8xbf16>
+    %negative = stablehlo.negate %weighted_reduce : tensor<2x2x8xbf16>
+    %negative_f32 = stablehlo.convert %negative :
+        (tensor<2x2x8xbf16>) -> tensor<2x2x8xf32>
+    %negative_4d = stablehlo.reshape %negative_f32 :
+        (tensor<2x2x8xf32>) -> tensor<2x2x8x1xf32>
+    %singleton_zero = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %singleton = stablehlo.reduce(%negative_4d init: %singleton_zero)
+        applies stablehlo.add across dimensions = [3] :
+        (tensor<2x2x8x1xf32>, tensor<f32>) -> tensor<2x2x8xf32>
+    %correction_f32 = stablehlo.broadcast_in_dim %singleton,
+        dims = [0, 1, 2] :
+        (tensor<2x2x8xf32>) -> tensor<2x2x8x8xf32>
+    %correction = stablehlo.convert %correction_f32 :
+        (tensor<2x2x8x8xf32>) -> tensor<2x2x8x8xbf16>
+    %direct = stablehlo.divide %dp, %denominator :
+        tensor<2x2x8x8xbf16>
+    %vjp = stablehlo.add %direct, %correction : tensor<2x2x8x8xbf16>
+    %unscaled_ds = stablehlo.multiply %vjp, %exp :
+        tensor<2x2x8x8xbf16>
+    %backward_scale = stablehlo.broadcast_in_dim %scale_scalar, dims = [] :
+        (tensor<bf16>) -> tensor<2x2x8x8xbf16>
+    %ds = stablehlo.multiply %unscaled_ds, %backward_scale :
+        tensor<2x2x8x8xbf16>
+    %dk_seed = stablehlo.dot_general %ds, %q,
+        batching_dims = [0, 1] x [0, 1],
+        contracting_dims = [2] x [2],
+        precision = [DEFAULT, DEFAULT] :
+        (tensor<2x2x8x8xbf16>, tensor<2x2x8x8xbf16>)
+        -> tensor<2x2x8x8xbf16>
+    %dk_transposed = stablehlo.transpose %dk_seed, dims = [0, 1, 3, 2] :
+        (tensor<2x2x8x8xbf16>) -> tensor<2x2x8x8xbf16>
+    %dq = stablehlo.dot_general %ds, %kt,
+        batching_dims = [0, 1] x [0, 1],
+        contracting_dims = [3] x [3],
+        precision = [DEFAULT, DEFAULT] :
+        (tensor<2x2x8x8xbf16>, tensor<2x2x8x8xbf16>)
+        -> tensor<2x2x8x8xbf16>
+    %dk = stablehlo.transpose %dk_transposed, dims = [0, 1, 3, 2] :
+        (tensor<2x2x8x8xbf16>) -> tensor<2x2x8x8xbf16>
+    return %loss, %dq, %dk, %dv :
+        tensor<f32>, tensor<2x2x8x8xbf16>, tensor<2x2x8x8xbf16>,
+        tensor<2x2x8x8xbf16>
+  }
+}
+
+// -----
+
+module {
+  func.func public @unmasked_incomplete_backward(
+      %q: tensor<2x2x8x8xbf16>, %k: tensor<2x2x8x8xbf16>,
+      %v: tensor<2x2x8x8xbf16>) -> tensor<2x2x8x8xbf16> {
+    %kt = stablehlo.transpose %k, dims = [0, 1, 3, 2] :
+        (tensor<2x2x8x8xbf16>) -> tensor<2x2x8x8xbf16>
+    %qk = stablehlo.dot_general %q, %kt,
+        batching_dims = [0, 1] x [0, 1],
+        contracting_dims = [3] x [2],
+        precision = [DEFAULT, DEFAULT] :
+        (tensor<2x2x8x8xbf16>, tensor<2x2x8x8xbf16>)
+        -> tensor<2x2x8x8xbf16>
+    %scale = stablehlo.constant dense<3.535160e-01> :
+        tensor<2x2x8x8xbf16>
+    %scaled = stablehlo.multiply %qk, %scale : tensor<2x2x8x8xbf16>
+    %neg_inf = stablehlo.constant dense<0xFF80> : tensor<bf16>
+    %row_max = stablehlo.reduce(%scaled init: %neg_inf)
+        applies stablehlo.maximum across dimensions = [3] :
+        (tensor<2x2x8x8xbf16>, tensor<bf16>) -> tensor<2x2x8xbf16>
+    %neg_inf_rows = stablehlo.constant dense<0xFF80> :
+        tensor<2x2x8xbf16>
+    %clamped_max = stablehlo.maximum %neg_inf_rows, %row_max :
+        tensor<2x2x8xbf16>
+    %max_broadcast = stablehlo.broadcast_in_dim %clamped_max,
+        dims = [0, 1, 2] :
+        (tensor<2x2x8xbf16>) -> tensor<2x2x8x8xbf16>
+    %centered = stablehlo.subtract %scaled, %max_broadcast :
+        tensor<2x2x8x8xbf16>
+    %exp = stablehlo.exponential %centered : tensor<2x2x8x8xbf16>
+    %exp_f32 = stablehlo.convert %exp :
+        (tensor<2x2x8x8xbf16>) -> tensor<2x2x8x8xf32>
+    %zero = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %sum = stablehlo.reduce(%exp_f32 init: %zero)
+        applies stablehlo.add across dimensions = [3] :
+        (tensor<2x2x8x8xf32>, tensor<f32>) -> tensor<2x2x8xf32>
+    %sum_bf16 = stablehlo.convert %sum :
+        (tensor<2x2x8xf32>) -> tensor<2x2x8xbf16>
+    %sum_4d = stablehlo.reshape %sum_bf16 :
+        (tensor<2x2x8xbf16>) -> tensor<2x2x8x1xbf16>
+    %denominator = stablehlo.broadcast_in_dim %sum_4d,
+        dims = [0, 1, 2, 3] :
+        (tensor<2x2x8x1xbf16>) -> tensor<2x2x8x8xbf16>
+    %probability = stablehlo.divide %exp, %denominator :
+        tensor<2x2x8x8xbf16>
+    %output = stablehlo.dot_general %probability, %v,
+        batching_dims = [0, 1] x [0, 1],
+        contracting_dims = [3] x [2],
+        precision = [DEFAULT, DEFAULT] :
+        (tensor<2x2x8x8xbf16>, tensor<2x2x8x8xbf16>)
+        -> tensor<2x2x8x8xbf16>
+    return %output : tensor<2x2x8x8xbf16>
   }
 }
 

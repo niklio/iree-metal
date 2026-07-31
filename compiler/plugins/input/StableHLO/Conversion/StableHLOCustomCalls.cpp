@@ -456,10 +456,11 @@ static std::string buildCeWrapper(StringRef target, StringRef exe, StringRef fn,
       .str();
 }
 
-// Raises the exact canonical StableHLO spelling emitted by JAX for causal
-// attention and its VJP as one transaction. This deliberately does not share
-// the legacy external-Metal flash gate below: these ops stay in IREE and use
-// the normal Attention/AttentionBackward lowering paths.
+// Raises the exact canonical StableHLO spellings emitted by JAX for causal or
+// unmasked encoder attention and their VJPs as one transaction. This
+// deliberately does not share the legacy external-Metal flash gate below:
+// these ops stay in IREE and use the normal Attention/AttentionBackward
+// lowering paths.
 static bool hasI64Values(ArrayRef<int64_t> actual,
                          std::initializer_list<int64_t> expected) {
   return actual.size() == expected.size() &&
@@ -626,7 +627,7 @@ struct PairedAttentionMatch {
   Value key;
   Value value;
   Value outputGrad;
-  Value causalMask;
+  Value mask;
   FloatAttr scale;
 };
 
@@ -713,48 +714,59 @@ matchPairedAttention(mlir::stablehlo::DotGeneralOp outputDot) {
     return std::nullopt;
   }
 
-  auto maskedSelect = maskedScores.getDefiningOp<mlir::stablehlo::SelectOp>();
-  auto maskBroadcast =
-      maskedSelect ? maskedSelect.getPred()
-                         .getDefiningOp<mlir::stablehlo::BroadcastInDimOp>()
-                   : mlir::stablehlo::BroadcastInDimOp();
-  auto causalMask = maskBroadcast
-                        ? maskBroadcast.getOperand()
-                              .getDefiningOp<mlir::stablehlo::SelectOp>()
-                        : mlir::stablehlo::SelectOp();
-  auto causalCompare =
-      causalMask
-          ? causalMask.getPred().getDefiningOp<mlir::stablehlo::CompareOp>()
-          : mlir::stablehlo::CompareOp();
-  auto rowIota =
-      causalCompare
-          ? causalCompare.getLhs().getDefiningOp<mlir::stablehlo::IotaOp>()
-          : mlir::stablehlo::IotaOp();
-  auto columnIota =
-      causalCompare
-          ? causalCompare.getRhs().getDefiningOp<mlir::stablehlo::IotaOp>()
-          : mlir::stablehlo::IotaOp();
-  if (!maskedSelect || !maskBroadcast || !causalMask || !causalCompare ||
-      !rowIota || !columnIota ||
-      !hasBroadcastDimensions(maskBroadcast, {2, 3}) ||
-      causalCompare.getComparisonDirection() !=
-          mlir::stablehlo::ComparisonDirection::GE ||
-      causalCompare.getCompareType().value_or(
-          mlir::stablehlo::ComparisonType::NOTYPE) !=
-          mlir::stablehlo::ComparisonType::SIGNED ||
-      rowIota.getIotaDimension() != 0 || columnIota.getIotaDimension() != 1) {
-    return std::nullopt;
+  Value mask;
+  mlir::stablehlo::BroadcastInDimOp maskBroadcast;
+  mlir::stablehlo::MulOp scaledScores;
+  if (auto maskedSelect =
+          maskedScores.getDefiningOp<mlir::stablehlo::SelectOp>()) {
+    maskBroadcast =
+        maskedSelect.getPred()
+            .getDefiningOp<mlir::stablehlo::BroadcastInDimOp>();
+    auto causalMask =
+        maskBroadcast
+            ? maskBroadcast.getOperand()
+                  .getDefiningOp<mlir::stablehlo::SelectOp>()
+            : mlir::stablehlo::SelectOp();
+    auto causalCompare =
+        causalMask
+            ? causalMask.getPred().getDefiningOp<mlir::stablehlo::CompareOp>()
+            : mlir::stablehlo::CompareOp();
+    auto rowIota =
+        causalCompare
+            ? causalCompare.getLhs().getDefiningOp<mlir::stablehlo::IotaOp>()
+            : mlir::stablehlo::IotaOp();
+    auto columnIota =
+        causalCompare
+            ? causalCompare.getRhs().getDefiningOp<mlir::stablehlo::IotaOp>()
+            : mlir::stablehlo::IotaOp();
+    if (!maskBroadcast || !causalMask || !causalCompare || !rowIota ||
+        !columnIota || !hasBroadcastDimensions(maskBroadcast, {2, 3}) ||
+        causalCompare.getComparisonDirection() !=
+            mlir::stablehlo::ComparisonDirection::GE ||
+        causalCompare.getCompareType().value_or(
+            mlir::stablehlo::ComparisonType::NOTYPE) !=
+            mlir::stablehlo::ComparisonType::SIGNED ||
+        rowIota.getIotaDimension() != 0 ||
+        columnIota.getIotaDimension() != 1) {
+      return std::nullopt;
+    }
+    BoolAttr causalTrue = getSplatBoolAttr(causalMask.getOnTrue());
+    BoolAttr causalFalse = getSplatBoolAttr(causalMask.getOnFalse());
+    if (!causalTrue || !causalTrue.getValue() || !causalFalse ||
+        causalFalse.getValue() ||
+        !isLowestFiniteSplat(maskedSelect.getOnFalse())) {
+      return std::nullopt;
+    }
+    mask = causalMask.getResult();
+    scaledScores =
+        maskedSelect.getOnTrue().getDefiningOp<mlir::stablehlo::MulOp>();
+  } else {
+    // The only mask-free form accepted here is the exact encoder spelling:
+    // softmax(scale * dot(Q, K^T)). Additive masks and other score transforms
+    // deliberately stay on the portable path.
+    scaledScores =
+        maskedScores.getDefiningOp<mlir::stablehlo::MulOp>();
   }
-  BoolAttr causalTrue = getSplatBoolAttr(causalMask.getOnTrue());
-  BoolAttr causalFalse = getSplatBoolAttr(causalMask.getOnFalse());
-  if (!causalTrue || !causalTrue.getValue() || !causalFalse ||
-      causalFalse.getValue() ||
-      !isLowestFiniteSplat(maskedSelect.getOnFalse())) {
-    return std::nullopt;
-  }
-
-  auto scaledScores =
-      maskedSelect.getOnTrue().getDefiningOp<mlir::stablehlo::MulOp>();
   auto queryKeyDot =
       scaledScores
           ? scaledScores.getLhs().getDefiningOp<mlir::stablehlo::DotGeneralOp>()
@@ -816,12 +828,15 @@ matchPairedAttention(mlir::stablehlo::DotGeneralOp outputDot) {
                            {batch, heads, sequence, 1}, bf16) ||
       !hasStaticTensorType(denominatorBroadcast.getResult(),
                            {batch, heads, sequence, sequence}, bf16) ||
-      !hasStaticTensorType(maskBroadcast.getResult(),
-                           {batch, heads, sequence, sequence}, i1) ||
-      !hasStaticTensorType(causalMask.getResult(), {sequence, sequence}, i1) ||
       !hasStaticTensorType(value, {batch, heads, sequence, headDim}, bf16) ||
       !hasStaticTensorType(outputDot.getResult(),
                            {batch, heads, sequence, headDim}, bf16)) {
+    return std::nullopt;
+  }
+  if (mask &&
+      (!hasStaticTensorType(maskBroadcast.getResult(),
+                            {batch, heads, sequence, sequence}, i1) ||
+       !hasStaticTensorType(mask, {sequence, sequence}, i1))) {
     return std::nullopt;
   }
 
@@ -920,7 +935,7 @@ matchPairedAttention(mlir::stablehlo::DotGeneralOp outputDot) {
     return std::nullopt;
   }
 
-  // dS = where(mask, softmax-vjp, 0) * the exact same scale splat.
+  // dS = [where(mask,)] softmax-vjp * the exact same scale splat.
   auto scoreScaleMul = scoreGrad.getDefiningOp<mlir::stablehlo::MulOp>();
   Value maskedScoreGrad = scoreScaleMul ? scoreScaleMul.getLhs() : Value();
   Value backwardScale = scoreScaleMul ? scoreScaleMul.getRhs() : Value();
@@ -928,19 +943,29 @@ matchPairedAttention(mlir::stablehlo::DotGeneralOp outputDot) {
     std::swap(maskedScoreGrad, backwardScale);
   }
   FloatAttr backwardScaleAttr = getSplatFloatAttr(backwardScale);
-  auto scoreMaskSelect =
-      maskedScoreGrad
-          ? maskedScoreGrad.getDefiningOp<mlir::stablehlo::SelectOp>()
-          : mlir::stablehlo::SelectOp();
   if (!scoreScaleMul || !backwardScaleAttr ||
-      !scale.getValue().bitwiseIsEqual(backwardScaleAttr.getValue()) ||
-      !scoreMaskSelect ||
-      scoreMaskSelect.getPred() != maskBroadcast.getResult() ||
-      !isFloatSplat(scoreMaskSelect.getOnFalse(), 0.0)) {
+      !scale.getValue().bitwiseIsEqual(backwardScaleAttr.getValue())) {
     return std::nullopt;
   }
-  auto unmaskedScoreGrad =
-      scoreMaskSelect.getOnTrue().getDefiningOp<mlir::stablehlo::MulOp>();
+  mlir::stablehlo::MulOp unmaskedScoreGrad;
+  if (mask) {
+    auto scoreMaskSelect =
+        maskedScoreGrad
+            ? maskedScoreGrad.getDefiningOp<mlir::stablehlo::SelectOp>()
+            : mlir::stablehlo::SelectOp();
+    if (!scoreMaskSelect ||
+        scoreMaskSelect.getPred() != maskBroadcast.getResult() ||
+        !isFloatSplat(scoreMaskSelect.getOnFalse(), 0.0)) {
+      return std::nullopt;
+    }
+    unmaskedScoreGrad =
+        scoreMaskSelect.getOnTrue().getDefiningOp<mlir::stablehlo::MulOp>();
+  } else {
+    unmaskedScoreGrad =
+        maskedScoreGrad
+            ? maskedScoreGrad.getDefiningOp<mlir::stablehlo::MulOp>()
+            : mlir::stablehlo::MulOp();
+  }
   Value softmaxVjp =
       getOtherBinaryOperand(unmaskedScoreGrad, exponential.getResult());
   auto softmaxVjpAdd = softmaxVjp
@@ -1086,7 +1111,7 @@ matchPairedAttention(mlir::stablehlo::DotGeneralOp outputDot) {
                               valueGradLeaf, queryGradLeaf,
                               keyGradLeaf,   query,
                               key,           value,
-                              outputGrad,    causalMask.getResult(),
+                              outputGrad,    mask,
                               scale};
 }
 
@@ -1129,8 +1154,11 @@ static void rewritePairedAttention(PairedAttentionMatch match) {
   AffineMap logsumexpMap = map({b, h, m});
   AffineMap scaleMap = map({});
   AffineMap maskMap = map({m, k2});
-  SmallVector<AffineMap> forwardMaps = {
-      queryMap, keyMap, valueMap, scaleMap, maskMap, outputMap, logsumexpMap};
+  SmallVector<AffineMap> forwardMaps = {queryMap, keyMap, valueMap, scaleMap};
+  if (match.mask) {
+    forwardMaps.push_back(maskMap);
+  }
+  forwardMaps.append({outputMap, logsumexpMap});
   DictionaryAttr decompositionConfig =
       forwardBuilder.getDictionaryAttr({forwardBuilder.getNamedAttr(
           IREE::LinalgExt::AttentionOp::getUseExp2AttrStr(),
@@ -1138,7 +1166,7 @@ static void rewritePairedAttention(PairedAttentionMatch match) {
   SmallVector<Type> forwardResultTypes = {outputType, logsumexpType};
   auto attention = IREE::LinalgExt::AttentionOp::create(
       forwardBuilder, loc, forwardResultTypes, match.query, match.key,
-      match.value, scale, match.causalMask, outputInit, logsumexpInit,
+      match.value, scale, match.mask, outputInit, logsumexpInit,
       forwardBuilder.getAffineMapArrayAttr(forwardMaps), decompositionConfig);
   {
     OpBuilder::InsertionGuard guard(forwardBuilder);
@@ -1157,13 +1185,17 @@ static void rewritePairedAttention(PairedAttentionMatch match) {
   Value valueGradInit = tensor::EmptyOp::create(
       backwardBuilder, loc, valueType.getShape(), valueType.getElementType());
   SmallVector<AffineMap> backwardMaps = {
-      queryMap, keyMap,  valueMap, outputMap, outputMap, logsumexpMap,
-      scaleMap, maskMap, queryMap, keyMap,    valueMap};
+      queryMap, keyMap,  valueMap, outputMap,
+      outputMap, logsumexpMap, scaleMap};
+  if (match.mask) {
+    backwardMaps.push_back(maskMap);
+  }
+  backwardMaps.append({queryMap, keyMap, valueMap});
   SmallVector<Type> backwardResultTypes = {queryType, keyType, valueType};
   auto attentionBackward = IREE::LinalgExt::AttentionBackwardOp::create(
       backwardBuilder, loc, backwardResultTypes, match.query, match.key,
       match.value, attention.getResult(0), match.outputGrad,
-      attention.getResult(1), scale, match.causalMask, queryGradInit,
+      attention.getResult(1), scale, match.mask, queryGradInit,
       keyGradInit, valueGradInit,
       backwardBuilder.getAffineMapArrayAttr(backwardMaps), decompositionConfig);
 
