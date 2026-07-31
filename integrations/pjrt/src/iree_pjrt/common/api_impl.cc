@@ -2221,7 +2221,7 @@ iree_status_t LoadedExecutableInstance::BatchExecute(
 
     if (args->device_complete_events) {
       args->device_complete_events[dev_index] =
-          *(new EventInstance(retain_ref(inv.wait_fence)));
+          *(new EventInstance(retain_ref(inv.signal_fence)));
     }
   }
 
