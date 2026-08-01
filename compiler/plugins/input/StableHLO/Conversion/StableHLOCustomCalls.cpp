@@ -819,7 +819,7 @@ matchPairedAttention(mlir::stablehlo::DotGeneralOp outputDot) {
     // masks the added keys. The environment override is also used by focused
     // tests and schedule sweeps; zero disables the automatic padding of an
     // otherwise unaligned sequence.
-    int64_t requestedSequence = sequence == 577 ? 592 : sequence;
+    int64_t requestedSequence = sequence == 577 ? 608 : sequence;
     if (const char *value = std::getenv("IREE_METAL_ATTN_PAD_SEQUENCE")) {
       char *end = nullptr;
       long parsed = std::strtol(value, &end, 10);
