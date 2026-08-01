@@ -23,6 +23,7 @@ iree_lit_test_suite(
     "legalize_shape_computations.mlir"
     "raise_attention.mlir"
     "raise_gelu_remat.mlir"
+    "raise_layer_norm.mlir"
     "stablehlo_custom_calls.mlir"
     "stablehlo_to_iree_input_dialects.mlir"
     "stablehlo_to_linalg_ext.mlir"

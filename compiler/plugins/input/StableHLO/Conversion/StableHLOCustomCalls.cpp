@@ -1406,6 +1406,22 @@ static OpTy findUniqueBinaryUser(Value known, Predicate predicate) {
   return found;
 }
 
+template <typename OpTy, typename Predicate>
+static OpTy findUniqueUser(Value input, Predicate predicate) {
+  OpTy found;
+  for (Operation *user : input.getUsers()) {
+    auto op = dyn_cast<OpTy>(user);
+    if (!op || !predicate(op)) {
+      continue;
+    }
+    if (found) {
+      return OpTy();
+    }
+    found = op;
+  }
+  return found;
+}
+
 static bool hasExactlyUsers(Value value,
                             std::initializer_list<Operation *> expected) {
   SmallVector<Operation *> remaining(expected);
@@ -1417,6 +1433,838 @@ static bool hasExactlyUsers(Value value,
     remaining.erase(it);
   }
   return remaining.empty();
+}
+
+// JAX's canonical rank-3 BF16 LayerNorm VJP expands the derivative of the
+// two-pass variance into a long chain of reductions and broadcasts. Besides
+// being expensive in its own right, that spelling keeps several full-sized
+// forward intermediates live across the normalized sublayer. Match the exact
+// complete forward/VJP pair and replace only its three gradient leaves with
+// the standard direct LayerNorm derivative. The forward remains untouched.
+//
+// This is intentionally narrow and opt-in. The direct derivative is
+// algebraically equivalent for finite tensors but rounds differently from
+// differentiating JAX's BF16 graph operation by operation.
+struct PairedLayerNormMatch {
+  Value input;
+  Value centered;
+  Value rstd;
+  Value gamma;
+  Value outputGrad;
+  Value inputGrad;
+  Value gammaGrad;
+  Value betaGrad;
+  Value inputCotangent;
+  Value featureCount;
+  Operation *outputGradDef;
+  int64_t batch;
+  int64_t sequence;
+  int64_t features;
+};
+
+static mlir::stablehlo::ReduceOp
+findUniqueAddReduce(Value input, std::initializer_list<int64_t> dimensions) {
+  mlir::stablehlo::ReduceOp found;
+  for (Operation *user : input.getUsers()) {
+    auto reduce = dyn_cast<mlir::stablehlo::ReduceOp>(user);
+    if (!reduce || reduce.getInitValues().size() != 1 ||
+        !isFloatSplat(reduce.getInitValues().front(), 0.0) ||
+        !matchesUnaryReduce(reduce, input, reduce.getInitValues().front(),
+                            dimensions, ReduceCombiner::kAdd)) {
+      continue;
+    }
+    if (found) {
+      return {};
+    }
+    found = reduce;
+  }
+  return found;
+}
+
+static mlir::stablehlo::BroadcastInDimOp
+findUniqueBroadcast(Value input, std::initializer_list<int64_t> dimensions) {
+  mlir::stablehlo::BroadcastInDimOp found;
+  for (Operation *user : input.getUsers()) {
+    auto broadcast = dyn_cast<mlir::stablehlo::BroadcastInDimOp>(user);
+    if (!hasBroadcastDimensions(broadcast, dimensions)) {
+      continue;
+    }
+    if (found) {
+      return {};
+    }
+    found = broadcast;
+  }
+  return found;
+}
+
+static mlir::stablehlo::ReduceOp
+matchRedundantFeatureGradient(Value input, int64_t features,
+                              Value &firstReduction,
+                              mlir::stablehlo::ReshapeOp &reshape) {
+  auto first = findUniqueAddReduce(input, {0, 1});
+  if (!first || !hasStaticTensorType(
+                    first.getResult(0), {features},
+                    cast<ShapedType>(input.getType()).getElementType())) {
+    return {};
+  }
+  for (Operation *user : first.getResult(0).getUsers()) {
+    auto possible = dyn_cast<mlir::stablehlo::ReshapeOp>(user);
+    if (!possible || !hasStaticTensorType(
+                         possible.getResult(), {1, 1, features},
+                         cast<ShapedType>(input.getType()).getElementType())) {
+      continue;
+    }
+    if (reshape) {
+      return {};
+    }
+    reshape = possible;
+  }
+  if (!reshape) {
+    return {};
+  }
+  auto second = findUniqueAddReduce(reshape.getResult(), {0, 1});
+  if (!second || !hasStaticTensorType(
+                     second.getResult(0), {features},
+                     cast<ShapedType>(input.getType()).getElementType())) {
+    return {};
+  }
+  firstReduction = first.getResult(0);
+  return second;
+}
+
+static Value matchOtherAddOperand(mlir::stablehlo::AddOp add, Value known) {
+  return getOtherBinaryOperand(add, known);
+}
+
+static std::optional<PairedLayerNormMatch>
+matchPairedLayerNorm(mlir::stablehlo::RsqrtOp rstdOp) {
+  auto smallType = dyn_cast<RankedTensorType>(rstdOp.getType());
+  if (!smallType || !smallType.hasStaticShape() || smallType.getRank() != 3 ||
+      smallType.getDimSize(2) != 1 ||
+      !isa<BFloat16Type>(smallType.getElementType())) {
+    return std::nullopt;
+  }
+  int64_t batch = smallType.getDimSize(0);
+  int64_t sequence = smallType.getDimSize(1);
+  Type bf16 = smallType.getElementType();
+  Type f32 = Float32Type::get(rstdOp.getContext());
+
+  auto variancePlusEpsilon =
+      rstdOp.getOperand().getDefiningOp<mlir::stablehlo::AddOp>();
+  if (!variancePlusEpsilon) {
+    return std::nullopt;
+  }
+  Value varianceValue = variancePlusEpsilon.getLhs();
+  Value epsilon = variancePlusEpsilon.getRhs();
+  if (!isTypedFloatSplat(epsilon, smallType, 1.0013580322265625e-5)) {
+    varianceValue = variancePlusEpsilon.getRhs();
+    epsilon = variancePlusEpsilon.getLhs();
+  }
+  if (!isTypedFloatSplat(epsilon, smallType, 1.0013580322265625e-5)) {
+    return std::nullopt;
+  }
+  auto varianceSelect =
+      varianceValue.getDefiningOp<mlir::stablehlo::SelectOp>();
+  if (!varianceSelect) {
+    return std::nullopt;
+  }
+  Value varianceBf16 = varianceSelect.getOnTrue();
+  auto varianceConvert =
+      varianceBf16.getDefiningOp<mlir::stablehlo::ConvertOp>();
+  auto varianceDivide =
+      varianceConvert
+          ? varianceConvert.getOperand().getDefiningOp<mlir::stablehlo::DivOp>()
+          : mlir::stablehlo::DivOp();
+  auto varianceReshape =
+      varianceDivide
+          ? varianceDivide.getLhs().getDefiningOp<mlir::stablehlo::ReshapeOp>()
+          : mlir::stablehlo::ReshapeOp();
+  auto varianceReduce = varianceReshape
+                            ? varianceReshape.getOperand()
+                                  .getDefiningOp<mlir::stablehlo::ReduceOp>()
+                            : mlir::stablehlo::ReduceOp();
+  auto centeredSquared = varianceReduce
+                             ? varianceReduce.getInputs()
+                                   .front()
+                                   .getDefiningOp<mlir::stablehlo::MulOp>()
+                             : mlir::stablehlo::MulOp();
+  Value centeredF32 = centeredSquared ? centeredSquared.getLhs() : Value();
+  auto centeredF32Op =
+      centeredF32 ? centeredF32.getDefiningOp<mlir::stablehlo::SubtractOp>()
+                  : mlir::stablehlo::SubtractOp();
+  auto varianceDenominatorBroadcast =
+      varianceDivide ? varianceDivide.getRhs()
+                           .getDefiningOp<mlir::stablehlo::BroadcastInDimOp>()
+                     : mlir::stablehlo::BroadcastInDimOp();
+  auto varianceDenominator =
+      varianceDenominatorBroadcast
+          ? varianceDenominatorBroadcast.getOperand()
+                .getDefiningOp<mlir::stablehlo::SubtractOp>()
+          : mlir::stablehlo::SubtractOp();
+  auto ddofConvert = varianceDenominator
+                         ? varianceDenominator.getRhs()
+                               .getDefiningOp<mlir::stablehlo::ConvertOp>()
+                         : mlir::stablehlo::ConvertOp();
+  auto validVariance =
+      varianceSelect.getPred().getDefiningOp<mlir::stablehlo::CompareOp>();
+  if (!varianceConvert || !varianceDivide || !varianceReshape ||
+      !varianceReduce || !centeredSquared || !centeredF32Op ||
+      !varianceDenominatorBroadcast || !varianceDenominator || !ddofConvert ||
+      !validVariance || centeredSquared.getRhs() != centeredF32 ||
+      !hasBroadcastDimensions(varianceDenominatorBroadcast, {}) ||
+      !matchPattern(ddofConvert.getOperand(), m_Zero()) ||
+      validVariance.getLhs() != varianceDenominator.getResult() ||
+      !isFloatSplat(validVariance.getRhs(), 0.0) ||
+      validVariance.getComparisonDirection() !=
+          mlir::stablehlo::ComparisonDirection::GT ||
+      validVariance.getCompareType().value_or(
+          mlir::stablehlo::ComparisonType::NOTYPE) !=
+          mlir::stablehlo::ComparisonType::FLOAT ||
+      !isFloatSplat(varianceReduce.getInitValues().front(), 0.0) ||
+      !matchesUnaryReduce(varianceReduce, centeredSquared.getResult(),
+                          varianceReduce.getInitValues().front(), {2},
+                          ReduceCombiner::kAdd)) {
+    return std::nullopt;
+  }
+
+  auto inputConvert =
+      centeredF32Op.getLhs().getDefiningOp<mlir::stablehlo::ConvertOp>();
+  auto meanF32Broadcast =
+      centeredF32Op.getRhs().getDefiningOp<mlir::stablehlo::BroadcastInDimOp>();
+  if (!inputConvert || !meanF32Broadcast ||
+      !hasBroadcastDimensions(meanF32Broadcast, {0, 1, 2})) {
+    return std::nullopt;
+  }
+  Value input = inputConvert.getOperand();
+  auto fullType = dyn_cast<RankedTensorType>(input.getType());
+  if (!fullType || !fullType.hasStaticShape() || fullType.getRank() != 3 ||
+      fullType.getDimSize(0) != batch || fullType.getDimSize(1) != sequence ||
+      !isa<BFloat16Type>(fullType.getElementType())) {
+    return std::nullopt;
+  }
+  int64_t features = fullType.getDimSize(2);
+  if (features != 384 && features != 768) {
+    return std::nullopt;
+  }
+  if (!hasStaticTensorType(centeredF32, {batch, sequence, features}, f32) ||
+      inputConvert.getType() !=
+          RankedTensorType::get({batch, sequence, features}, f32) ||
+      centeredF32Op.getLhs() != inputConvert.getResult() ||
+      !isFloatSplat(varianceDenominator.getLhs(),
+                    static_cast<double>(features))) {
+    return std::nullopt;
+  }
+
+  auto meanDivide =
+      meanF32Broadcast.getOperand().getDefiningOp<mlir::stablehlo::DivOp>();
+  auto meanReshape =
+      meanDivide
+          ? meanDivide.getLhs().getDefiningOp<mlir::stablehlo::ReshapeOp>()
+          : mlir::stablehlo::ReshapeOp();
+  auto meanReduce =
+      meanReshape
+          ? meanReshape.getOperand().getDefiningOp<mlir::stablehlo::ReduceOp>()
+          : mlir::stablehlo::ReduceOp();
+  if (!meanDivide || !meanReshape || !meanReduce ||
+      !isFloatSplat(meanDivide.getRhs(), static_cast<double>(features)) ||
+      !isFloatSplat(meanReduce.getInitValues().front(), 0.0) ||
+      !matchesUnaryReduce(meanReduce, inputConvert.getResult(),
+                          meanReduce.getInitValues().front(), {2},
+                          ReduceCombiner::kAdd)) {
+    return std::nullopt;
+  }
+  Value featureCount = meanDivide.getRhs();
+  mlir::stablehlo::ConvertOp meanBf16;
+  for (Operation *user : meanDivide.getResult().getUsers()) {
+    auto possible = dyn_cast<mlir::stablehlo::ConvertOp>(user);
+    if (possible &&
+        hasStaticTensorType(possible.getResult(), {batch, sequence, 1}, bf16)) {
+      if (meanBf16) {
+        return std::nullopt;
+      }
+      meanBf16 = possible;
+    }
+  }
+  if (!meanBf16) {
+    return std::nullopt;
+  }
+  auto meanBf16Broadcast = findUniqueBroadcast(meanBf16.getResult(), {0, 1, 2});
+  if (!meanBf16Broadcast ||
+      !hasStaticTensorType(meanBf16Broadcast.getResult(),
+                           {batch, sequence, features}, bf16)) {
+    return std::nullopt;
+  }
+  auto centered = findUniqueUser<mlir::stablehlo::SubtractOp>(
+      input, [&](mlir::stablehlo::SubtractOp op) {
+        return op.getLhs() == input &&
+               op.getRhs() == meanBf16Broadcast.getResult() &&
+               op.getType() == fullType;
+      });
+  if (!centered) {
+    return std::nullopt;
+  }
+
+  auto rstdBroadcast = findUniqueBroadcast(rstdOp.getResult(), {0, 1, 2});
+  if (!rstdBroadcast ||
+      !hasStaticTensorType(rstdBroadcast.getResult(),
+                           {batch, sequence, features}, bf16)) {
+    return std::nullopt;
+  }
+  auto normalized = findUniqueBinaryUser<mlir::stablehlo::MulOp>(
+      centered.getResult(),
+      [&](Value other) { return other == rstdBroadcast.getResult(); });
+  if (!normalized) {
+    return std::nullopt;
+  }
+
+  mlir::stablehlo::MulOp scaled;
+  mlir::stablehlo::BroadcastInDimOp gammaBroadcast;
+  Value gamma;
+  for (Operation *user : normalized.getResult().getUsers()) {
+    auto multiply = dyn_cast<mlir::stablehlo::MulOp>(user);
+    Value other = getOtherBinaryOperand(multiply, normalized.getResult());
+    auto broadcast =
+        other ? other.getDefiningOp<mlir::stablehlo::BroadcastInDimOp>()
+              : mlir::stablehlo::BroadcastInDimOp();
+    if (!broadcast || !hasBroadcastDimensions(broadcast, {2}) ||
+        !hasStaticTensorType(broadcast.getOperand(), {features}, bf16)) {
+      continue;
+    }
+    if (scaled) {
+      return std::nullopt;
+    }
+    scaled = multiply;
+    gammaBroadcast = broadcast;
+    gamma = broadcast.getOperand();
+  }
+  if (!scaled) {
+    return std::nullopt;
+  }
+  mlir::stablehlo::AddOp output;
+  for (Operation *user : scaled.getResult().getUsers()) {
+    auto add = dyn_cast<mlir::stablehlo::AddOp>(user);
+    Value other = getOtherBinaryOperand(add, scaled.getResult());
+    auto betaBroadcast =
+        other ? other.getDefiningOp<mlir::stablehlo::BroadcastInDimOp>()
+              : mlir::stablehlo::BroadcastInDimOp();
+    if (!betaBroadcast || !hasBroadcastDimensions(betaBroadcast, {2}) ||
+        !hasStaticTensorType(betaBroadcast.getOperand(), {features}, bf16)) {
+      continue;
+    }
+    if (output) {
+      return std::nullopt;
+    }
+    output = add;
+  }
+  if (!output || output.getResult().use_empty()) {
+    return std::nullopt;
+  }
+
+  mlir::stablehlo::MulOp dgammaInput;
+  Value outputGrad;
+  for (Operation *user : normalized.getResult().getUsers()) {
+    auto multiply = dyn_cast<mlir::stablehlo::MulOp>(user);
+    if (!multiply || multiply == scaled) {
+      continue;
+    }
+    Value possibleGrad =
+        getOtherBinaryOperand(multiply, normalized.getResult());
+    if (!possibleGrad || possibleGrad.getType() != fullType) {
+      continue;
+    }
+    if (dgammaInput) {
+      return std::nullopt;
+    }
+    dgammaInput = multiply;
+    outputGrad = possibleGrad;
+  }
+  if (!dgammaInput || !outputGrad) {
+    return std::nullopt;
+  }
+
+  Value betaFirst;
+  mlir::stablehlo::ReshapeOp betaReshape;
+  auto betaGrad = matchRedundantFeatureGradient(outputGrad, features, betaFirst,
+                                                betaReshape);
+  Value gammaFirst;
+  mlir::stablehlo::ReshapeOp gammaReshape;
+  auto gammaGrad = matchRedundantFeatureGradient(
+      dgammaInput.getResult(), features, gammaFirst, gammaReshape);
+  if (!betaGrad || !gammaGrad || betaGrad.getResult(0).use_empty() ||
+      gammaGrad.getResult(0).use_empty()) {
+    return std::nullopt;
+  }
+  auto scaledOutputGrad = findUniqueBinaryUser<mlir::stablehlo::MulOp>(
+      outputGrad,
+      [&](Value other) { return other == gammaBroadcast.getResult(); });
+  auto centeredScaledGrad =
+      scaledOutputGrad ? findUniqueBinaryUser<mlir::stablehlo::MulOp>(
+                             centered.getResult(),
+                             [&](Value other) {
+                               return other == scaledOutputGrad.getResult();
+                             })
+                       : mlir::stablehlo::MulOp();
+  auto centeredGradReduce =
+      centeredScaledGrad
+          ? findUniqueAddReduce(centeredScaledGrad.getResult(), {2})
+          : mlir::stablehlo::ReduceOp();
+  auto centeredGradReshape =
+      centeredGradReduce
+          ? findUniqueUser<mlir::stablehlo::ReshapeOp>(
+                centeredGradReduce.getResult(0),
+                [&](mlir::stablehlo::ReshapeOp op) {
+                  return hasStaticTensorType(op.getResult(),
+                                             {batch, sequence, 1}, bf16);
+                })
+          : mlir::stablehlo::ReshapeOp();
+  auto directGrad =
+      scaledOutputGrad
+          ? findUniqueBinaryUser<mlir::stablehlo::MulOp>(
+                scaledOutputGrad.getResult(),
+                [&](Value other) { return other == rstdBroadcast.getResult(); })
+          : mlir::stablehlo::MulOp();
+  auto rstdDiv = findUniqueUser<mlir::stablehlo::DivOp>(
+      rstdOp.getResult(), [&](mlir::stablehlo::DivOp op) {
+        return op.getLhs() == rstdOp.getResult() &&
+               op.getRhs() == variancePlusEpsilon.getResult() &&
+               op.getType() == smallType;
+      });
+  auto negativeHalfRstd =
+      rstdDiv ? findUniqueBinaryUser<mlir::stablehlo::MulOp>(
+                    rstdDiv.getResult(),
+                    [&](Value other) {
+                      return isTypedFloatSplat(other, smallType, -0.5);
+                    })
+              : mlir::stablehlo::MulOp();
+  auto varianceSeed = centeredGradReshape && negativeHalfRstd
+                          ? findUniqueBinaryUser<mlir::stablehlo::MulOp>(
+                                centeredGradReshape.getResult(),
+                                [&](Value other) {
+                                  return other == negativeHalfRstd.getResult();
+                                })
+                          : mlir::stablehlo::MulOp();
+  if (!scaledOutputGrad || !centeredScaledGrad || !centeredGradReduce ||
+      !centeredGradReshape || !directGrad || !rstdDiv || !negativeHalfRstd ||
+      !varianceSeed) {
+    return std::nullopt;
+  }
+
+  auto varianceSeedSelect =
+      varianceSeed
+          ? findUniqueUser<mlir::stablehlo::SelectOp>(
+                varianceSeed.getResult(),
+                [&](mlir::stablehlo::SelectOp op) {
+                  return op.getPred() == varianceSelect.getPred() &&
+                         op.getOnTrue() == varianceSeed.getResult() &&
+                         isTypedFloatSplat(op.getOnFalse(), smallType, 0.0) &&
+                         op.getType() == smallType;
+                })
+          : mlir::stablehlo::SelectOp();
+  auto varianceSeedF32 =
+      varianceSeedSelect ? findUniqueUser<mlir::stablehlo::ConvertOp>(
+                               varianceSeedSelect.getResult(),
+                               [&](mlir::stablehlo::ConvertOp op) {
+                                 return hasStaticTensorType(
+                                     op.getResult(), {batch, sequence, 1}, f32);
+                               })
+                         : mlir::stablehlo::ConvertOp();
+  auto dividedVarianceSeed =
+      varianceSeedF32
+          ? findUniqueUser<mlir::stablehlo::DivOp>(
+                varianceSeedF32.getResult(),
+                [&](mlir::stablehlo::DivOp op) {
+                  return op.getLhs() == varianceSeedF32.getResult() &&
+                         op.getRhs() == varianceDivide.getRhs() &&
+                         hasStaticTensorType(op.getResult(),
+                                             {batch, sequence, 1}, f32);
+                })
+          : mlir::stablehlo::DivOp();
+  auto singletonVarianceReduce =
+      dividedVarianceSeed
+          ? findUniqueAddReduce(dividedVarianceSeed.getResult(), {2})
+          : mlir::stablehlo::ReduceOp();
+  auto varianceBroadcast =
+      singletonVarianceReduce
+          ? findUniqueBroadcast(singletonVarianceReduce.getResult(0), {0, 1})
+          : mlir::stablehlo::BroadcastInDimOp();
+  auto twiceCentered = findUniqueBinaryUser<mlir::stablehlo::MulOp>(
+      centeredF32, [&](Value other) {
+        return isTypedFloatSplat(other, centeredF32.getType(), 2.0);
+      });
+  auto varianceProduct =
+      varianceBroadcast && twiceCentered
+          ? findUniqueBinaryUser<mlir::stablehlo::MulOp>(
+                varianceBroadcast.getResult(),
+                [&](Value other) { return other == twiceCentered.getResult(); })
+          : mlir::stablehlo::MulOp();
+  auto negativeVarianceProduct =
+      varianceProduct
+          ? findUniqueUser<mlir::stablehlo::NegOp>(
+                varianceProduct.getResult(),
+                [&](mlir::stablehlo::NegOp op) {
+                  return hasStaticTensorType(op.getResult(),
+                                             {batch, sequence, features}, f32);
+                })
+          : mlir::stablehlo::NegOp();
+  auto varianceMeanReduce =
+      negativeVarianceProduct
+          ? findUniqueAddReduce(negativeVarianceProduct.getResult(), {2})
+          : mlir::stablehlo::ReduceOp();
+  auto varianceMeanReshape =
+      varianceMeanReduce ? findUniqueUser<mlir::stablehlo::ReshapeOp>(
+                               varianceMeanReduce.getResult(0),
+                               [&](mlir::stablehlo::ReshapeOp op) {
+                                 return hasStaticTensorType(
+                                     op.getResult(), {batch, sequence, 1}, f32);
+                               })
+                         : mlir::stablehlo::ReshapeOp();
+  auto varianceMeanDivide =
+      varianceMeanReshape
+          ? findUniqueUser<mlir::stablehlo::DivOp>(
+                varianceMeanReshape.getResult(),
+                [&](mlir::stablehlo::DivOp op) {
+                  return op.getLhs() == varianceMeanReshape.getResult() &&
+                         op.getRhs() == featureCount &&
+                         hasStaticTensorType(op.getResult(),
+                                             {batch, sequence, 1}, f32);
+                })
+          : mlir::stablehlo::DivOp();
+  auto varianceMeanSingleton =
+      varianceMeanDivide
+          ? findUniqueAddReduce(varianceMeanDivide.getResult(), {2})
+          : mlir::stablehlo::ReduceOp();
+  auto varianceMeanBroadcast =
+      varianceMeanSingleton
+          ? findUniqueBroadcast(varianceMeanSingleton.getResult(0), {0, 1})
+          : mlir::stablehlo::BroadcastInDimOp();
+  auto varianceAdd =
+      varianceMeanBroadcast && varianceProduct
+          ? findUniqueBinaryUser<mlir::stablehlo::AddOp>(
+                varianceProduct.getResult(),
+                [&](Value other) {
+                  return other == varianceMeanBroadcast.getResult();
+                })
+          : mlir::stablehlo::AddOp();
+  auto varianceContribution =
+      varianceAdd
+          ? findUniqueUser<mlir::stablehlo::ConvertOp>(
+                varianceAdd.getResult(),
+                [&](mlir::stablehlo::ConvertOp op) {
+                  return hasStaticTensorType(op.getResult(),
+                                             {batch, sequence, features}, bf16);
+                })
+          : mlir::stablehlo::ConvertOp();
+  if (!varianceSeedSelect || !varianceSeedF32 || !dividedVarianceSeed ||
+      !singletonVarianceReduce || !varianceBroadcast || !twiceCentered ||
+      !varianceProduct || !negativeVarianceProduct || !varianceMeanReduce ||
+      !varianceMeanReshape || !varianceMeanDivide || !varianceMeanSingleton ||
+      !varianceMeanBroadcast || !varianceAdd || !varianceContribution) {
+    return std::nullopt;
+  }
+
+  auto negativeDirect = findUniqueUser<mlir::stablehlo::NegOp>(
+      directGrad.getResult(), [&](mlir::stablehlo::NegOp op) {
+        return hasStaticTensorType(op.getResult(), {batch, sequence, features},
+                                   bf16);
+      });
+  auto directMeanReduce =
+      negativeDirect ? findUniqueAddReduce(negativeDirect.getResult(), {2})
+                     : mlir::stablehlo::ReduceOp();
+  auto directMeanF32 = directMeanReduce
+                           ? findUniqueUser<mlir::stablehlo::ConvertOp>(
+                                 directMeanReduce.getResult(0),
+                                 [&](mlir::stablehlo::ConvertOp op) {
+                                   return hasStaticTensorType(
+                                       op.getResult(), {batch, sequence}, f32);
+                                 })
+                           : mlir::stablehlo::ConvertOp();
+  auto directMeanReshape =
+      directMeanF32 ? findUniqueUser<mlir::stablehlo::ReshapeOp>(
+                          directMeanF32.getResult(),
+                          [&](mlir::stablehlo::ReshapeOp op) {
+                            return hasStaticTensorType(
+                                op.getResult(), {batch, sequence, 1}, f32);
+                          })
+                    : mlir::stablehlo::ReshapeOp();
+  auto directMeanDivide =
+      directMeanReshape
+          ? findUniqueUser<mlir::stablehlo::DivOp>(
+                directMeanReshape.getResult(),
+                [&](mlir::stablehlo::DivOp op) {
+                  return op.getLhs() == directMeanReshape.getResult() &&
+                         op.getRhs() == featureCount &&
+                         hasStaticTensorType(op.getResult(),
+                                             {batch, sequence, 1}, f32);
+                })
+          : mlir::stablehlo::DivOp();
+  auto directMeanSingleton =
+      directMeanDivide ? findUniqueAddReduce(directMeanDivide.getResult(), {2})
+                       : mlir::stablehlo::ReduceOp();
+  Value directMeanContribution;
+  mlir::stablehlo::ConvertOp directMeanBf16;
+  if (directMeanSingleton) {
+    for (Operation *user : directMeanSingleton.getResult(0).getUsers()) {
+      auto possible = dyn_cast<mlir::stablehlo::ConvertOp>(user);
+      if (possible &&
+          hasStaticTensorType(possible.getResult(), {batch, sequence}, bf16)) {
+        if (directMeanBf16) {
+          return std::nullopt;
+        }
+        directMeanBf16 = possible;
+      }
+    }
+  }
+  auto directMeanBroadcast =
+      directMeanBf16 ? findUniqueBroadcast(directMeanBf16.getResult(), {0, 1})
+                     : mlir::stablehlo::BroadcastInDimOp();
+  if (directMeanBroadcast &&
+      hasStaticTensorType(directMeanBroadcast.getResult(),
+                          {batch, sequence, features}, bf16)) {
+    directMeanContribution = directMeanBroadcast.getResult();
+  }
+
+  // Canonicalization may interchange a shape-preserving convert with the
+  // broadcast. JAX vision graphs currently use the f32-broadcast/bf16-convert
+  // spelling, while language graphs use the bf16-convert/broadcast spelling.
+  if (!directMeanContribution && directMeanSingleton) {
+    auto directMeanF32Broadcast =
+        findUniqueBroadcast(directMeanSingleton.getResult(0), {0, 1});
+    if (directMeanF32Broadcast &&
+        hasStaticTensorType(directMeanF32Broadcast.getResult(),
+                            {batch, sequence, features}, f32)) {
+      mlir::stablehlo::ConvertOp fullConvert;
+      for (Operation *user : directMeanF32Broadcast.getResult().getUsers()) {
+        auto possible = dyn_cast<mlir::stablehlo::ConvertOp>(user);
+        if (!possible ||
+            !hasStaticTensorType(possible.getResult(),
+                                 {batch, sequence, features}, bf16)) {
+          continue;
+        }
+        if (fullConvert) {
+          return std::nullopt;
+        }
+        fullConvert = possible;
+      }
+      if (fullConvert) {
+        directMeanContribution = fullConvert.getResult();
+      }
+    }
+  }
+  if (!negativeDirect || !directMeanReduce || !directMeanF32 ||
+      !directMeanReshape || !directMeanDivide || !directMeanSingleton ||
+      !directMeanContribution) {
+    return std::nullopt;
+  }
+
+  Value inputCotangent;
+  mlir::stablehlo::AddOp directAdd;
+  mlir::stablehlo::AddOp inputGrad;
+  for (Operation *user : directGrad.getResult().getUsers()) {
+    auto add = dyn_cast<mlir::stablehlo::AddOp>(user);
+    Value other = getOtherBinaryOperand(add, directGrad.getResult());
+    if (!other) {
+      continue;
+    }
+    Value candidateCotangent;
+    if (other != varianceContribution.getResult()) {
+      auto possibleOuter = other.getDefiningOp<mlir::stablehlo::AddOp>();
+      candidateCotangent =
+          matchOtherAddOperand(possibleOuter, varianceContribution.getResult());
+      if (!candidateCotangent || candidateCotangent.getType() != fullType) {
+        continue;
+      }
+    }
+    auto candidateInputGrad = findUniqueBinaryUser<mlir::stablehlo::AddOp>(
+        add.getResult(),
+        [&](Value other) { return other == directMeanContribution; });
+    if (!candidateInputGrad || candidateInputGrad.getResult().use_empty()) {
+      continue;
+    }
+    if (directAdd) {
+      return std::nullopt;
+    }
+    directAdd = add;
+    inputGrad = candidateInputGrad;
+    inputCotangent = candidateCotangent;
+  }
+  if (!directAdd || !inputGrad) {
+    return std::nullopt;
+  }
+
+  Operation *outputGradDef = outputGrad.getDefiningOp();
+  Block *block = rstdOp->getBlock();
+  if (!outputGradDef || outputGradDef->getBlock() != block ||
+      output->getBlock() != block || inputGrad->getBlock() != block ||
+      gammaGrad->getBlock() != block || betaGrad->getBlock() != block ||
+      !output->isBeforeInBlock(outputGradDef) ||
+      !outputGradDef->isBeforeInBlock(inputGrad)) {
+    return std::nullopt;
+  }
+  if (inputCotangent) {
+    Operation *cotangentDef = inputCotangent.getDefiningOp();
+    if (cotangentDef && (cotangentDef->getBlock() != block ||
+                         !cotangentDef->isBeforeInBlock(outputGradDef))) {
+      return std::nullopt;
+    }
+  }
+
+  return PairedLayerNormMatch{input,
+                              centered.getResult(),
+                              rstdOp.getResult(),
+                              gamma,
+                              outputGrad,
+                              inputGrad.getResult(),
+                              gammaGrad.getResult(0),
+                              betaGrad.getResult(0),
+                              inputCotangent,
+                              featureCount,
+                              outputGradDef,
+                              batch,
+                              sequence,
+                              features};
+}
+
+static Value createAddReduce(OpBuilder &builder, Location loc, Value input,
+                             Value zero, ArrayRef<int64_t> dimensions) {
+  Type elementType = cast<ShapedType>(input.getType()).getElementType();
+  auto reduce = mlir::stablehlo::ReduceOp::create(
+      builder, loc, ValueRange{input}, ValueRange{zero},
+      builder.getDenseI64ArrayAttr(dimensions), TypeRange{elementType});
+  Region &body = reduce.getBody();
+  Block &block = body.emplaceBlock();
+  auto scalarType = RankedTensorType::get({}, elementType);
+  block.addArgument(scalarType, loc);
+  block.addArgument(scalarType, loc);
+  {
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(&block);
+    Value sum = mlir::stablehlo::AddOp::create(
+        builder, loc, block.getArgument(0), block.getArgument(1));
+    mlir::stablehlo::ReturnOp::create(builder, loc, sum);
+  }
+  return reduce.getResult(0);
+}
+
+static void rewritePairedLayerNorm(PairedLayerNormMatch match) {
+  OpBuilder builder(match.outputGradDef);
+  builder.setInsertionPointAfter(match.outputGradDef);
+  Location loc = match.inputGrad.getLoc();
+  Type bf16 = cast<ShapedType>(match.input.getType()).getElementType();
+  Type f32 = builder.getF32Type();
+  auto fullBf16Type = RankedTensorType::get(
+      {match.batch, match.sequence, match.features}, bf16);
+  auto fullF32Type =
+      RankedTensorType::get({match.batch, match.sequence, match.features}, f32);
+  auto smallF32Type =
+      RankedTensorType::get({match.batch, match.sequence, 1}, f32);
+  Value bf16Zero = mlir::stablehlo::ConstantOp::create(
+      builder, loc,
+      DenseFPElementsAttr::get(
+          RankedTensorType::get({}, bf16),
+          APFloat::getZero(cast<FloatType>(bf16).getFloatSemantics())));
+  Value f32Zero = mlir::stablehlo::ConstantOp::create(
+      builder, loc,
+      DenseFPElementsAttr::get(
+          RankedTensorType::get({}, f32),
+          APFloat::getZero(cast<FloatType>(f32).getFloatSemantics())));
+
+  Value rstdBroadcastBf16 = mlir::stablehlo::BroadcastInDimOp::create(
+      builder, loc, fullBf16Type, match.rstd,
+      builder.getDenseI64ArrayAttr({0, 1, 2}));
+  Value gammaBroadcast = mlir::stablehlo::BroadcastInDimOp::create(
+      builder, loc, fullBf16Type, match.gamma,
+      builder.getDenseI64ArrayAttr({2}));
+  Value scaledOutputGrad = mlir::stablehlo::MulOp::create(
+      builder, loc, match.outputGrad, gammaBroadcast);
+  Value scaledCentered = mlir::stablehlo::MulOp::create(
+      builder, loc, scaledOutputGrad, match.centered);
+
+  Value gammaInput = mlir::stablehlo::MulOp::create(
+      builder, loc, match.outputGrad, match.centered);
+  gammaInput = mlir::stablehlo::MulOp::create(builder, loc, gammaInput,
+                                              rstdBroadcastBf16);
+  // Keep the BF16 parameter reductions separate. Combining them into one
+  // variadic reduction changes Metal's BF16 accumulation schedule enough to
+  // exceed the gradient-signature tolerance on real vision models.
+  Value gammaGrad = createAddReduce(builder, loc, gammaInput, bf16Zero, {0, 1});
+  Value betaGrad =
+      createAddReduce(builder, loc, match.outputGrad, bf16Zero, {0, 1});
+
+  Value scaledOutputGradF32 = mlir::stablehlo::ConvertOp::create(
+      builder, loc, fullF32Type, scaledOutputGrad);
+  Value scaledCenteredF32 = mlir::stablehlo::ConvertOp::create(
+      builder, loc, fullF32Type, scaledCentered);
+  // Keep the f32 row reductions independent too. A variadic spelling can fuse
+  // across LayerNorms in a full ViT graph and request 96 KiB of workgroup
+  // memory, exceeding Apple's 32 KiB limit.
+  Value sumGradRow =
+      createAddReduce(builder, loc, scaledOutputGradF32, f32Zero, {2});
+  Value sumCenteredGradRow =
+      createAddReduce(builder, loc, scaledCenteredF32, f32Zero, {2});
+  Value sumGrad = mlir::stablehlo::ReshapeOp::create(builder, loc, smallF32Type,
+                                                     sumGradRow);
+  Value sumCenteredGrad = mlir::stablehlo::ReshapeOp::create(
+      builder, loc, smallF32Type, sumCenteredGradRow);
+  sumGrad = mlir::stablehlo::BroadcastInDimOp::create(
+      builder, loc, fullF32Type, sumGrad,
+      builder.getDenseI64ArrayAttr({0, 1, 2}));
+  sumCenteredGrad = mlir::stablehlo::BroadcastInDimOp::create(
+      builder, loc, fullF32Type, sumCenteredGrad,
+      builder.getDenseI64ArrayAttr({0, 1, 2}));
+
+  Value centeredF32 = mlir::stablehlo::ConvertOp::create(
+      builder, loc, fullF32Type, match.centered);
+  Value rstdF32 = mlir::stablehlo::ConvertOp::create(builder, loc, smallF32Type,
+                                                     match.rstd);
+  Value rstdSquared =
+      mlir::stablehlo::MulOp::create(builder, loc, rstdF32, rstdF32);
+  rstdSquared = mlir::stablehlo::BroadcastInDimOp::create(
+      builder, loc, fullF32Type, rstdSquared,
+      builder.getDenseI64ArrayAttr({0, 1, 2}));
+  Value centeredRstdSquared =
+      mlir::stablehlo::MulOp::create(builder, loc, centeredF32, rstdSquared);
+  Value covarianceCorrection = mlir::stablehlo::MulOp::create(
+      builder, loc, centeredRstdSquared, sumCenteredGrad);
+  Value correctionNumerator = mlir::stablehlo::AddOp::create(
+      builder, loc, sumGrad, covarianceCorrection);
+  Value featureCount = mlir::stablehlo::BroadcastInDimOp::create(
+      builder, loc, fullF32Type, match.featureCount,
+      builder.getDenseI64ArrayAttr({0, 1, 2}));
+  Value correction = mlir::stablehlo::DivOp::create(
+      builder, loc, correctionNumerator, featureCount);
+  Value centeredGrad = mlir::stablehlo::SubtractOp::create(
+      builder, loc, scaledOutputGradF32, correction);
+  rstdF32 = mlir::stablehlo::BroadcastInDimOp::create(
+      builder, loc, fullF32Type, rstdF32,
+      builder.getDenseI64ArrayAttr({0, 1, 2}));
+  Value inputGradF32 =
+      mlir::stablehlo::MulOp::create(builder, loc, rstdF32, centeredGrad);
+  Value inputGrad = mlir::stablehlo::ConvertOp::create(
+      builder, loc, fullBf16Type, inputGradF32);
+  if (match.inputCotangent) {
+    inputGrad = mlir::stablehlo::AddOp::create(builder, loc,
+                                               match.inputCotangent, inputGrad);
+  }
+
+  match.inputGrad.replaceAllUsesWith(inputGrad);
+  match.gammaGrad.replaceAllUsesWith(gammaGrad);
+  match.betaGrad.replaceAllUsesWith(betaGrad);
+}
+
+static void rewritePairedLayerNorms(ModuleOp module) {
+  const char *value = std::getenv("IREE_METAL_LN_PAIRED");
+  if (!value || StringRef(value) != "1") {
+    return;
+  }
+  SmallVector<mlir::stablehlo::RsqrtOp> candidates;
+  module.walk(
+      [&](mlir::stablehlo::RsqrtOp rsqrt) { candidates.push_back(rsqrt); });
+  for (mlir::stablehlo::RsqrtOp candidate : candidates) {
+    std::optional<PairedLayerNormMatch> match = matchPairedLayerNorm(candidate);
+    if (match) {
+      rewritePairedLayerNorm(*match);
+    }
+  }
 }
 
 static std::optional<PairedTanhGeluMatch>
@@ -1998,6 +2846,7 @@ struct ConvertFlashAttentionDispatch final
     ModuleOp module = getOperation();
     MLIRContext *ctx = &getContext();
 
+    rewritePairedLayerNorms(module);
     rematerializePairedTanhGelu(module);
 
     // The native paired raise and the legacy external-Metal forward raise are

@@ -9,6 +9,7 @@
 #include "compiler/plugins/input/StableHLO/Conversion/Preprocessing/Passes.h"
 #include "iree/compiler/Dialect/Util/Transforms/Passes.h"
 #include "iree/compiler/InputConversion/Common/Passes.h"
+#include "llvm/ADT/StringRef.h"
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Conversion/ShapeToStandard/ShapeToStandard.h"
@@ -46,6 +47,9 @@ void buildStableHLOInputConversionPassPipelineImpl(
   const bool nativeAttentionEnabled =
       options.enableNativeAttention &&
       !std::getenv("IREE_METAL_DISABLE_NATIVE_ATTENTION");
+  const char *pairedLayerNormValue = std::getenv("IREE_METAL_LN_PAIRED");
+  const bool pairedLayerNormEnabled =
+      pairedLayerNormValue && llvm::StringRef(pairedLayerNormValue) == "1";
   // Having both StableHLO and VHLO in the same module is not supported.
   // If the input is VHLO, then it is automatically converted to StableHLO.
   // If the input is StableHLO, this pass is considered a NOP.
@@ -70,19 +74,25 @@ void buildStableHLOInputConversionPassPipelineImpl(
     passManager.addPass(createFlattenTuplesInCFG());
   }
 
-  if (nativeAttentionEnabled) {
-    // The paired native attention raiser needs the outlined JAX mask helpers
-    // inlined and the forward/VJP graph canonicalized, but it must run before
-    // StableHLO preprocessing collapses the rank-4 batched attention dots
-    // through flattened batch/head dimensions. Keep the earlier invocation
-    // for explicit flash custom calls and use this distinct, phase-gated
-    // invocation for the transactional native raise.
+  if (nativeAttentionEnabled || pairedLayerNormEnabled) {
+    // The paired native attention and LayerNorm raisers need their outlined
+    // JAX helpers inlined and their forward/VJP graphs canonicalized. They
+    // must run before StableHLO preprocessing changes the graph spellings;
+    // in particular, preprocessing collapses the rank-4 batched attention
+    // dots through flattened batch/head dimensions. Keep the earlier
+    // invocation for explicit flash custom calls and use this distinct,
+    // phase-gated invocation for transactional paired raises.
     passManager.addPass(mlir::createInlinerPass());
     passManager.addNestedPass<func::FuncOp>(mlir::createCanonicalizerPass());
     passManager.addNestedPass<func::FuncOp>(createStableHLOCanonicalize());
     passManager.addNestedPass<func::FuncOp>(mlir::createCSEPass());
     ConvertFlashAttentionDispatchOptions attentionOptions;
-    attentionOptions.raiseNativeAttention = true;
+    attentionOptions.raiseNativeAttention = nativeAttentionEnabled;
+    // A LayerNorm-only late invocation must not re-run the legacy attention
+    // matcher. Explicit legacy calls were already handled by the initial
+    // invocation above, and the native-attention rollback remains
+    // authoritative.
+    attentionOptions.suppressLegacyAttentionRaise = !nativeAttentionEnabled;
     passManager.addPass(createConvertFlashAttentionDispatch(attentionOptions));
     passManager.addNestedPass<func::FuncOp>(mlir::createCanonicalizerPass());
     passManager.addNestedPass<func::FuncOp>(createStableHLOCanonicalize());
