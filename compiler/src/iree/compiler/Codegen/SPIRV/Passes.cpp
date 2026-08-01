@@ -1154,12 +1154,12 @@ void addSPIRVVectorDistributeAttentionPassPipeline(
 }
 
 void addSPIRVAppleVectorDistributeAttentionPassPipeline(
-    OpPassManager &funcPassManager) {
+    OpPassManager &funcPassManager,
+    const IREE::GPU::GPUPipelineOptions &pipelineOptions) {
   // Reuse the intrinsic-based vector-distribute attention pipeline while its
   // target-independent passes are being moved out of LLVMGPU. It performs its
   // own tiling, layout configuration, intrinsic packing, and distribution.
-  IREE::GPU::GPUPipelineOptions options;
-  addGPUVectorDistributePassPipeline(funcPassManager, options,
+  addGPUVectorDistributePassPipeline(funcPassManager, pipelineOptions,
                                      /*forROCDL=*/false);
 
   // Distributed softmax uses clustered subgroup reductions (for example, two

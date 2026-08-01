@@ -15,6 +15,10 @@
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "mlir/Pass/Pass.h"
 
+namespace mlir::iree_compiler::IREE::GPU {
+struct GPUPipelineOptions;
+}
+
 namespace mlir::iree_compiler {
 
 //===---------------------------------------------------------------------===//
@@ -61,7 +65,8 @@ void addSPIRVVectorDistributeAttentionPassPipeline(OpPassManager &funcPassManage
 
 /// Apple/Metal intrinsic-based vector-distributed attention pipeline.
 void addSPIRVAppleVectorDistributeAttentionPassPipeline(
-    OpPassManager &funcPassManager);
+    OpPassManager &funcPassManager,
+    const IREE::GPU::GPUPipelineOptions &pipelineOptions);
 
 /// Populates passes needed to preprocess the input variant before lowering
 /// and select lowering strategies.

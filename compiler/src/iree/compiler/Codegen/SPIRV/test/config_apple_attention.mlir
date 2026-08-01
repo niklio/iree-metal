@@ -14,6 +14,19 @@
 // RUN:   --pass-pipeline='builtin.module(iree-spirv-select-lowering-strategy-pass)' \
 // RUN:   %s | FileCheck %s --check-prefix=PHYSICAL
 // RUN: env -u IREE_METAL_DISABLE_NATIVE_ATTENTION \
+// RUN:   IREE_METAL_APPLE_PHYSICAL_FRAGMENTS=0 \
+// RUN:   iree-opt --iree-gpu-test-target=apple@metal \
+// RUN:   -mlir-disable-threading=true -mlir-timing -mlir-timing-display=tree \
+// RUN:   --pass-pipeline='builtin.module(iree-spirv-select-lowering-strategy-pass,func.func(iree-spirv-lower-executable-target-pass))' \
+// RUN:   %s -o /dev/null 2>&1 | FileCheck %s --check-prefix=CANONICAL-PIPE
+// RUN: env -u IREE_METAL_DISABLE_NATIVE_ATTENTION \
+// RUN:   IREE_METAL_APPLE_PHYSICAL_FRAGMENTS=1 \
+// RUN:   iree-opt --iree-gpu-test-target=apple@metal \
+// RUN:   -mlir-disable-threading=true -mlir-timing -mlir-timing-display=tree \
+// RUN:   --pass-pipeline='builtin.module(iree-spirv-select-lowering-strategy-pass,func.func(iree-spirv-lower-executable-target-pass))' \
+// RUN:   %s -o /dev/null 2>&1 | FileCheck %s --check-prefix=PHYSICAL-PIPE \
+// RUN:     --implicit-check-not=GPUReduceBankConflictsPass
+// RUN: env -u IREE_METAL_DISABLE_NATIVE_ATTENTION \
 // RUN:   IREE_METAL_APPLE_PHYSICAL_FRAGMENTS=1 \
 // RUN:   iree-opt --iree-gpu-test-target=volta@vulkan \
 // RUN:   --pass-pipeline='builtin.module(iree-spirv-select-lowering-strategy-pass)' \
@@ -56,15 +69,24 @@ func.func @attention_bf16(
 }
 
 // APPLE-DAG: #[[TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = SPIRVAppleVectorDistributeAttention
+// APPLE-NOT: no_reduce_shared_memory_bank_conflicts = true
 // APPLE-LABEL: func.func @attention_bf16(
 // APPLE-SAME: translation_info = #[[TRANSLATION]]
 // APPLE-NOT: apple_physical_fragment_layout
+// APPLE-NOT: no_reduce_shared_memory_bank_conflicts = true
 
+// ZERO-NOT: no_reduce_shared_memory_bank_conflicts = true
 // ZERO-LABEL: func.func @attention_bf16(
 // ZERO-NOT: apple_physical_fragment_layout
+// ZERO-NOT: no_reduce_shared_memory_bank_conflicts = true
 
+// PHYSICAL: gpu_pipeline_options = #iree_gpu.pipeline_options<no_reduce_shared_memory_bank_conflicts = true
 // PHYSICAL-COUNT-2: apple_physical_fragment_layout = true
 // PHYSICAL-NOT: apple_physical_fragment_layout
+
+// CANONICAL-PIPE: SPIRVLowerExecutableTargetPass
+// CANONICAL-PIPE: GPUReduceBankConflictsPass
+// PHYSICAL-PIPE: SPIRVLowerExecutableTargetPass
 
 // OFF-DAG: #[[TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = SPIRVBaseDistribute
 // OFF-LABEL: func.func @attention_bf16(
@@ -73,6 +95,8 @@ func.func @attention_bf16(
 // OFF-NOT: APPLE_SIMDGROUP
 
 // NONAPPLE-NOT: SPIRVAppleVectorDistributeAttention
+// NONAPPLE-NOT: no_reduce_shared_memory_bank_conflicts = true
 // NONAPPLE-LABEL: func.func @attention_bf16(
 // NONAPPLE-NOT: SPIRVAppleVectorDistributeAttention
 // NONAPPLE-NOT: apple_physical_fragment_layout
+// NONAPPLE-NOT: no_reduce_shared_memory_bank_conflicts = true

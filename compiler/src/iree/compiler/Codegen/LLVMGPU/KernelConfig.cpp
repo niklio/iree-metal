@@ -1123,9 +1123,23 @@ LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
   auto configDict = b.getDictionaryAttr(attrs);
   auto loweringConfig = IREE::GPU::LoweringConfigAttr::get(context, configDict);
 
-  SmallVector<NamedAttribute, 1> pipelineAttrs;
+  SmallVector<NamedAttribute, 2> pipelineAttrs;
 
   setAttentionPipelineAttributes(target, pipelineAttrs);
+  if (useApplePhysicalLayout) {
+    // The factorized physical Apple fragment layout has a small innermost
+    // dimension. Generic bank-conflict padding operates on that physical
+    // dimension instead of the logical row stride and can therefore double
+    // every promoted attention operand. Keep the original compact allocations
+    // instead of applying a transform whose stride assumption no longer holds.
+    auto pipelineOptions = IREE::GPU::GPUPipelineOptionsAttr::get(
+        context, /*prefetch_num_stages=*/0,
+        /*no_reduce_shared_memory_bank_conflicts=*/true,
+        /*use_igemm_convolution=*/false,
+        /*reorder_workgroups_strategy=*/std::nullopt);
+    pipelineAttrs.emplace_back(
+        IREE::GPU::GPUPipelineOptionsAttr::getDictKeyName(), pipelineOptions);
+  }
 
   // TODO: We do not turn prefetching on even when requested by the prefetching
   // flag because there is a shared memory allocation the two matmuls, which
