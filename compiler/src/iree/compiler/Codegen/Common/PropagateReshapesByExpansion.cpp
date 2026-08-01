@@ -508,6 +508,11 @@ struct PropagateReshapesByExpansionPass final
 };
 } // namespace
 
+void populateHoistReshapesFromLoopsPatterns(RewritePatternSet &patterns) {
+  patterns.add<ExpandDestinationForallOp, ExpandDestinationForOp>(
+      patterns.getContext());
+}
+
 void PropagateReshapesByExpansionPass::runOnOperation() {
   MLIRContext *context = &getContext();
 
@@ -551,9 +556,8 @@ void PropagateReshapesByExpansionPass::runOnOperation() {
                                                      context);
   populateReshapeToInterfaceTensorPatterns(bubbleExpandShapePatterns);
   populateFoldTensorReshapeIntoBufferPatterns(bubbleExpandShapePatterns);
-  bubbleExpandShapePatterns
-      .add<ExpandDestinationForallOp, ExpandDestinationForOp,
-           SwapInnerBitcastWithExtractSlice>(context);
+  populateHoistReshapesFromLoopsPatterns(bubbleExpandShapePatterns);
+  bubbleExpandShapePatterns.add<SwapInnerBitcastWithExtractSlice>(context);
 
   if (failed(applyPatternsGreedily(getOperation(),
                                    std::move(bubbleExpandShapePatterns)))) {

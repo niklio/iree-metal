@@ -189,3 +189,23 @@ func.func @vector_multi_mma_with_permutation_of_wrong_size(%lhs: vector<2x3x4xf1
   } : vector<2x3x4xf16>, vector<3x5x4xf16> into vector<2x5x4xf32>
   return %0 : vector<2x5x4xf32>
 }
+
+// -----
+
+module attributes {
+  // expected-error @+1 {{apple_physical_fragment_layout is only valid for Apple simdgroup MMA intrinsics}}
+  test_mma = #iree_gpu.mma_layout<
+      MFMA_F32_16x16x16_F16:
+      apple_physical_fragment_layout = true>
+} {
+}
+
+// -----
+
+module attributes {
+  // expected-error @+1 {{apple_physical_fragment_layout does not support col_major results}}
+  test_mma = #iree_gpu.mma_layout<
+      APPLE_SIMDGROUP_F32_16x16x16_F16, col_major = true:
+      apple_physical_fragment_layout = true>
+} {
+}

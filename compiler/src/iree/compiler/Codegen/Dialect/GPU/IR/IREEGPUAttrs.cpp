@@ -697,7 +697,25 @@ void IREE::GPU::InnerTiledSemanticsAttr::getTileTypes(
 //===----------------------------------------------------------------------===//
 
 MMAAttr MMAAttr::get(MLIRContext *context, MMAIntrinsic type) {
-  return Base::get(context, type, /*colMajor=*/false);
+  return Base::get(context, type, /*colMajor=*/false,
+                   /*applePhysicalFragmentLayout=*/false);
+}
+
+LogicalResult MMAAttr::verify(function_ref<InFlightDiagnostic()> emitError,
+                              MMAIntrinsic intrinsic, bool colMajor,
+                              bool applePhysicalFragmentLayout) {
+  if (!applePhysicalFragmentLayout) {
+    return success();
+  }
+  if (!isAppleSimdgroupMma(intrinsic)) {
+    return emitError() << "apple_physical_fragment_layout is only valid for "
+                          "Apple simdgroup MMA intrinsics";
+  }
+  if (colMajor) {
+    return emitError() << "apple_physical_fragment_layout does not support "
+                          "col_major results";
+  }
+  return success();
 }
 
 int64_t MMAAttr::getExpectedNumInputs() const { return 2; }
@@ -915,7 +933,8 @@ static Value shuffleAppleMmaFragment(OpBuilder &builder, Location loc,
 
 static Value createMmaOp(OpBuilder &builder, Location loc,
                          MMAIntrinsic intrinsic, Type resultType, Value lhs,
-                         Value rhs, Value acc, bool colMajor = false) {
+                         Value rhs, Value acc, bool colMajor = false,
+                         bool applePhysicalFragmentLayout = false) {
   auto getVecOrSingleElem = [&](Value vec) -> Value {
     bool one = cast<VectorType>(vec.getType()).getNumElements() == 1;
     return one ? vector::ExtractOp::create(builder, loc, vec, 0) : vec;
@@ -985,11 +1004,13 @@ static Value createMmaOp(OpBuilder &builder, Location loc,
       return {};
     }
 
-    Value hardwareSourceLane = getAppleMmaShuffleSourceLane(
-        builder, loc, AppleMmaShuffleDirection::CanonicalToHardware);
-    lhs = shuffleAppleMmaFragment(builder, loc, lhs, hardwareSourceLane);
-    rhs = shuffleAppleMmaFragment(builder, loc, rhs, hardwareSourceLane);
-    acc = shuffleAppleMmaFragment(builder, loc, acc, hardwareSourceLane);
+    if (!applePhysicalFragmentLayout) {
+      Value hardwareSourceLane = getAppleMmaShuffleSourceLane(
+          builder, loc, AppleMmaShuffleDirection::CanonicalToHardware);
+      lhs = shuffleAppleMmaFragment(builder, loc, lhs, hardwareSourceLane);
+      rhs = shuffleAppleMmaFragment(builder, loc, rhs, hardwareSourceLane);
+      acc = shuffleAppleMmaFragment(builder, loc, acc, hardwareSourceLane);
+    }
 
     auto packFragment = [&](Value fragment, ArrayRef<int64_t> matrixShape,
                             StringRef operand) -> Value {
@@ -1026,9 +1047,13 @@ static Value createMmaOp(OpBuilder &builder, Location loc,
           ValueRange{index});
       result = vector::InsertOp::create(builder, loc, scalar, result, i);
     }
-    Value canonicalSourceLane = getAppleMmaShuffleSourceLane(
-        builder, loc, AppleMmaShuffleDirection::HardwareToCanonical);
-    return shuffleAppleMmaFragment(builder, loc, result, canonicalSourceLane);
+    if (!applePhysicalFragmentLayout) {
+      Value canonicalSourceLane = getAppleMmaShuffleSourceLane(
+          builder, loc, AppleMmaShuffleDirection::HardwareToCanonical);
+      result =
+          shuffleAppleMmaFragment(builder, loc, result, canonicalSourceLane);
+    }
+    return result;
   }
   return {};
 }
@@ -1039,6 +1064,17 @@ LogicalResult
 MMAAttr::buildUnderlyingOperations(OpBuilder &builder, Location loc,
                                    ValueRange inputs, ValueRange outputs,
                                    SmallVectorImpl<Value> &results) const {
+  return buildUnderlyingOperations(builder, loc, inputs, outputs, results,
+                                   /*applePhysicalFragmentLayoutProven=*/false);
+}
+
+LogicalResult MMAAttr::buildUnderlyingOperations(
+    OpBuilder &builder, Location loc, ValueRange inputs, ValueRange outputs,
+    SmallVectorImpl<Value> &results,
+    bool applePhysicalFragmentLayoutProven) const {
+  if (applePhysicalFragmentLayoutProven && !getApplePhysicalFragmentLayout()) {
+    return failure();
+  }
   if (inputs.size() != 2) {
     return failure();
   }
@@ -1054,7 +1090,8 @@ MMAAttr::buildUnderlyingOperations(OpBuilder &builder, Location loc,
 
   if (Value value =
           createMmaOp(builder, loc, getIntrinsic(), outputs[0].getType(),
-                      inputs[0], inputs[1], outputs[0], getColMajor())) {
+                      inputs[0], inputs[1], outputs[0], getColMajor(),
+                      applePhysicalFragmentLayoutProven)) {
     results.push_back(value);
     return success();
   }

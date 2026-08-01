@@ -455,8 +455,8 @@ debugPrintContractionInfo(StringRef label, unsigned numLoops,
 
 LogicalResult setMatmulVectorDistributionConfig(
     IREE::GPU::TargetAttr target, mlir::FunctionOpInterface entryPoint,
-    linalg::LinalgOp op, CodeGenPipeline pipeline,
-    bool appleSimdgroupOnly) {
+    linalg::LinalgOp op, CodeGenPipeline pipeline, bool appleSimdgroupOnly,
+    bool applePhysicalFragmentLayout) {
   if (target.getWgp().getMma().empty()) {
     return failure();
   }
@@ -563,8 +563,7 @@ LogicalResult setMatmulVectorDistributionConfig(
   intrinsics.reserve(target.getWgp().getMma().size());
   MLIRContext *context = op.getContext();
   for (IREE::GPU::MMAAttr mma : target.getWgp().getMma()) {
-    if (appleSimdgroupOnly &&
-        !isAppleSimdgroupIntrinsic(mma.getIntrinsic())) {
+    if (appleSimdgroupOnly && !isAppleSimdgroupIntrinsic(mma.getIntrinsic())) {
       continue;
     }
     if (mma.getSubgroupSize() != targetSubgroupSize) {
@@ -686,7 +685,18 @@ LogicalResult setMatmulVectorDistributionConfig(
   auto promotedOperands =
       llvm::to_vector(llvm::seq<int64_t>(op.getNumDpsInputs()));
   IREE::GPU::appendPromotedOperandsList(context, attrs, promotedOperands);
-  IREE::GPU::setMmaKind(context, attrs, schedule->mmaKind);
+  IREE::Codegen::InnerTileDescAttrInterface configuredMmaKind =
+      schedule->mmaKind;
+  if (auto mma = dyn_cast<IREE::GPU::MMAAttr>(schedule->mmaKind)) {
+    bool useApplePhysicalLayout =
+        applePhysicalFragmentLayout && appleSimdgroupOnly &&
+        pipeline == CodeGenPipeline::SPIRVAppleVectorDistributeAttention &&
+        isAppleSimdgroupIntrinsic(mma.getIntrinsic()) && !mma.getColMajor();
+    configuredMmaKind = IREE::GPU::MMAAttr::get(
+        context, mma.getIntrinsic(), mma.getColMajor(),
+        /*applePhysicalFragmentLayout=*/useApplePhysicalLayout);
+  }
+  IREE::GPU::setMmaKind(context, attrs, configuredMmaKind);
   IREE::GPU::Basis subgroupBasis = {
       SmallVector<int64_t>(op.getNumLoops(), 1),
       // Distribute subgroups from outer to inner. Mostly an arbitrary choice.
@@ -744,7 +754,8 @@ setAttentionPipelineAttributes(IREE::GPU::TargetAttr target,
 LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
     IREE::GPU::TargetAttr target, mlir::FunctionOpInterface entryPoint,
     IREE::LinalgExt::AttentionOp op,
-    IREE::Codegen::DispatchLoweringPassPipeline pipeline) {
+    IREE::Codegen::DispatchLoweringPassPipeline pipeline,
+    bool applePhysicalFragmentLayout) {
   if (target.getWgp().getMma().empty()) {
     return failure();
   }
@@ -1037,13 +1048,25 @@ LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
   bool useColMajor = !isAppleSimdgroupIntrinsic(qkSchedule.mmaKind) &&
                      !isAppleSimdgroupIntrinsic(pvSchedule.mmaKind) &&
                      matchLayout(qkOutLayout, pvRhsLayout);
+  auto qkMma = dyn_cast<IREE::GPU::MMAAttr>(qkSchedule.mmaKind);
+  auto pvMma = dyn_cast<IREE::GPU::MMAAttr>(pvSchedule.mmaKind);
+  // QK's accumulator is consumed directly as PV's LHS. Mark the pair only
+  // when both schedules use the same concrete Apple intrinsic, so that the
+  // shared physical fragment contract cannot be forged across layouts.
+  bool useApplePhysicalLayout =
+      applePhysicalFragmentLayout && requiresAppleSimdgroupMma && qkMma &&
+      pvMma && isAppleSimdgroupIntrinsic(qkMma) &&
+      isAppleSimdgroupIntrinsic(pvMma) &&
+      qkMma.getIntrinsic() == pvMma.getIntrinsic() && !useColMajor;
 
   auto getIntrinsic =
       [&](IREE::Codegen::InnerTileDescAttrInterface mmaKind,
           bool colMajor) -> IREE::Codegen::InnerTileDescAttrInterface {
     if (auto mma = dyn_cast<IREE::GPU::MMAAttr>(mmaKind)) {
       return IREE::GPU::MMAAttr::get(context, mma.getIntrinsic(),
-                                     /*colMajor=*/colMajor);
+                                     /*colMajor=*/colMajor,
+                                     /*applePhysicalFragmentLayout=*/
+                                     useApplePhysicalLayout);
     }
     if (auto vmma = dyn_cast<IREE::GPU::VirtualMMAAttr>(mmaKind)) {
       return IREE::GPU::VirtualMMAAttr::get(context, vmma.getIntrinsic(),

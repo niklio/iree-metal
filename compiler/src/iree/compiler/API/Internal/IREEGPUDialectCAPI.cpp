@@ -214,7 +214,7 @@ MlirAttribute ireeGPUMMAAttrGet(MlirContext mlirCtx, mma_intrinsic_enum_t value,
   mlir::MLIRContext *ctx = unwrap(mlirCtx);
   return wrap(mlir::iree_compiler::IREE::GPU::MMAAttr::get(
       ctx, static_cast<mlir::iree_compiler::IREE::GPU::MMAIntrinsic>(value),
-      colMajor));
+      colMajor, /*applePhysicalFragmentLayout=*/false));
 }
 
 bool ireeGPUMMAAttrGetColMajor(MlirAttribute attr) {

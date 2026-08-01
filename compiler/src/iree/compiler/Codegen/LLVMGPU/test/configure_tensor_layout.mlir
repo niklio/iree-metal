@@ -50,6 +50,142 @@ func.func @matmul_96x64x16_mfma(%lhs: tensor<96x16xf16>,
 
 // -----
 
+// The physical Apple fragment factors are explicit iteration dimensions.
+// Verify the exact native lane mapping for an 8x8 fragment, including a RHS
+// whose tensor dimensions are in transposed (N, K) order.
+
+#translation = #iree_codegen.translation_info<
+    pipeline = SPIRVAppleVectorDistributeAttention
+    workgroup_size = [32, 1, 1]
+    subgroup_size = 32>
+
+#apple8_physical_maps = [
+  affine_map<(m0, m1, m2, n0, n1, n2, k0, k1, k2) ->
+      (m0, m1, m2, k0, k1, k2)>,
+  affine_map<(m0, m1, m2, n0, n1, n2, k0, k1, k2) ->
+      (n0, n1, n2, k0, k1, k2)>,
+  affine_map<(m0, m1, m2, n0, n1, n2, k0, k1, k2) ->
+      (m0, m1, m2, n0, n1, n2)>
+]
+
+#apple8_physical_traits = {
+  indexing_maps = #apple8_physical_maps,
+  iterator_types = [
+    "parallel", "parallel", "parallel",
+    "parallel", "parallel", "parallel",
+    "reduction", "reduction", "reduction"],
+  lowering_config = #iree_gpu.lowering_config<{
+    mma_kind = #iree_gpu.mma_layout<
+        APPLE_SIMDGROUP_F32_8x8x8_F16:
+        apple_physical_fragment_layout = true>,
+    subgroup_basis = [
+      [1, 1, 1, 1, 1, 1, 1, 1, 1],
+      [0, 3, 4, 1, 5, 6, 2, 7, 8]]
+  }>
+}
+
+func.func @apple8_physical_transposed_rhs(
+    %lhs: tensor<1x2x4x1x2x4xf16>,
+    %rhs: tensor<1x2x4x1x2x4xf16>,
+    %init: tensor<1x2x4x1x2x4xf32>)
+    -> tensor<1x2x4x1x2x4xf32>
+    attributes {translation_info = #translation} {
+  %out = linalg.generic #apple8_physical_traits
+      ins(%lhs, %rhs : tensor<1x2x4x1x2x4xf16>,
+                        tensor<1x2x4x1x2x4xf16>)
+      outs(%init : tensor<1x2x4x1x2x4xf32>) {
+    ^bb0(%l: f16, %r: f16, %acc: f32):
+      %lext = arith.extf %l : f16 to f32
+      %rext = arith.extf %r : f16 to f32
+      %mul = arith.mulf %lext, %rext : f32
+      %sum = arith.addf %acc, %mul : f32
+      linalg.yield %sum : f32
+  } -> tensor<1x2x4x1x2x4xf32>
+  return %out : tensor<1x2x4x1x2x4xf32>
+}
+
+// CHECK-DAG: #[[$APPLE8_ROW_COL:.+]] = #iree_vector_ext.nested_layout<subgroup_tile = [1, 1, 1, 1, 1, 1], batch_tile = [1, 1, 1, 1, 1, 1], outer_tile = [1, 1, 1, 1, 1, 1], thread_tile = [1, 2, 4, 1, 2, 2], element_tile = [1, 1, 1, 1, 1, 2], subgroup_strides = [0, 0, 0, 0, 0, 0], thread_strides = [0, 16, 2, 0, 8, 1]>
+// CHECK-DAG: #[[$APPLE8_COL_ROW:.+]] = #iree_vector_ext.nested_layout<subgroup_tile = [1, 1, 1, 1, 1, 1], batch_tile = [1, 1, 1, 1, 1, 1], outer_tile = [1, 1, 1, 1, 1, 1], thread_tile = [1, 2, 2, 1, 2, 4], element_tile = [1, 1, 2, 1, 1, 1], subgroup_strides = [0, 0, 0, 0, 0, 0], thread_strides = [0, 8, 1, 0, 16, 2]>
+
+// CHECK-LABEL: func.func @apple8_physical_transposed_rhs
+// CHECK-DAG: %[[APPLE8_LHS:.+]] = iree_vector_ext.to_layout %{{.*}} to layout(#[[$APPLE8_ROW_COL]])
+// CHECK-DAG: %[[APPLE8_RHS:.+]] = iree_vector_ext.to_layout %{{.*}} to layout(#[[$APPLE8_COL_ROW]])
+// CHECK-DAG: %[[APPLE8_ACC:.+]] = iree_vector_ext.to_layout %{{.*}} to layout(#[[$APPLE8_ROW_COL]])
+// CHECK: linalg.generic
+// CHECK-SAME: ins(%[[APPLE8_LHS]], %[[APPLE8_RHS]]
+// CHECK-SAME: outs(%[[APPLE8_ACC]]
+
+// -----
+
+// Apple16 adds a native 2x2 outer-tile factor while retaining the same 8x8
+// physical lane mapping inside each tile.
+
+#translation = #iree_codegen.translation_info<
+    pipeline = SPIRVAppleVectorDistributeAttention
+    workgroup_size = [32, 1, 1]
+    subgroup_size = 32>
+
+#apple16_physical_maps = [
+  affine_map<(m0, m1, m2, m3, n0, n1, n2, n3,
+              k0, k1, k2, k3) ->
+      (m0, m1, m2, m3, k0, k1, k2, k3)>,
+  affine_map<(m0, m1, m2, m3, n0, n1, n2, n3,
+              k0, k1, k2, k3) ->
+      (n0, n1, n2, n3, k0, k1, k2, k3)>,
+  affine_map<(m0, m1, m2, m3, n0, n1, n2, n3,
+              k0, k1, k2, k3) ->
+      (m0, m1, m2, m3, n0, n1, n2, n3)>
+]
+
+#apple16_physical_traits = {
+  indexing_maps = #apple16_physical_maps,
+  iterator_types = [
+    "parallel", "parallel", "parallel", "parallel",
+    "parallel", "parallel", "parallel", "parallel",
+    "reduction", "reduction", "reduction", "reduction"],
+  lowering_config = #iree_gpu.lowering_config<{
+    mma_kind = #iree_gpu.mma_layout<
+        APPLE_SIMDGROUP_F32_16x16x16_F16:
+        apple_physical_fragment_layout = true>,
+    subgroup_basis = [
+      [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+      [0, 3, 4, 5, 1, 6, 7, 8, 2, 9, 10, 11]]
+  }>
+}
+
+func.func @apple16_physical_transposed_rhs(
+    %lhs: tensor<1x2x2x4x1x2x2x4xf16>,
+    %rhs: tensor<1x2x2x4x1x2x2x4xf16>,
+    %init: tensor<1x2x2x4x1x2x2x4xf32>)
+    -> tensor<1x2x2x4x1x2x2x4xf32>
+    attributes {translation_info = #translation} {
+  %out = linalg.generic #apple16_physical_traits
+      ins(%lhs, %rhs : tensor<1x2x2x4x1x2x2x4xf16>,
+                        tensor<1x2x2x4x1x2x2x4xf16>)
+      outs(%init : tensor<1x2x2x4x1x2x2x4xf32>) {
+    ^bb0(%l: f16, %r: f16, %acc: f32):
+      %lext = arith.extf %l : f16 to f32
+      %rext = arith.extf %r : f16 to f32
+      %mul = arith.mulf %lext, %rext : f32
+      %sum = arith.addf %acc, %mul : f32
+      linalg.yield %sum : f32
+  } -> tensor<1x2x2x4x1x2x2x4xf32>
+  return %out : tensor<1x2x2x4x1x2x2x4xf32>
+}
+
+// CHECK-DAG: #[[$APPLE16_ROW_COL:.+]] = #iree_vector_ext.nested_layout<subgroup_tile = [1, 1, 1, 1, 1, 1, 1, 1], batch_tile = [1, 1, 1, 1, 1, 1, 1, 1], outer_tile = [1, 2, 1, 1, 1, 2, 1, 1], thread_tile = [1, 1, 2, 4, 1, 1, 2, 2], element_tile = [1, 1, 1, 1, 1, 1, 1, 2], subgroup_strides = [0, 0, 0, 0, 0, 0, 0, 0], thread_strides = [0, 0, 16, 2, 0, 0, 8, 1]>
+// CHECK-DAG: #[[$APPLE16_COL_ROW:.+]] = #iree_vector_ext.nested_layout<subgroup_tile = [1, 1, 1, 1, 1, 1, 1, 1], batch_tile = [1, 1, 1, 1, 1, 1, 1, 1], outer_tile = [1, 2, 1, 1, 1, 2, 1, 1], thread_tile = [1, 1, 2, 2, 1, 1, 2, 4], element_tile = [1, 1, 1, 2, 1, 1, 1, 1], subgroup_strides = [0, 0, 0, 0, 0, 0, 0, 0], thread_strides = [0, 0, 8, 1, 0, 0, 16, 2]>
+
+// CHECK-LABEL: func.func @apple16_physical_transposed_rhs
+// CHECK-DAG: %[[APPLE16_LHS:.+]] = iree_vector_ext.to_layout %{{.*}} to layout(#[[$APPLE16_ROW_COL]])
+// CHECK-DAG: %[[APPLE16_RHS:.+]] = iree_vector_ext.to_layout %{{.*}} to layout(#[[$APPLE16_COL_ROW]])
+// CHECK-DAG: %[[APPLE16_ACC:.+]] = iree_vector_ext.to_layout %{{.*}} to layout(#[[$APPLE16_ROW_COL]])
+// CHECK: linalg.generic
+// CHECK-SAME: ins(%[[APPLE16_LHS]], %[[APPLE16_RHS]]
+// CHECK-SAME: outs(%[[APPLE16_ACC]]
+
+// -----
+
 // Preserve the contraction result layout across a pointwise DPS update. If the
 // update folds to a constant (as an all-false attention mask does), the result
 // anchor must remain available to distribute the following reduction.

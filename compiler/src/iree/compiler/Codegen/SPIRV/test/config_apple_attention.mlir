@@ -1,8 +1,20 @@
 // RUN: env -u IREE_METAL_DISABLE_NATIVE_ATTENTION \
+// RUN:   -u IREE_METAL_APPLE_PHYSICAL_FRAGMENTS \
 // RUN:   iree-opt --iree-gpu-test-target=apple@metal \
 // RUN:   --pass-pipeline='builtin.module(iree-spirv-select-lowering-strategy-pass)' \
 // RUN:   %s | FileCheck %s --check-prefix=APPLE
 // RUN: env -u IREE_METAL_DISABLE_NATIVE_ATTENTION \
+// RUN:   IREE_METAL_APPLE_PHYSICAL_FRAGMENTS=0 \
+// RUN:   iree-opt --iree-gpu-test-target=apple@metal \
+// RUN:   --pass-pipeline='builtin.module(iree-spirv-select-lowering-strategy-pass)' \
+// RUN:   %s | FileCheck %s --check-prefix=ZERO
+// RUN: env -u IREE_METAL_DISABLE_NATIVE_ATTENTION \
+// RUN:   IREE_METAL_APPLE_PHYSICAL_FRAGMENTS=1 \
+// RUN:   iree-opt --iree-gpu-test-target=apple@metal \
+// RUN:   --pass-pipeline='builtin.module(iree-spirv-select-lowering-strategy-pass)' \
+// RUN:   %s | FileCheck %s --check-prefix=PHYSICAL
+// RUN: env -u IREE_METAL_DISABLE_NATIVE_ATTENTION \
+// RUN:   IREE_METAL_APPLE_PHYSICAL_FRAGMENTS=1 \
 // RUN:   iree-opt --iree-gpu-test-target=volta@vulkan \
 // RUN:   --pass-pipeline='builtin.module(iree-spirv-select-lowering-strategy-pass)' \
 // RUN:   %s | FileCheck %s --check-prefix=NONAPPLE
@@ -46,6 +58,13 @@ func.func @attention_bf16(
 // APPLE-DAG: #[[TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = SPIRVAppleVectorDistributeAttention
 // APPLE-LABEL: func.func @attention_bf16(
 // APPLE-SAME: translation_info = #[[TRANSLATION]]
+// APPLE-NOT: apple_physical_fragment_layout
+
+// ZERO-LABEL: func.func @attention_bf16(
+// ZERO-NOT: apple_physical_fragment_layout
+
+// PHYSICAL-COUNT-2: apple_physical_fragment_layout = true
+// PHYSICAL-NOT: apple_physical_fragment_layout
 
 // OFF-DAG: #[[TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = SPIRVBaseDistribute
 // OFF-LABEL: func.func @attention_bf16(
@@ -56,3 +75,4 @@ func.func @attention_bf16(
 // NONAPPLE-NOT: SPIRVAppleVectorDistributeAttention
 // NONAPPLE-LABEL: func.func @attention_bf16(
 // NONAPPLE-NOT: SPIRVAppleVectorDistributeAttention
+// NONAPPLE-NOT: apple_physical_fragment_layout

@@ -30,6 +30,7 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Utils/IndexingUtils.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/Dialect/Utils/StructuredOpsUtils.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
@@ -1127,6 +1128,61 @@ struct LowerInnerTiledPattern : OpRewritePattern<IREE::Codegen::InnerTiledOp> {
     tiledOp.getKind().getDistributedTileTypes(regTypes);
 
     auto mmaKind = dyn_cast<IREE::GPU::MMAAttr>(tiledOp.getKind());
+    bool requestsApplePhysicalLayout =
+        mmaKind && mmaKind.getApplePhysicalFragmentLayout();
+    bool applePhysicalLayoutProven = false;
+    SmallVector<int64_t> applePhysicalCanonicalShape;
+    SmallVector<SmallVector<int64_t>> applePhysicalOutputPermutations;
+    int64_t numInputs = tiledOp.getNumInputs();
+    if (requestsApplePhysicalLayout) {
+      auto [m, n, k] = mmaKind.getMNKShape();
+      if (m != n || n != k || (m != 8 && m != 16)) {
+        return tiledOp.emitOpError(
+            "invalid intrinsic for Apple physical fragment layout");
+      }
+      SmallVector<int64_t> rowShape =
+          m == 8 ? SmallVector<int64_t>{1, 1} : SmallVector<int64_t>{2, 1, 1};
+      SmallVector<int64_t> colShape =
+          m == 8 ? SmallVector<int64_t>{1, 2} : SmallVector<int64_t>{2, 1, 2};
+      SmallVector<int64_t> canonicalShape(rowShape);
+      llvm::append_range(canonicalShape, colShape);
+      applePhysicalCanonicalShape = canonicalShape;
+      std::optional<ArrayAttr> permutations = tiledOp.getPermutations();
+      for (auto [operandIndex, operand] :
+           llvm::enumerate(tiledOp.getOperands())) {
+        auto operandType = dyn_cast<VectorType>(operand.getType());
+        if (!operandType || operandType.getRank() != canonicalShape.size()) {
+          return tiledOp.emitOpError(
+              "marked Apple physical fragment lacks expanded vector rank");
+        }
+        SmallVector<int64_t> permutation = llvm::to_vector(
+            llvm::seq<int64_t>(0, static_cast<int64_t>(canonicalShape.size())));
+        if (permutations) {
+          permutation = llvm::to_vector(
+              cast<DenseI64ArrayAttr>((*permutations)[operandIndex])
+                  .asArrayRef());
+        }
+        if (!isPermutationVector(permutation) ||
+            permutation.size() != canonicalShape.size()) {
+          return tiledOp.emitOpError(
+              "marked Apple physical fragment has invalid permutation");
+        }
+        SmallVector<int64_t> expectedOperandShape(canonicalShape);
+        applyPermutationToVector(expectedOperandShape, permutation);
+        if (operandType.getShape() != ArrayRef<int64_t>(expectedOperandShape)) {
+          return tiledOp.emitOpError(
+              "marked Apple physical fragment has unexpected local shape");
+        }
+        if (operandIndex >= static_cast<size_t>(numInputs)) {
+          applePhysicalOutputPermutations.push_back(std::move(permutation));
+        }
+      }
+      if (applePhysicalOutputPermutations.size() != tiledOp.getNumResults()) {
+        return tiledOp.emitOpError(
+            "marked Apple physical fragment has mismatched outputs");
+      }
+      applePhysicalLayoutProven = true;
+    }
     bool isApple16Mma =
         mmaKind &&
         (mmaKind.getIntrinsic() ==
@@ -1145,6 +1201,26 @@ struct LowerInnerTiledPattern : OpRewritePattern<IREE::Codegen::InnerTiledOp> {
 
     for (auto [operandIndex, regType] : llvm::enumerate(regTypes)) {
       Value &operand = operands[operandIndex];
+      if (applePhysicalLayoutProven) {
+        SmallVector<int64_t> permutation = llvm::to_vector(llvm::seq<int64_t>(
+            0, cast<VectorType>(operand.getType()).getRank()));
+        if (std::optional<ArrayAttr> permutations = tiledOp.getPermutations()) {
+          permutation = llvm::to_vector(
+              cast<DenseI64ArrayAttr>((*permutations)[operandIndex])
+                  .asArrayRef());
+        }
+        if (!isIdentityPermutation(permutation)) {
+          SmallVector<int64_t> inverse = invertPermutationVector(permutation);
+          SmallVector<int64_t> canonicalShape(
+              cast<VectorType>(operand.getType()).getShape());
+          applyPermutationToVector(canonicalShape, inverse);
+          auto canonicalType =
+              VectorType::get(canonicalShape, regType.getElementType());
+          operand = vector::TransposeOp::create(
+              rewriter, tiledOp.getLoc(), canonicalType, operand,
+              rewriter.getDenseI64ArrayAttr(inverse));
+        }
+      }
       // A packed generic matmul records its transposed physical RHS tile with
       // permutation [1, 0]. After lane distribution that tile is vector<4x2>;
       // normalize it to tile-major vector<2x4> before the generic shape cast
@@ -1153,7 +1229,8 @@ struct LowerInnerTiledPattern : OpRewritePattern<IREE::Codegen::InnerTiledOp> {
       // Requiring the explicit permutation makes this fail closed for opaque,
       // hand-written vector<4x2> operands whose ordering is unknown.
       auto operandType = dyn_cast<VectorType>(operand.getType());
-      if (isApple16Mma && hasTransposedRhsPermutation &&
+      if (!applePhysicalLayoutProven && isApple16Mma &&
+          hasTransposedRhsPermutation &&
           operandIndex == IREE::GPU::kMMAOperandRhs && operandType &&
           operandType.getRank() == 2 && operandType.getDimSize(0) == 4 &&
           operandType.getDimSize(1) == 2) {
@@ -1170,19 +1247,48 @@ struct LowerInnerTiledPattern : OpRewritePattern<IREE::Codegen::InnerTiledOp> {
     }
 
     SmallVector<Value> concreteResults;
-    int64_t numInputs = tiledOp.getNumInputs();
-    LogicalResult couldLower = tiledOp.getKind().buildUnderlyingOperations(
-        rewriter, tiledOp.getLoc(), ValueRange{operands}.take_front(numInputs),
-        ValueRange{operands}.drop_front(numInputs), concreteResults);
+    LogicalResult couldLower = failure();
+    if (applePhysicalLayoutProven) {
+      couldLower = mmaKind.buildUnderlyingOperations(
+          rewriter, tiledOp.getLoc(),
+          ValueRange{operands}.take_front(numInputs),
+          ValueRange{operands}.drop_front(numInputs), concreteResults,
+          /*applePhysicalFragmentLayoutProven=*/true);
+    } else {
+      couldLower = tiledOp.getKind().buildUnderlyingOperations(
+          rewriter, tiledOp.getLoc(),
+          ValueRange{operands}.take_front(numInputs),
+          ValueRange{operands}.drop_front(numInputs), concreteResults);
+    }
     if (failed(couldLower)) {
       tiledOp.emitOpError(
           "failed to lower to concrete inner tiled operations.");
       return failure();
     }
-    for (auto [result, externalShape] :
-         llvm::zip_equal(concreteResults, tiledOp.getResultTypes())) {
-      result = vector::ShapeCastOp::create(rewriter, tiledOp.getLoc(),
-                                           externalShape, result);
+    for (auto [resultIndex, result, externalShape] :
+         llvm::enumerate(concreteResults, tiledOp.getResultTypes())) {
+      if (applePhysicalLayoutProven) {
+        ArrayRef<int64_t> outputPermutation =
+            applePhysicalOutputPermutations[resultIndex];
+        if (!isIdentityPermutation(outputPermutation)) {
+          auto concreteType = cast<VectorType>(result.getType());
+          auto canonicalType = VectorType::get(applePhysicalCanonicalShape,
+                                               concreteType.getElementType());
+          result = vector::ShapeCastOp::create(rewriter, tiledOp.getLoc(),
+                                               canonicalType, result);
+          SmallVector<int64_t> permutedShape(applePhysicalCanonicalShape);
+          applyPermutationToVector(permutedShape, outputPermutation);
+          auto permutedType =
+              VectorType::get(permutedShape, concreteType.getElementType());
+          result = vector::TransposeOp::create(
+              rewriter, tiledOp.getLoc(), permutedType, result,
+              rewriter.getDenseI64ArrayAttr(outputPermutation));
+        }
+      }
+      if (result.getType() != externalShape) {
+        result = vector::ShapeCastOp::create(rewriter, tiledOp.getLoc(),
+                                             externalShape, result);
+      }
     }
     rewriter.replaceOp(tiledOp, concreteResults);
     return success();
@@ -1462,12 +1568,67 @@ FailureOr<IREE::Codegen::InnerTiledOp> convertContractionToInnerTiledMma(
   int64_t innerN = contractionDims.n.back();
   int64_t innerK = contractionDims.k.back();
 
+  SmallVector<int64_t> bounds = linalgOp.getStaticLoopRanges();
+  SmallVector<int64_t> intrinsicMDims = {innerM};
+  SmallVector<int64_t> intrinsicNDims = {innerN};
+  SmallVector<int64_t> intrinsicKDims = {innerK};
+  bool physicalAppleLayout = false;
+  if (auto concreteMma = dyn_cast<IREE::GPU::MMAAttr>(mmaKind)) {
+    physicalAppleLayout = concreteMma.getApplePhysicalFragmentLayout();
+  }
+
+  auto [intrinsicM, intrinsicN, intrinsicK] = mmaKind.getMNKShape();
+  if (physicalAppleLayout) {
+    if (intrinsicM != intrinsicN || intrinsicN != intrinsicK ||
+        (intrinsicM != 8 && intrinsicM != 16)) {
+      return failure();
+    }
+    SmallVector<int64_t> factors = intrinsicM == 8
+                                       ? SmallVector<int64_t>{2, 4}
+                                       : SmallVector<int64_t>{2, 2, 4};
+    auto getExpandedDims =
+        [&](ArrayRef<unsigned> dims) -> FailureOr<SmallVector<int64_t>> {
+      if (dims.size() < factors.size()) {
+        return failure();
+      }
+      SmallVector<int64_t> expandedDims;
+      for (auto [dim, factor] :
+           llvm::zip_equal(dims.take_back(factors.size()), factors)) {
+        if (bounds[dim] != factor) {
+          return failure();
+        }
+        expandedDims.push_back(dim);
+      }
+      return expandedDims;
+    };
+    FailureOr<SmallVector<int64_t>> maybeMDims =
+        getExpandedDims(contractionDims.m);
+    FailureOr<SmallVector<int64_t>> maybeNDims =
+        getExpandedDims(contractionDims.n);
+    FailureOr<SmallVector<int64_t>> maybeKDims =
+        getExpandedDims(contractionDims.k);
+    if (failed(maybeMDims) || failed(maybeNDims) || failed(maybeKDims)) {
+      return linalgOp.emitOpError(
+          "marked Apple physical fragment was not expanded before packing");
+    }
+    intrinsicMDims = std::move(*maybeMDims);
+    intrinsicNDims = std::move(*maybeNDims);
+    intrinsicKDims = std::move(*maybeKDims);
+  }
+
   AffineExpr d0, d1, d2;
   bindDims(context, d0, d1, d2);
   llvm::SmallDenseMap<AffineExpr, AffineExpr> newDims;
   AffineExpr mExpr = rewriter.getAffineDimExpr(innerM);
   AffineExpr nExpr = rewriter.getAffineDimExpr(innerN);
   AffineExpr kExpr = rewriter.getAffineDimExpr(innerK);
+  auto getDimExprs = [&](ArrayRef<int64_t> dims) {
+    return llvm::map_to_vector(
+        dims, [&](int64_t dim) { return rewriter.getAffineDimExpr(dim); });
+  };
+  SmallVector<AffineExpr> mExprs = getDimExprs(intrinsicMDims);
+  SmallVector<AffineExpr> nExprs = getDimExprs(intrinsicNDims);
+  SmallVector<AffineExpr> kExprs = getDimExprs(intrinsicKDims);
 
   SmallVector<AffineMap> indexingMaps = linalgOp.getIndexingMapsArray();
   AffineMap lhsMap = indexingMaps[0];
@@ -1475,8 +1636,8 @@ FailureOr<IREE::Codegen::InnerTiledOp> convertContractionToInnerTiledMma(
   AffineMap accMap = indexingMaps[2];
 
   auto getNormalizedPermutation =
-      [&](AffineMap map,
-          ArrayRef<AffineExpr> expectedDimOrder) -> SmallVector<int64_t> {
+      [&](AffineMap map, ArrayRef<AffineExpr> expectedDimOrder,
+          bool filterOuterDims = false) -> SmallVector<int64_t> {
     llvm::SmallDenseMap<AffineExpr, int64_t> dimMap;
     for (auto [i, expr] : llvm::enumerate(expectedDimOrder)) {
       dimMap[expr] = i;
@@ -1484,30 +1645,54 @@ FailureOr<IREE::Codegen::InnerTiledOp> convertContractionToInnerTiledMma(
     SmallVector<int64_t> permutation;
     for (AffineExpr resExpr : map.getResults()) {
       if (!dimMap.contains(resExpr)) {
+        if (filterOuterDims) {
+          continue;
+        }
         return {};
       }
       permutation.push_back(dimMap[resExpr]);
     }
+    if (permutation.size() != expectedDimOrder.size()) {
+      return {};
+    }
     return permutation;
   };
 
-  // TODO: Enable batched intrinsics and get the appropriate sub-map here.
-  SmallVector<int64_t> lhsInnerPerm =
-      getNormalizedPermutation(lhsMap.getMinorSubMap(2), {mExpr, kExpr});
-  SmallVector<int64_t> rhsInnerPerm =
-      getNormalizedPermutation(rhsMap.getMinorSubMap(2), {kExpr, nExpr});
-  SmallVector<int64_t> accInnerPerm =
-      getNormalizedPermutation(accMap.getMinorSubMap(2), {mExpr, nExpr});
+  SmallVector<int64_t> lhsInnerPerm, rhsInnerPerm, accInnerPerm;
+  if (physicalAppleLayout) {
+    SmallVector<AffineExpr> lhsOrder(mExprs);
+    llvm::append_range(lhsOrder, kExprs);
+    SmallVector<AffineExpr> rhsOrder(kExprs);
+    llvm::append_range(rhsOrder, nExprs);
+    SmallVector<AffineExpr> accOrder(mExprs);
+    llvm::append_range(accOrder, nExprs);
+    lhsInnerPerm = getNormalizedPermutation(lhsMap, lhsOrder,
+                                            /*filterOuterDims=*/true);
+    rhsInnerPerm = getNormalizedPermutation(rhsMap, rhsOrder,
+                                            /*filterOuterDims=*/true);
+    accInnerPerm = getNormalizedPermutation(accMap, accOrder,
+                                            /*filterOuterDims=*/true);
+  } else {
+    // TODO: Enable batched intrinsics and get the appropriate sub-map here.
+    lhsInnerPerm =
+        getNormalizedPermutation(lhsMap.getMinorSubMap(2), {mExpr, kExpr});
+    rhsInnerPerm =
+        getNormalizedPermutation(rhsMap.getMinorSubMap(2), {kExpr, nExpr});
+    accInnerPerm =
+        getNormalizedPermutation(accMap.getMinorSubMap(2), {mExpr, nExpr});
+  }
 
   if (lhsInnerPerm.empty() || rhsInnerPerm.empty() || accInnerPerm.empty()) {
     return failure();
   }
 
-  SmallVector<int64_t> bounds = linalgOp.getStaticLoopRanges();
-
-  auto [intrinsicM, intrinsicN, intrinsicK] = mmaKind.getMNKShape();
-  if (intrinsicM != bounds[innerM] || intrinsicN != bounds[innerN] ||
-      intrinsicK != bounds[innerK]) {
+  auto getDimProduct = [&](ArrayRef<int64_t> dims) {
+    return llvm::product_of(
+        llvm::map_range(dims, [&](int64_t dim) { return bounds[dim]; }));
+  };
+  if (intrinsicM != getDimProduct(intrinsicMDims) ||
+      intrinsicN != getDimProduct(intrinsicNDims) ||
+      intrinsicK != getDimProduct(intrinsicKDims)) {
     return failure();
   }
 
@@ -1525,7 +1710,10 @@ FailureOr<IREE::Codegen::InnerTiledOp> convertContractionToInnerTiledMma(
 
   SmallVector<utils::IteratorType> linalgIteratorTypes =
       linalgOp.getIteratorTypesArray();
-  llvm::SmallDenseSet<int64_t> droppedDims = {innerM, innerN, innerK};
+  llvm::SmallDenseSet<int64_t> droppedDims;
+  droppedDims.insert(intrinsicMDims.begin(), intrinsicMDims.end());
+  droppedDims.insert(intrinsicNDims.begin(), intrinsicNDims.end());
+  droppedDims.insert(intrinsicKDims.begin(), intrinsicKDims.end());
   llvm::SmallDenseMap<int64_t, int64_t> oldDimsToNewDimsMap;
   int64_t currentDim = 0;
   int64_t numDims = lhsMap.getNumDims();
@@ -1538,17 +1726,18 @@ FailureOr<IREE::Codegen::InnerTiledOp> convertContractionToInnerTiledMma(
     oldDimsToNewDimsMap[dim] = currentDim++;
   }
 
-  AffineMap outerLhsMap =
-      dropDims(context, numDims - 3, lhsMap, oldDimsToNewDimsMap);
-  AffineMap outerRhsMap =
-      dropDims(context, numDims - 3, rhsMap, oldDimsToNewDimsMap);
-  AffineMap outerAccMap =
-      dropDims(context, numDims - 3, accMap, oldDimsToNewDimsMap);
+  AffineMap outerLhsMap = dropDims(context, numDims - droppedDims.size(),
+                                   lhsMap, oldDimsToNewDimsMap);
+  AffineMap outerRhsMap = dropDims(context, numDims - droppedDims.size(),
+                                   rhsMap, oldDimsToNewDimsMap);
+  AffineMap outerAccMap = dropDims(context, numDims - droppedDims.size(),
+                                   accMap, oldDimsToNewDimsMap);
 
   std::optional<SmallVector<SmallVector<int64_t>>> perms =
       SmallVector<SmallVector<int64_t>>{lhsInnerPerm, rhsInnerPerm,
                                         accInnerPerm};
-  SmallVector<int64_t> identityPerm = {0, 1};
+  SmallVector<int64_t> identityPerm = llvm::to_vector(
+      llvm::seq<int64_t>(0, static_cast<int64_t>(lhsInnerPerm.size())));
 
   if (lhsInnerPerm == identityPerm && rhsInnerPerm == identityPerm &&
       accInnerPerm == identityPerm) {

@@ -10,11 +10,13 @@
 
 #include <cassert>
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/Support/DebugLog.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Utils/IndexingUtils.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
@@ -63,6 +65,11 @@ struct LayoutAnalysis {
       candidates;
   /// Resolved layouts: single layout per value (after resolve, used by fixup).
   llvm::MapVector<Value, VectorLayoutInterface> resolved;
+  /// Cache whether a shaped value's entire defining DAG is cheap to clone.
+  llvm::DenseMap<Value, bool> cheapRematerializable;
+  /// Clones keyed by their source value and requested result layout.
+  llvm::MapVector<Value, llvm::MapVector<VectorLayoutInterface, Value>>
+      rematerialized;
   /// Forward worklist (Phase 1 only).
   std::queue<Value> forward;
 
@@ -88,6 +95,7 @@ struct LayoutAnalysis {
 
   void fixupRegion(Region &region);
   void fixupOp(Operation *op);
+  bool isCheapRematerializable(Value value);
   void setLayoutOrClone(OpOperand *val, VectorLayoutInterface layout);
 };
 
@@ -466,6 +474,44 @@ void LayoutAnalysis::fixupOp(Operation *op) {
 
 /// Assign a layout to an operand, cloning cheap ops or inserting conversions
 /// on conflict.
+bool LayoutAnalysis::isCheapRematerializable(Value value) {
+  if (!isa<ShapedType>(value.getType())) {
+    return true;
+  }
+
+  auto [it, inserted] = cheapRematerializable.try_emplace(value, false);
+  if (!inserted) {
+    return it->second;
+  }
+
+  Operation *defOp = value.getDefiningOp();
+  if (!defOp || defOp->getNumResults() != 1) {
+    return false;
+  }
+  bool isConstantLike = defOp->hasTrait<OpTrait::ConstantLike>();
+  auto resultType = dyn_cast<VectorType>(defOp->getResult(0).getType());
+  bool isIndexVector = resultType && resultType.getElementType().isIndex();
+  bool isDuplicatable =
+      isa<vector::StepOp, vector::CreateMaskOp, vector::ConstantMaskOp>(
+          defOp) ||
+      (isIndexVector &&
+       isa<vector::BroadcastOp, arith::AddIOp, arith::MulIOp>(defOp));
+  if (!isConstantLike && !isDuplicatable) {
+    return false;
+  }
+
+  // Scalar leaves do not carry vector layouts and are safe to share. Every
+  // shaped input, however, must itself be cheap to rematerialize so cloning is
+  // all-or-nothing and cannot hide a communication behind a cheap parent.
+  if (!llvm::all_of(defOp->getOperands(), [&](Value operand) {
+        return isCheapRematerializable(operand);
+      })) {
+    return false;
+  }
+  cheapRematerializable[value] = true;
+  return true;
+}
+
 void LayoutAnalysis::setLayoutOrClone(OpOperand *val,
                                       VectorLayoutInterface layout) {
   if (!layout) {
@@ -488,17 +534,27 @@ void LayoutAnalysis::setLayoutOrClone(OpOperand *val,
 
   // Different layout -- clone cheap ops or insert to_layout conversion.
   OpBuilder b(val->getOwner());
-  if (Operation *defOp = val->get().getDefiningOp()) {
-    // Clone constant-like and duplicatable ops per use site.
-    bool isConstantLike = defOp->hasTrait<OpTrait::ConstantLike>();
-    bool isDuplicatable =
-        isa<vector::StepOp, vector::CreateMaskOp, vector::ConstantMaskOp>(
-            defOp);
-    if (isConstantLike || isDuplicatable) {
+  Value source = val->get();
+  if (Operation *defOp = source.getDefiningOp()) {
+    if (isCheapRematerializable(source)) {
+      auto &clonesForValue = rematerialized[source];
+      auto cloneIt = clonesForValue.find(layout);
+      if (cloneIt != clonesForValue.end()) {
+        val->set(cloneIt->second);
+        return;
+      }
+
       b.setInsertionPoint(defOp);
       Operation *cloned = b.clone(*defOp);
       val->set(cloned->getResult(0));
       resolved[cloned->getResult(0)] = layout;
+      clonesForValue[layout] = cloned->getResult(0);
+      // fixupRegion snapshots operations before mutation, so a clone inserted
+      // here would otherwise never have its operands fixed up. Recursing now
+      // lets a rematerializable coordinate DAG (for example
+      // step -> muli -> broadcast) clone all the way back to its cheap roots
+      // instead of introducing a layout conversion inside the cloned DAG.
+      fixupOp(cloned);
       return;
     }
   }

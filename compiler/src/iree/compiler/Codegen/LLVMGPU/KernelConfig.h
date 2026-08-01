@@ -24,7 +24,7 @@ LogicalResult setMatmulVectorDistributionConfig(
     linalg::LinalgOp op,
     IREE::Codegen::DispatchLoweringPassPipeline pipeline =
         IREE::Codegen::DispatchLoweringPassPipeline::LLVMGPUVectorDistribute,
-    bool appleSimdgroupOnly = false);
+    bool appleSimdgroupOnly = false, bool applePhysicalFragmentLayout = false);
 
 // iree-metal (attn vdist port): exposed so the metal-spirv attention pipeline
 // can reuse the LLVMGPU intrinsic-based vector-distribute attention config. The
@@ -34,7 +34,8 @@ LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
     IREE::GPU::TargetAttr target, mlir::FunctionOpInterface entryPoint,
     IREE::LinalgExt::AttentionOp op,
     IREE::Codegen::DispatchLoweringPassPipeline pipeline =
-        IREE::Codegen::DispatchLoweringPassPipeline::LLVMGPUVectorDistribute);
+        IREE::Codegen::DispatchLoweringPassPipeline::LLVMGPUVectorDistribute,
+    bool applePhysicalFragmentLayout = false);
 
 } // namespace mlir::iree_compiler
 #endif // IREE_COMPILER_CODEGEN_LLVMGPU_KERNELCONFIG_H_

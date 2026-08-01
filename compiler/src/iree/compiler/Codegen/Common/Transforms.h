@@ -126,6 +126,10 @@ void moveUpMemrefReshapeOps(RewriterBase &rewriter, Operation *op);
 /// of iree_codegen.load_from_buffer or iree_codegen.store_to_buffer ops.
 void populateFoldTensorReshapeIntoBufferPatterns(RewritePatternSet &patterns);
 
+/// Populate patterns that hoist matching tensor expand/collapse_shape pairs
+/// across scf.for and workgroup-mapped scf.forall iter_args.
+void populateHoistReshapesFromLoopsPatterns(RewritePatternSet &patterns);
+
 /// Populate patterns that fold reshaping and bitcasting ops into the source
 /// hal.interface.binding.subspan.
 void populateReshapeToInterfaceTensorPatterns(RewritePatternSet &patterns);

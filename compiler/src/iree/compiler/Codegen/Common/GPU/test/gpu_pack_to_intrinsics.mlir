@@ -410,3 +410,53 @@ func.func @no_propagate_extract_differentblock_2(%input : tensor<128xf32>, %arg0
 // CHECK-LABEL: func.func @no_propagate_extract_differentblock_2
 //       CHECK:  tensor.extract_slice
 //       CHECK:  linalg.generic
+
+// -----
+
+#apple16_physical_maps = [
+  affine_map<(m0, m1, m2, m3, n0, n1, n2, n3,
+              k0, k1, k2, k3) -> (m0, m1, m2, m3, k0, k1, k2, k3)>,
+  affine_map<(m0, m1, m2, m3, n0, n1, n2, n3,
+              k0, k1, k2, k3) -> (n0, n1, n2, n3, k0, k1, k2, k3)>,
+  affine_map<(m0, m1, m2, m3, n0, n1, n2, n3,
+              k0, k1, k2, k3) -> (n0, n1, n2, n3, m0, m1, m2, m3)>
+]
+#apple16_physical_config = #iree_gpu.lowering_config<{
+  mma_kind = #iree_gpu.mma_layout<
+      APPLE_SIMDGROUP_F32_16x16x16_F16:
+      apple_physical_fragment_layout = true>
+}>
+
+func.func @pack_apple16_physical_fragment_factors(
+    %lhs: tensor<2x2x2x4x4x2x2x4xf16>,
+    %rhs: tensor<3x2x2x4x4x2x2x4xf16>,
+    %acc: tensor<3x2x2x4x2x2x2x4xf32>)
+    -> tensor<3x2x2x4x2x2x2x4xf32> {
+  %result = linalg.generic {
+      indexing_maps = #apple16_physical_maps,
+      iterator_types = [
+        "parallel", "parallel", "parallel", "parallel",
+        "parallel", "parallel", "parallel", "parallel",
+        "reduction", "reduction", "reduction", "reduction"],
+      lowering_config = #apple16_physical_config
+    } ins(%lhs, %rhs : tensor<2x2x2x4x4x2x2x4xf16>,
+                       tensor<3x2x2x4x4x2x2x4xf16>)
+      outs(%acc : tensor<3x2x2x4x2x2x2x4xf32>) {
+    ^bb0(%l: f16, %r: f16, %old: f32):
+      %lf = arith.extf %l : f16 to f32
+      %rf = arith.extf %r : f16 to f32
+      %mul = arith.mulf %lf, %rf : f32
+      %sum = arith.addf %old, %mul : f32
+      linalg.yield %sum : f32
+  } -> tensor<3x2x2x4x2x2x2x4xf32>
+  return %result : tensor<3x2x2x4x2x2x2x4xf32>
+}
+
+// CHECK-LABEL: func.func @pack_apple16_physical_fragment_factors
+// CHECK-DAG: %[[LHS_PACK:.+]] = linalg.pack %{{.*}} inner_dims_pos = [1, 2, 3, 5, 6, 7] inner_tiles = [2, 2, 4, 2, 2, 4]
+// CHECK-DAG: %[[RHS_PACK:.+]] = linalg.pack %{{.*}} inner_dims_pos = [1, 2, 3, 5, 6, 7] inner_tiles = [2, 2, 4, 2, 2, 4]
+// CHECK-DAG: %[[ACC_PACK:.+]] = linalg.pack %{{.*}} inner_dims_pos = [5, 6, 7, 1, 2, 3] inner_tiles = [2, 2, 4, 2, 2, 4]
+// CHECK: iree_codegen.inner_tiled ins(%[[LHS_PACK]], %[[RHS_PACK]]) outs(%[[ACC_PACK]])
+// CHECK-SAME: kind = #iree_gpu.mma_layout<APPLE_SIMDGROUP_F32_16x16x16_F16 : apple_physical_fragment_layout = true>
+// CHECK-SAME: permutations = [array<i64: 0, 1, 2, 3, 4, 5>, array<i64: 3, 4, 5, 0, 1, 2>, array<i64: 0, 1, 2, 3, 4, 5>]
+// CHECK-SAME: tensor<2x1x1x1x4x1x1x1x2x2x4x2x2x4xf16>, tensor<3x1x1x1x4x1x1x1x2x2x4x2x2x4xf16> into tensor<3x1x1x1x2x1x1x1x2x2x4x2x2x4xf32>

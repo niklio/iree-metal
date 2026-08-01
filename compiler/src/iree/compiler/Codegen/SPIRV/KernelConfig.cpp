@@ -1245,6 +1245,11 @@ setCooperativeMatrixConfig(IREE::GPU::TargetAttr target, linalg::LinalgOp op,
 // the leading parallel dims (batch + query-M) one-per-workgroup and let the
 // reduction (scores/K2) tile via the pipeline's GPUApplyTilingLevel. Tile sizes
 // are intentionally simple; perf tuning (coop routing) is a follow-up.
+static bool enableApplePhysicalFragments() {
+  const char *value = getenv("IREE_METAL_APPLE_PHYSICAL_FRAGMENTS");
+  return value && StringRef(value) == "1";
+}
+
 static LogicalResult setAttentionOpConfig(IREE::GPU::TargetAttr target,
                                           IREE::LinalgExt::AttentionOp op) {
   LLVM_DEBUG(llvm::dbgs() << "trying to deduce config as attention...\n");
@@ -1254,7 +1259,9 @@ static LogicalResult setAttentionOpConfig(IREE::GPU::TargetAttr target,
       !getenv("IREE_METAL_DISABLE_NATIVE_ATTENTION")) {
     return setAttentionIntrinsicBasedVectorDistributionConfig(
         target, op->getParentOfType<mlir::FunctionOpInterface>(), op,
-        CodeGenPipeline::SPIRVAppleVectorDistributeAttention);
+        CodeGenPipeline::SPIRVAppleVectorDistributeAttention,
+        /*applePhysicalFragmentLayout=*/
+        enableApplePhysicalFragments());
   }
 
   // The older generic SPIR-V attention pipeline remains dormant scaffolding.
@@ -2292,11 +2299,20 @@ static LogicalResult setSPIRVOpConfig(IREE::GPU::TargetAttr target,
       !getenv("IREE_METAL_DISABLE_NATIVE_ATTENTION") &&
       rootOp->hasAttr("iree_codegen.apple_attention_backward_role")) {
     auto linalgOp = dyn_cast<linalg::LinalgOp>(rootOp);
+    auto role = rootOp->getAttrOfType<StringAttr>(
+        "iree_codegen.apple_attention_backward_role");
+    bool isKnownBackwardRole =
+        role &&
+        (role.getValue() == "qk_attrs" || role.getValue() == "dp_attrs" ||
+         role.getValue() == "dq_attrs" || role.getValue() == "dk_attrs" ||
+         role.getValue() == "dv_attrs");
     if (linalgOp &&
         succeeded(setMatmulVectorDistributionConfig(
             target, entryPointFn, linalgOp,
             CodeGenPipeline::SPIRVAppleVectorDistributeAttention,
-            /*appleSimdgroupOnly=*/true))) {
+            /*appleSimdgroupOnly=*/true,
+            /*applePhysicalFragmentLayout=*/
+            enableApplePhysicalFragments() && isKnownBackwardRole))) {
       return verifyCompactCausalAttentionConfig(linalgOp);
     }
   }

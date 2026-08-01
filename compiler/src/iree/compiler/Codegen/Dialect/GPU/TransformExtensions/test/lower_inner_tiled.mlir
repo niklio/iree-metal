@@ -924,3 +924,56 @@ module attributes { transform.with_named_sequence } {
 //          CHECK: gpu.subgroup_mma_compute
 //  CHECK-COUNT-8: gpu.shuffle
 //       CHECK: return
+
+// -----
+
+#physical_contraction_accesses = [
+ affine_map<() -> ()>,
+ affine_map<() -> ()>,
+ affine_map<() -> ()>
+]
+func.func @lower_apple16_physical_fragment_no_shuffles(
+    %lhs: vector<2x1x1x2x1x2xf16>,
+    %rhs: vector<2x1x2x2x1x1xf16>,
+    %acc: vector<2x1x2x2x1x1xf32>) -> vector<2x1x2x2x1x1xf32> {
+  %0 = iree_codegen.inner_tiled ins(%lhs, %rhs) outs(%acc) {
+    indexing_maps = #physical_contraction_accesses,
+    iterator_types = [],
+    kind = #iree_gpu.mma_layout<
+        APPLE_SIMDGROUP_F32_16x16x16_F16:
+        apple_physical_fragment_layout = true>,
+    permutations = [
+      array<i64: 0, 1, 2, 3, 4, 5>,
+      array<i64: 3, 4, 5, 0, 1, 2>,
+      array<i64: 3, 4, 5, 0, 1, 2>],
+    semantics = #iree_gpu.mma_semantics<distributed = true, opaque = true>
+  } : vector<2x1x1x2x1x2xf16>, vector<2x1x2x2x1x1xf16>
+      into vector<2x1x2x2x1x1xf32>
+  return %0 : vector<2x1x2x2x1x1xf32>
+}
+
+module attributes { transform.with_named_sequence } {
+  transform.named_sequence @__transform_main(
+      %root: !transform.any_op {transform.readonly}) {
+    %func = transform.structured.match ops{["func.func"]} in %root
+        : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %func {
+      transform.apply_patterns.iree.lower_inner_tiled
+    } : !transform.any_op
+    transform.yield
+  }
+}
+
+// CHECK-LABEL: func.func @lower_apple16_physical_fragment_no_shuffles(
+// CHECK-SAME: %[[LHS:.+]]: vector<2x1x1x2x1x2xf16>
+// CHECK-SAME: %[[RHS:.+]]: vector<2x1x2x2x1x1xf16>
+// CHECK-SAME: %[[ACC:.+]]: vector<2x1x2x2x1x1xf32>
+// CHECK-NOT: gpu.shuffle
+// CHECK: vector.extract %[[RHS]][0, 0, 1, 0, 0, 0]
+// CHECK: vector.extract %[[ACC]][0, 0, 1, 0, 0, 0]
+// CHECK-NOT: gpu.shuffle
+// CHECK-COUNT-1: gpu.subgroup_mma_compute
+// CHECK: %[[CANONICAL_RESULT:.+]] = vector.shape_cast {{.*}} : vector<8xf32> to vector<2x1x1x2x1x2xf32>
+// CHECK: %[[PERMUTED_RESULT:.+]] = vector.transpose %[[CANONICAL_RESULT]], [3, 4, 5, 0, 1, 2] : vector<2x1x1x2x1x2xf32> to vector<2x1x2x2x1x1xf32>
+// CHECK-NOT: gpu.shuffle
+// CHECK: return %[[PERMUTED_RESULT]] : vector<2x1x2x2x1x1xf32>

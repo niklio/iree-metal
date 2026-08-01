@@ -760,8 +760,7 @@ void addGPUVectorDistributePassPipeline(OpPassManager &funcPassManager,
     GPUApplyTilingLevelPassOptions options;
     options.tilingLevel = IREE::GPU::TilingLevel::Reduction;
     options.allowZeroSlices = true;
-    const char *causalBounds =
-        std::getenv("IREE_METAL_CAUSAL_BWD_BOUNDS");
+    const char *causalBounds = std::getenv("IREE_METAL_CAUSAL_BWD_BOUNDS");
     options.shortenCausalAttentionBackwardReductions =
         !forROCDL && causalBounds && StringRef(causalBounds) == "1";
     const char *causalForwardBounds =
@@ -812,6 +811,15 @@ void addGPUVectorDistributePassPipeline(OpPassManager &funcPassManager,
   funcPassManager.addPass(IREE::LinalgExt::createDecomposeAttentionPass());
   funcPassManager.addPass(createConfigTrackingCanonicalizerPass());
   funcPassManager.addPass(createCSEPass());
+
+  // Attention's qk/pv lowering configs are materialized on the contractions
+  // by DecomposeAttention, after reduction/serial tiling and the earlier
+  // dimension-expansion pass. Only this late invocation may split explicitly
+  // marked Apple physical fragments: doing so earlier would change the logical
+  // M/K ranks inspected by causal backward shortening.
+  GPUExpandDimensionsPassOptions expandOptions;
+  expandOptions.expandApplePhysicalFragments = true;
+  funcPassManager.addPass(createGPUExpandDimensionsPass(expandOptions));
 
   // Convert convolutions to matmuls by tiling filter dimensions.
   funcPassManager.addPass(createGPUTileAndConvertConvToMatmulPass());

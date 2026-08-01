@@ -286,14 +286,26 @@ def IREEGPU_MMAAttr : AttrDef<IREEGPU_Dialect, "MMA", [
     ```
       C^T += B^T x A^T
     ```
+
+    |apple_physical_fragment_layout| is an experimental, default-off contract
+    for Apple simdgroup MMA intrinsics. When set, the operands and result use
+    Apple's native per-lane fragment mapping rather than IREE's canonical
+    logical mapping. The vector-distribution pipeline must prove this contract
+    by expanding the intrinsic M/N/K dimensions before it reaches the terminal
+    lowering; the terminal may then omit the otherwise-required lane shuffles.
   }];
 
   let parameters = (ins
     EnumParameter<IREEGPU_MMAIntrinsic>:$intrinsic,
-    DefaultValuedParameter<"bool", "false">:$col_major
+    DefaultValuedParameter<"bool", "false">:$col_major,
+    DefaultValuedParameter<"bool", "false">:$apple_physical_fragment_layout
   );
 
-  let assemblyFormat = "`<` $intrinsic (`,` `col_major` `=` $col_major^)? `>`";
+  let assemblyFormat = [{
+    `<` $intrinsic (`,` `col_major` `=` $col_major^)?
+        (`:` `apple_physical_fragment_layout` `=`
+             $apple_physical_fragment_layout^)? `>`
+  }];
 
   let builders = [
     AttrBuilder<(ins "MMAIntrinsic":$intrinsic)>
@@ -303,7 +315,18 @@ def IREEGPU_MMAAttr : AttrDef<IREEGPU_Dialect, "MMA", [
     int64_t getBlockSize() const;
 
     SmallVector<VirtualMMAIntrinsic> getVirtualIntrinsics() const;
+
+    // Same operation builder as the interface method, with an additional
+    // proof bit supplied only by LowerInnerTiledPattern after it validates the
+    // expanded Apple physical-fragment contract. The interface entry point
+    // always takes the canonical, shuffled path.
+    LogicalResult buildUnderlyingOperations(
+        OpBuilder &builder, Location loc, ValueRange inputs,
+        ValueRange outputs, SmallVectorImpl<Value> &results,
+        bool applePhysicalFragmentLayoutProven) const;
   }];
+
+  let genVerifyDecl = 1;
 }
 
 //===----------------------------------------------------------------------===//

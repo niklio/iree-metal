@@ -414,6 +414,12 @@ def GPUExpandDimensionsPass :
   let dependentDialects = [
     "::mlir::iree_compiler::IREE::Util::UtilDialect"
   ];
+  let options = [
+    Option<"expandApplePhysicalFragments", "expand-apple-physical-fragments",
+           "bool", /*default=*/"false",
+           "Expand explicitly marked Apple MMA fragment dimensions. This is "
+           "only safe after reduction/serial attention tiling and decomposition">
+  ];
 }
 
 def GPUTensorTileToSerialLoopsPass :

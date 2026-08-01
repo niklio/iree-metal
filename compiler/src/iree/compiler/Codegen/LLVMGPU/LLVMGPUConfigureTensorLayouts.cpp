@@ -147,6 +147,40 @@ struct ContractionLayout {
   VectorLayoutInterface acc;
 };
 
+static bool
+usesApplePhysicalFragmentLayout(IREE::GPU::MmaInterfaceAttr intrinsic) {
+  auto mma = dyn_cast<IREE::GPU::MMAAttr>(intrinsic);
+  return mma && mma.getApplePhysicalFragmentLayout();
+}
+
+static SmallVector<int64_t>
+getApplePhysicalFragmentFactors(IREE::GPU::MmaInterfaceAttr intrinsic) {
+  auto [m, n, k] = intrinsic.getMNKShape();
+  assert(m == n && n == k && "expected square Apple MMA intrinsic");
+  if (m == 8) {
+    return {2, 4};
+  }
+  assert(m == 16 && "unexpected Apple MMA shape");
+  return {2, 2, 4};
+}
+
+static FailureOr<SmallVector<int64_t>>
+getPhysicalFragmentDims(ArrayRef<unsigned> contractionDims,
+                        ArrayRef<int64_t> bounds, ArrayRef<int64_t> factors) {
+  if (contractionDims.size() < factors.size()) {
+    return failure();
+  }
+  SmallVector<int64_t> result;
+  for (auto [dim, factor] :
+       llvm::zip_equal(contractionDims.take_back(factors.size()), factors)) {
+    if (bounds[dim] != factor) {
+      return failure();
+    }
+    result.push_back(dim);
+  }
+  return result;
+}
+
 // Get the layouts to use for the contraction given the intrinsic to use and
 // number of subgroups on the M and N dimension.
 //
@@ -178,6 +212,26 @@ getContractionLayout(Operation *candidate, ArrayRef<int64_t> bounds,
   int64_t innerNDim = opInfo.getNDims().back();
   int64_t innerKDim = opInfo.getKDims().back();
 
+  bool physicalAppleLayout = usesApplePhysicalFragmentLayout(intrinsic);
+  SmallVector<int64_t> physicalFactors;
+  SmallVector<int64_t> physicalMDims, physicalNDims, physicalKDims;
+  if (physicalAppleLayout) {
+    physicalFactors = getApplePhysicalFragmentFactors(intrinsic);
+    FailureOr<SmallVector<int64_t>> maybeMDims =
+        getPhysicalFragmentDims(opInfo.getMDims(), bounds, physicalFactors);
+    FailureOr<SmallVector<int64_t>> maybeNDims =
+        getPhysicalFragmentDims(opInfo.getNDims(), bounds, physicalFactors);
+    FailureOr<SmallVector<int64_t>> maybeKDims =
+        getPhysicalFragmentDims(opInfo.getKDims(), bounds, physicalFactors);
+    if (failed(maybeMDims) || failed(maybeNDims) || failed(maybeKDims)) {
+      return candidate->emitError(
+          "marked Apple physical fragment lacks its expanded M/N/K factors");
+    }
+    physicalMDims = std::move(*maybeMDims);
+    physicalNDims = std::move(*maybeNDims);
+    physicalKDims = std::move(*maybeKDims);
+  }
+
   SmallVector<int64_t> batchCounts(bounds);
 
   // Subgroup distribution layouts.
@@ -192,9 +246,25 @@ getContractionLayout(Operation *candidate, ArrayRef<int64_t> bounds,
   // calculate the batch dimensions without looking at the subgroup layout.
   SmallVector<int64_t> subgroupSize(rank, 1);
   auto [mSize, nSize, kSize] = intrinsic.getMNKShape();
-  subgroupSize[innerMDim] = mSize;
-  subgroupSize[innerNDim] = nSize;
-  subgroupSize[innerKDim] = kSize;
+  if (physicalAppleLayout) {
+    for (ArrayRef<int64_t> dims :
+         {ArrayRef<int64_t>(physicalMDims), ArrayRef<int64_t>(physicalNDims),
+          ArrayRef<int64_t>(physicalKDims)}) {
+      for (auto [dim, factor] : llvm::zip_equal(dims, physicalFactors)) {
+        // Schedule-level subgroup distribution belongs to the dynamic outer
+        // factor inserted ahead of these fixed fragment factors.
+        if (subgroupCounts[dim] != 1) {
+          return candidate->emitError(
+              "Apple physical fragment factor is subgroup-distributed");
+        }
+        subgroupSize[dim] = factor;
+      }
+    }
+  } else {
+    subgroupSize[innerMDim] = mSize;
+    subgroupSize[innerNDim] = nSize;
+    subgroupSize[innerKDim] = kSize;
+  }
 
   for (auto i : llvm::seq<int64_t>(rank)) {
     batchCounts[i] = llvm::divideCeil(batchCounts[i], subgroupSize[i]);
@@ -204,7 +274,8 @@ getContractionLayout(Operation *candidate, ArrayRef<int64_t> bounds,
   // iteration space, so we need to find their value subgroup iteration space
   // individually.
   auto getFragmentLayout = [&](int operandIndex, int64_t outerDim,
-                               int64_t innerDim,
+                               int64_t innerDim, ArrayRef<int64_t> rowDims,
+                               ArrayRef<int64_t> colDims,
                                AffineMap map) -> VectorLayoutInterface {
     // Note that the struct MMASingleSubgroupLayout contains the partial layout
     // for the canonical (M, K) x (K, N) -> (M, N) matmul form. We treat the
@@ -215,16 +286,41 @@ getContractionLayout(Operation *candidate, ArrayRef<int64_t> bounds,
     SmallVector<int64_t> threadCounts(rank, 1);
     SmallVector<int64_t> threadStrides(rank, 0);
 
-    MMASingleSubgroupLayout subgroupLayout =
-        IREE::GPU::getSingleSubgroupLayout(intrinsic, operandIndex);
-    outerCounts[outerDim] = subgroupLayout.outer[0];
-    outerCounts[innerDim] = subgroupLayout.outer[1];
-    threadCounts[outerDim] = subgroupLayout.thread[0];
-    threadCounts[innerDim] = subgroupLayout.thread[1];
-    threadStrides[outerDim] = subgroupLayout.tstrides[0];
-    threadStrides[innerDim] = subgroupLayout.tstrides[1];
-    elementCounts[outerDim] = subgroupLayout.element[0];
-    elementCounts[innerDim] = subgroupLayout.element[1];
+    if (physicalAppleLayout) {
+      auto setPhysicalAxis = [&](ArrayRef<int64_t> dims, bool row) {
+        size_t offset = 0;
+        if (physicalFactors.size() == 3) {
+          outerCounts[dims[0]] = 2;
+          offset = 1;
+        }
+        // Physical 8x8 mapping:
+        // row: lane factors 2@stride16, 4@stride2
+        // col: lane factors 2@stride8, 2@stride1, element factor 2.
+        threadCounts[dims[offset]] = 2;
+        threadStrides[dims[offset]] = row ? 16 : 8;
+        if (row) {
+          threadCounts[dims[offset + 1]] = 4;
+          threadStrides[dims[offset + 1]] = 2;
+        } else {
+          threadCounts[dims[offset + 1]] = 2;
+          threadStrides[dims[offset + 1]] = 1;
+          elementCounts[dims[offset + 1]] = 2;
+        }
+      };
+      setPhysicalAxis(rowDims, /*row=*/true);
+      setPhysicalAxis(colDims, /*row=*/false);
+    } else {
+      MMASingleSubgroupLayout subgroupLayout =
+          IREE::GPU::getSingleSubgroupLayout(intrinsic, operandIndex);
+      outerCounts[outerDim] = subgroupLayout.outer[0];
+      outerCounts[innerDim] = subgroupLayout.outer[1];
+      threadCounts[outerDim] = subgroupLayout.thread[0];
+      threadCounts[innerDim] = subgroupLayout.thread[1];
+      threadStrides[outerDim] = subgroupLayout.tstrides[0];
+      threadStrides[innerDim] = subgroupLayout.tstrides[1];
+      elementCounts[outerDim] = subgroupLayout.element[0];
+      elementCounts[innerDim] = subgroupLayout.element[1];
+    }
     // Get the fragment layout for the entire iteration space and then project
     // it. This is significantly easier than trying to create a layout for each
     // fragment itself.
@@ -234,12 +330,15 @@ getContractionLayout(Operation *candidate, ArrayRef<int64_t> bounds,
     return fragmentSpaceLayout.apply(map);
   };
 
-  VectorLayoutInterface lhs = getFragmentLayout(
-      IREE::GPU::kMMAOperandLhs, innerMDim, innerKDim, contractIndexingMaps[0]);
-  VectorLayoutInterface rhs = getFragmentLayout(
-      IREE::GPU::kMMAOperandRhs, innerKDim, innerNDim, contractIndexingMaps[1]);
-  VectorLayoutInterface acc = getFragmentLayout(
-      IREE::GPU::kMMAOperandAcc, innerMDim, innerNDim, contractIndexingMaps[2]);
+  VectorLayoutInterface lhs =
+      getFragmentLayout(IREE::GPU::kMMAOperandLhs, innerMDim, innerKDim,
+                        physicalMDims, physicalKDims, contractIndexingMaps[0]);
+  VectorLayoutInterface rhs =
+      getFragmentLayout(IREE::GPU::kMMAOperandRhs, innerKDim, innerNDim,
+                        physicalKDims, physicalNDims, contractIndexingMaps[1]);
+  VectorLayoutInterface acc =
+      getFragmentLayout(IREE::GPU::kMMAOperandAcc, innerMDim, innerNDim,
+                        physicalMDims, physicalNDims, contractIndexingMaps[2]);
 
   return ContractionLayout{lhs, rhs, acc};
 }

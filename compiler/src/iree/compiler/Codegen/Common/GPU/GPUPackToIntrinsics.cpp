@@ -52,6 +52,50 @@ getPackedSizes(linalg::LinalgOp linalgOp, RewriterBase &rewriter,
     return packedSizes;
   };
 
+  // A marked Apple contraction has already split each native M/N/K fragment
+  // into physical factors. Pack every factor separately so that linalg::pack
+  // moves the interleaved factor axes to the trailing inner-tile positions.
+  // Packing only the last factor with the full intrinsic size would try to
+  // apply a size-8/16 tile to an extent-4 dimension and would also lose the
+  // physical fragment ordering.
+  if (auto mmaKind = dyn_cast<IREE::GPU::MMAAttr>(kind);
+      mmaKind && mmaKind.getApplePhysicalFragmentLayout()) {
+    FailureOr<linalg::ContractionDimensions> contractionDims =
+        linalg::inferContractionDims(linalgOp);
+    if (failed(contractionDims)) {
+      return rewriter.notifyMatchFailure(linalgOp,
+                                         "failed to infer contraction dims");
+    }
+    auto [m, n, k] = mmaKind.getMNKShape();
+    if (m != n || n != k || (m != 8 && m != 16)) {
+      return linalgOp.emitOpError(
+          "invalid intrinsic for Apple physical fragment packing");
+    }
+    SmallVector<int64_t> factors =
+        m == 8 ? SmallVector<int64_t>{2, 4} : SmallVector<int64_t>{2, 2, 4};
+    SmallVector<int64_t> bounds = linalgOp.getStaticLoopRanges();
+    auto zero = rewriter.getIndexAttr(0);
+    SmallVector<OpFoldResult> packedSizes(linalgOp.getNumLoops(), zero);
+    for (ArrayRef<unsigned> dims : {ArrayRef<unsigned>(contractionDims->m),
+                                    ArrayRef<unsigned>(contractionDims->n),
+                                    ArrayRef<unsigned>(contractionDims->k)}) {
+      if (dims.size() < factors.size()) {
+        return linalgOp.emitOpError(
+            "marked Apple physical fragment lacks expanded M/N/K factors");
+      }
+      for (auto [dim, factor] :
+           llvm::zip_equal(dims.take_back(factors.size()), factors)) {
+        if (bounds[dim] != factor) {
+          return linalgOp.emitOpError(
+              "marked Apple physical fragment has an unexpected factor "
+              "extent");
+        }
+        packedSizes[dim] = rewriter.getIndexAttr(factor);
+      }
+    }
+    return packedSizes;
+  }
+
   SmallVector<int64_t> dims;
   SmallVector<SmallVector<unsigned, 2>> indices;
   if (auto smmaKind = dyn_cast<IREE::GPU::ScaledMMAAttr>(kind)) {
@@ -91,8 +135,11 @@ LogicalResult packToIntrinsic(linalg::LinalgOp linalgOp,
   assert(kind && "Packing op without mma kind");
   FailureOr<SmallVector<OpFoldResult>> packedSizes =
       getPackedSizes(linalgOp, rewriter, kind);
+  if (failed(packedSizes)) {
+    return failure();
+  }
   FailureOr<linalg::PackResult> maybeResult =
-      linalg::pack(rewriter, linalgOp, packedSizes.value());
+      linalg::pack(rewriter, linalgOp, *packedSizes);
   if (failed(maybeResult)) {
     return rewriter.notifyMatchFailure(linalgOp, "packing failed");
   }
