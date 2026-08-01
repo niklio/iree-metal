@@ -7,6 +7,7 @@
 #include "iree/compiler/Codegen/LLVMGPU/KernelConfig.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <numeric>
 #include <optional>
 
@@ -635,6 +636,37 @@ LogicalResult setMatmulVectorDistributionConfig(
     return failure();
   }
 
+  // Use two subgroups for the exact BF16 32x32x64 score tile. Moving the two
+  // M intrinsic tiles into one subgroup preserves the workgroup and reduction
+  // tiles while reducing coordination overhead. All other contractions retain
+  // the heuristic result.
+  const char *scoreWG64 = std::getenv("IREE_METAL_APPLE_PHYSICAL_SCORE_WG64");
+  auto attentionBackwardRole = op->getAttrOfType<StringAttr>(
+      "iree_codegen.apple_attention_backward_role");
+  bool isAttentionBackwardRole =
+      attentionBackwardRole &&
+      llvm::is_contained(ArrayRef<StringRef>{"qk_attrs", "dp_attrs", "dq_attrs",
+                                             "dk_attrs", "dv_attrs"},
+                         attentionBackwardRole.getValue());
+  auto scheduledMma = dyn_cast<IREE::GPU::MMAAttr>(schedule->mmaKind);
+  bool isScoreRole = attentionBackwardRole &&
+                     (attentionBackwardRole.getValue() == "qk_attrs" ||
+                      attentionBackwardRole.getValue() == "dp_attrs");
+  if (scoreWG64 && StringRef(scoreWG64) == "1" && applePhysicalFragmentLayout &&
+      appleSimdgroupOnly &&
+      pipeline == CodeGenPipeline::SPIRVAppleVectorDistributeAttention &&
+      isScoreRole && scheduledMma &&
+      scheduledMma.getIntrinsic() ==
+          IREE::GPU::MMAIntrinsic::APPLE_SIMDGROUP_F32_16x16x16_BF16 &&
+      !scheduledMma.getColMajor() && schedule->hasSingleDimensions() &&
+      schedule->mSizes[0] == 16 && schedule->nSizes[0] == 16 &&
+      schedule->kSizes[0] * schedule->kTileSizes[0] == 64 &&
+      schedule->mSubgroupCounts[0] == 2 && schedule->nSubgroupCounts[0] == 2 &&
+      schedule->mTileSizes[0] == 1 && schedule->nTileSizes[0] == 1) {
+    schedule->mSubgroupCounts[0] = 1;
+    schedule->mTileSizes[0] = 2;
+  }
+
   LDBG() << "Target Subgroup size: " << targetSubgroupSize;
   LDBG() << "Schedule: " << schedule;
 
@@ -687,8 +719,9 @@ LogicalResult setMatmulVectorDistributionConfig(
   IREE::GPU::appendPromotedOperandsList(context, attrs, promotedOperands);
   IREE::Codegen::InnerTileDescAttrInterface configuredMmaKind =
       schedule->mmaKind;
+  bool useApplePhysicalLayout = false;
   if (auto mma = dyn_cast<IREE::GPU::MMAAttr>(schedule->mmaKind)) {
-    bool useApplePhysicalLayout =
+    useApplePhysicalLayout =
         applePhysicalFragmentLayout && appleSimdgroupOnly &&
         pipeline == CodeGenPipeline::SPIRVAppleVectorDistributeAttention &&
         isAppleSimdgroupIntrinsic(mma.getIntrinsic()) && !mma.getColMajor();
@@ -715,9 +748,18 @@ LogicalResult setMatmulVectorDistributionConfig(
   SmallVector<NamedAttribute, 1> pipelineAttrs;
   // Default to no prefetching if not specified.
   int64_t prefetchStages = clPrefetchNumStages.getValue().value_or(0);
+  // Physical Apple fragments end in factorized dimensions whose innermost
+  // factor is not a logical row stride. Generic row-stride padding therefore
+  // only inflates the promoted buffers for the known backward roles.
+  const char *compactPhysicalFragments =
+      std::getenv("IREE_METAL_APPLE_PHYSICAL_BACKWARD_COMPACT_SMEM");
+  bool keepPhysicalFragmentsCompact =
+      useApplePhysicalLayout && isAttentionBackwardRole &&
+      compactPhysicalFragments && StringRef(compactPhysicalFragments) == "1";
   auto pipelineOptions = IREE::GPU::GPUPipelineOptionsAttr::get(
       context, /*prefetch_num_stages=*/prefetchStages,
-      /*no_reduce_shared_memory_bank_conflicts=*/false,
+      /*no_reduce_shared_memory_bank_conflicts=*/
+      keepPhysicalFragmentsCompact,
       /*use_igemm_convolution=*/false,
       /*reorder_workgroups_strategy=*/std::nullopt);
   pipelineAttrs.emplace_back(
