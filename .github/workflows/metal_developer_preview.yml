@@ -1,0 +1,61 @@
+name: Build iree-metal developer preview
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: PEP 440 preview version (for example 3.11.0.dev20260801)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-validate:
+    runs-on: macos-15
+    timeout-minutes: 360
+    env:
+      IREE_METAL_VERSION: ${{ inputs.version }}
+      IREE_METAL_PYTHON: python3
+      IREE_METAL_WHEELHOUSE: ${{ github.workspace }}/wheelhouse
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_MAXSIZE: 2G
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install build tools
+        run: |
+          brew install ccache
+          ccache --max-size "${CCACHE_MAXSIZE}"
+          python3 -m pip install --upgrade pip build wheel ninja cmake
+
+      - uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: ~/Library/Caches/ccache
+          key: iree-metal-ccache-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          restore-keys: |
+            iree-metal-ccache-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build wheels and provenance
+        run: ./build_tools/iree_metal/build_preview_wheels.sh
+
+      - name: Upload candidate bundle
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: iree-metal-preview-${{ inputs.version }}-macos-arm64
+          path: |
+            wheelhouse/*.whl
+            wheelhouse/SHA256SUMS
+            wheelhouse/*.manifest.txt
+            wheelhouse/THIRD_PARTY_LICENSES.txt
+          if-no-files-found: error
+          retention-days: 14

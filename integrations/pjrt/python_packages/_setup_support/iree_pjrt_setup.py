@@ -33,6 +33,8 @@ except FileNotFoundError:
 
 PACKAGE_SUFFIX = version_info.get("package-suffix") or ""
 PACKAGE_VERSION = version_info.get("package-version") or "0.1dev1"
+PYTHON_REQUIRES = version_info.get("python-requires") or ">=3.8"
+PROJECT_URL = version_info.get("project-url") or "https://github.com/iree-org/iree"
 
 # Parse some versions out of the project level requirements.txt
 # so that we get our pins setup properly.
@@ -44,9 +46,30 @@ with requirements_path.open() as requirements_txt:
     pin_versions = dict(pin_pairs)
     print(f"requirements.txt pins: {pin_versions}")
     # Convert pinned versions to >= for install_requires.
-    for pin_name in ("iree-base-compiler", "jaxlib"):
-        pin_version = pin_versions[pin_name]
-        install_requires.append(f"{pin_name}>={pin_version}")
+    compiler_package_name = version_info.get(
+        "compiler-package-name", "iree-base-compiler"
+    )
+    compiler_package_version = version_info.get("compiler-package-version")
+    if compiler_package_version:
+        install_requires.append(
+            f"{compiler_package_name}=={compiler_package_version}"
+        )
+    else:
+        install_requires.append(
+            f"{compiler_package_name}>={pin_versions['iree-base-compiler']}"
+        )
+
+    # Preview releases can declare the exact JAX/JAXLIB pair they were tested
+    # against. Keep the historical lower-bound behavior for upstream builds
+    # that do not provide these fields.
+    jax_version = version_info.get("jax-version")
+    jaxlib_version = version_info.get("jaxlib-version")
+    if jax_version:
+        install_requires.append(f"jax=={jax_version}")
+    if jaxlib_version:
+        install_requires.append(f"jaxlib=={jaxlib_version}")
+    else:
+        install_requires.append(f"jaxlib>={pin_versions['jaxlib']}")
 
 # Force platform specific wheel.
 # https://stackoverflow.com/questions/45150304

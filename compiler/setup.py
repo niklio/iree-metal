@@ -477,13 +477,22 @@ with open(
 
 custom_package_suffix = os.getenv("IREE_COMPILER_CUSTOM_PACKAGE_SUFFIX", "")
 custom_package_prefix = os.getenv("IREE_COMPILER_CUSTOM_PACKAGE_PREFIX", "")
+custom_package_description = os.getenv(
+    "IREE_COMPILER_CUSTOM_DESCRIPTION", "IREE Python Compiler API"
+)
+custom_homepage_url = os.getenv(
+    "IREE_COMPILER_CUSTOM_HOMEPAGE_URL", "https://iree.dev/"
+)
+custom_repository_url = os.getenv(
+    "IREE_COMPILER_CUSTOM_REPOSITORY_URL", "https://github.com/iree-org/iree"
+)
 
 setup(
     name=f"{custom_package_prefix}iree-base-compiler{custom_package_suffix}{PACKAGE_SUFFIX}",
     version=f"{PACKAGE_VERSION}",
     author="IREE Authors",
     author_email="iree-technical-discussion@lists.lfaidata.foundation",
-    description="IREE Python Compiler API",
+    description=custom_package_description,
     long_description=README,
     long_description_content_type="text/markdown",
     license="Apache-2.0",
@@ -497,8 +506,8 @@ setup(
         "Programming Language :: Python :: 3.13",
     ],
     project_urls={
-        "homepage": "https://iree.dev/",
-        "repository": "https://github.com/iree-org/iree",
+        "homepage": custom_homepage_url,
+        "repository": custom_repository_url,
         "documentation": "https://iree.dev/reference/bindings/python/",
     },
     ext_modules=[

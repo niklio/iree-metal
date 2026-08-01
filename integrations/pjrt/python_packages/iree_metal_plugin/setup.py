@@ -34,11 +34,10 @@ class CMakeBuildPy(iree_pjrt_setup.BaseCMakeBuildPy):
             os.path.join(THIS_DIR, "build", "cmake"),
             extra_cmake_args=(
                 "-DIREE_HAL_DRIVER_METAL=ON",
-                # The PJRT plugin requires the in-tree compiler bindings
-                # (IREELLVMIncludeSetup et al.), so IREE_BUILD_COMPILER must be ON
-                # -- runtime-only is unsupported. Limit parallel link jobs so the
-                # LLVM/MLIR link steps don't exhaust RAM on a 16GB machine.
-                "-DIREE_BUILD_COMPILER=ON",
+                # The plugin loads libIREECompiler dynamically from the compiler
+                # wheel. The lightweight interface stub in integrations/pjrt
+                # lets this wheel build without compiling LLVM/MLIR a second time.
+                "-DIREE_BUILD_COMPILER=OFF",
                 "-DLLVM_PARALLEL_LINK_JOBS=1",
             ),
         )
@@ -65,12 +64,13 @@ setup(
     description="IREE PJRT Plugin for Metal (Apple Silicon)",
     long_description=README,
     long_description_content_type="text/markdown",
-    url="https://github.com/iree-org/iree",
+    url=iree_pjrt_setup.PROJECT_URL,
     classifiers=[
         "Development Status :: 3 - Alpha",
         "License :: OSI Approved :: Apache Software License",
         "Programming Language :: Python :: 3",
     ],
+    python_requires=iree_pjrt_setup.PYTHON_REQUIRES,
     packages=[
         "jax_plugins.iree_metal",
         "iree._pjrt_libs.metal",

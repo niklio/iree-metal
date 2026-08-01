@@ -1,0 +1,64 @@
+name: iree-metal developer preview bug
+description: Report a reproducible correctness, crash, compilation, or packaging issue
+title: "[iree-metal] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing the preview. Remove credentials, private paths, model weights, and proprietary code before submitting.
+  - type: input
+    id: release
+    attributes:
+      label: Preview version and IREE revision
+      description: Copy these from the release manifest.
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware and macOS
+      placeholder: M4 Mac mini, 16 GB, macOS ...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include Python, JAX/JAXLIB, installed iree packages, and jax.devices() output.
+      render: shell
+    validations:
+      required: true
+  - type: dropdown
+    id: category
+    attributes:
+      label: Failure category
+      options:
+        - Incorrect output or gradients
+        - Crash or hang
+        - Compilation failure
+        - Installation or plugin discovery
+        - Performance regression
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: reproducer
+    attributes:
+      label: Minimal reproducer
+      description: Provide a self-contained script and exact command if possible.
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Paste a short relevant excerpt or attach a sanitized log.
+      render: text

@@ -5,6 +5,7 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 import logging
+from importlib import metadata
 from pathlib import Path
 import platform
 import sys
@@ -12,6 +13,56 @@ import sys
 import jax._src.xla_bridge as xb
 
 logger = logging.getLogger(__name__)
+
+
+def _verify_compiler_distribution() -> None:
+    """Rejects mixed stock/preview compiler installations.
+
+    The preview compiler has a distinct distribution name but necessarily
+    provides the same ``iree.compiler`` import namespace as stock IREE. Check
+    the plugin's installed requirements so upstream builds retain their normal
+    behavior while preview builds fail clearly if pip produced a hybrid env.
+    """
+    try:
+        requirements = metadata.requires("iree-pjrt-plugin-metal") or []
+    except metadata.PackageNotFoundError:
+        # Source/editable development may not have distribution metadata yet.
+        return
+
+    is_preview = any(
+        requirement.lower().replace("_", "-").startswith(
+            "iree-base-compiler-iree-metal"
+        )
+        for requirement in requirements
+    )
+    if not is_preview:
+        return
+
+    try:
+        metadata.distribution("iree-base-compiler-iree-metal")
+    except metadata.PackageNotFoundError as exc:
+        raise RuntimeError(
+            "The iree-metal preview requires its matching "
+            "iree-base-compiler-iree-metal wheel."
+        ) from exc
+
+    try:
+        metadata.distribution("iree-base-compiler")
+    except metadata.PackageNotFoundError:
+        pass
+    else:
+        raise RuntimeError(
+            "Stock iree-base-compiler and the iree-metal preview compiler are "
+            "installed together and share files. Create a clean virtual environment."
+        )
+
+    from iree.compiler import version as compiler_version
+
+    if compiler_version.PACKAGE_SUFFIX != "-iree-metal":
+        raise RuntimeError(
+            "The installed iree.compiler files do not carry the iree-metal fork "
+            "marker. Create a clean virtual environment and reinstall both preview wheels."
+        )
 
 
 def probe_iree_compiler_dylib() -> str:
@@ -58,6 +109,7 @@ def _find_native_library() -> Path:
 
 
 def initialize():
+    _verify_compiler_distribution()
     path = _find_native_library()
     if not path.exists():
         logger.warning(
