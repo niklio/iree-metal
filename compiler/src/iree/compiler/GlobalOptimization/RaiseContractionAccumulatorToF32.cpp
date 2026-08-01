@@ -343,13 +343,15 @@ struct IsolateBatchMatmulPattern : OpRewritePattern<linalg::BatchMatmulOp> {
 
 // Pads a non-mult-16 2D matmul's M/N/K up to a multiple of 16 with zeros, runs
 // the matmul on the padded operands, and extract_slices the result back to the
-// original shape. Zero padding is numerically EXACT for matmul (padded K rows are
-// 0 → contribute nothing; padded M/N rows/cols are computed then sliced off). The
-// metal-spirv coop path REQUIRES mult-16 M/N/K (mustBeAligned) and has no
-// unaligned support, so odd-sized models (e.g. vit: M=B*T=4616) otherwise fall to
-// scalar (0.31 vs jax-metal 2.51). Padding makes them aligned → they hit the
-// matrix units. The padded matmul is then f32-promoted by RaiseAccumulatorPattern
-// (dims now mult-16 and, for vit, >=128). Env-gated IREE_METAL_COOP_PAD.
+// original shape. Zero padding is algebraically equivalent for matmul (padded K
+// rows are 0 → contribute nothing; padded M/N rows/cols are computed then sliced
+// off), though changing the tile shape can change floating-point reduction
+// association. The metal-spirv coop path REQUIRES mult-16 M/N/K (mustBeAligned)
+// and has no unaligned support, so odd-sized models (e.g. vit: M=B*T=4616)
+// otherwise fall to scalar (0.31 vs jax-metal 2.51). Padding makes them aligned
+// → they hit the matrix units. The padded matmul is then f32-promoted by
+// RaiseAccumulatorPattern (dims now mult-16 and, for vit, >=128). Env-gated
+// IREE_METAL_COOP_PAD.
 struct PadMatmulToCoopPattern : OpInterfaceRewritePattern<linalg::LinalgOp> {
   using OpInterfaceRewritePattern<linalg::LinalgOp>::OpInterfaceRewritePattern;
 
@@ -370,6 +372,26 @@ struct PadMatmulToCoopPattern : OpInterfaceRewritePattern<linalg::LinalgOp> {
     if (llvm::any_of(ranges, [](int64_t d) { return d < 16; }))
       return failure();
 
+    // The ViT FFN's flattened row extent M=8*577=4616 is first padded to 4624
+    // by the general multiple-of-16 path below. Although that is legal for the
+    // cooperative matrix intrinsic, it makes Metal's schedule heuristic fall
+    // back to smaller workgroup tiles. Padding the exact BF16 FFN shape family
+    // to the next multiple of 64 (4672) selects a larger aligned schedule
+    // family for all six forward/backward contractions. Keep this deliberately
+    // exact and opt-in while it is correctness/performance gated on the
+    // complete model.
+    bool padViTFFNTo64 = false;
+    if (const char *value = getenv("IREE_METAL_FFN_PAD_M64")) {
+      SmallVector<int64_t> sortedRanges = ranges;
+      llvm::sort(sortedRanges);
+      padViTFFNTo64 =
+          StringRef(value) == "1" &&
+          sortedRanges == SmallVector<int64_t>({768, 3072, 4616}) &&
+          llvm::all_of(linalgOp.getDpsInputs(), [](Value input) {
+            return cast<ShapedType>(input.getType()).getElementType().isBF16();
+          });
+    }
+
     linalg::LinalgPaddingOptions options;
     SmallVector<Attribute> padValues;
     for (Value operand : op->getOperands()) {
@@ -378,7 +400,9 @@ struct PadMatmulToCoopPattern : OpInterfaceRewritePattern<linalg::LinalgOp> {
     }
     options.setPaddingValues(padValues);
     options.setPaddingDimensions({0, 1, 2});
-    options.setPadToMultipleOf({16, 16, 16});
+    options.setPadToMultipleOf(padViTFFNTo64
+                                   ? SmallVector<int64_t>({64, 64, 64})
+                                   : SmallVector<int64_t>({16, 16, 16}));
     // Return the unpadded result via extract_slice; don't materialize a copy back
     // into the (differently-shaped) original destination.
     options.setCopyBackOp(linalg::LinalgPaddingOptions::CopyBackOp::None);

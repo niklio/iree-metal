@@ -32,6 +32,7 @@ iree_lit_test_suite(
             "linalg_quantized_matmul_to_matmul.mlir",
             "optimize_numerics.mlir",
             "propagate_linalg_transpose.mlir",
+            "raise_contraction_accumulator_to_f32.mlir",
             "raise_special_ops.mlir",
             "remove_zero_extent_tensors.mlir",
             "split_attention_backward_for_metal.mlir",
