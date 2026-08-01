@@ -38,6 +38,7 @@
 #include <cstdlib>
 #include <initializer_list>
 #include <iterator>
+#include <utility>
 
 namespace mlir::iree_compiler::stablehlo {
 
@@ -1352,6 +1353,380 @@ static void rewritePairedAttention(PairedAttentionMatch match) {
   match.outputDot.getResult().replaceAllUsesWith(output);
 }
 
+// The canonical JAX tanh-GELU VJP retains the full forward elementwise chain
+// until the backward is available. On Metal that forces large rank-3 BF16
+// intermediates to survive across the intervening FFN contraction. Recognize
+// the complete canonical forward/VJP pair and rebuild the derivative behind an
+// optimization barrier. This deliberately trades a second small elementwise
+// chain (including tanh) for avoiding the saved forward intermediates.
+//
+// Keep this matcher intentionally exact. Apart from guarding correctness, the
+// strict spelling makes the environment variable a safe experiment: a JAX or
+// StableHLO canonicalization change simply leaves the original graph intact.
+struct PairedTanhGeluMatch {
+  Value input;
+  Value outputGrad;
+  Value inputGrad;
+  Value one;
+  Value half;
+  Value three;
+  Value cubicCoefficient;
+  Value tanhScale;
+  Operation *outputGradDef;
+};
+
+static bool isTypedFloatSplat(Value value, Type type, double expected) {
+  return value.getType() == type && isFloatSplat(value, expected);
+}
+
+template <typename OpTy, typename Predicate>
+static OpTy findUniqueBinaryUser(Value known, Predicate predicate) {
+  OpTy found;
+  for (Operation *user : known.getUsers()) {
+    auto op = dyn_cast<OpTy>(user);
+    Value other = getOtherBinaryOperand(op, known);
+    if (!other || !predicate(other)) {
+      continue;
+    }
+    if (found) {
+      return OpTy();
+    }
+    found = op;
+  }
+  return found;
+}
+
+static bool hasExactlyUsers(Value value,
+                            std::initializer_list<Operation *> expected) {
+  SmallVector<Operation *> remaining(expected);
+  for (OpOperand &use : value.getUses()) {
+    auto it = llvm::find(remaining, use.getOwner());
+    if (it == remaining.end()) {
+      return false;
+    }
+    remaining.erase(it);
+  }
+  return remaining.empty();
+}
+
+static std::optional<PairedTanhGeluMatch>
+matchPairedTanhGelu(mlir::stablehlo::TanhOp tanh) {
+  auto type = dyn_cast<RankedTensorType>(tanh.getType());
+  if (!type || type.getRank() != 3 ||
+      !isa<BFloat16Type>(type.getElementType())) {
+    return std::nullopt;
+  }
+
+  // Forward: 0.5*x*(1+tanh(0.796875*(x+0.044677734375*x^3))).
+  auto tanhArgument = tanh.getOperand().getDefiningOp<mlir::stablehlo::MulOp>();
+  if (!tanhArgument) {
+    return std::nullopt;
+  }
+  Value tanhScale;
+  Value innerValue;
+  if (isTypedFloatSplat(tanhArgument.getLhs(), type, 0.796875)) {
+    tanhScale = tanhArgument.getLhs();
+    innerValue = tanhArgument.getRhs();
+  } else if (isTypedFloatSplat(tanhArgument.getRhs(), type, 0.796875)) {
+    tanhScale = tanhArgument.getRhs();
+    innerValue = tanhArgument.getLhs();
+  } else {
+    return std::nullopt;
+  }
+
+  auto inner = innerValue.getDefiningOp<mlir::stablehlo::AddOp>();
+  if (!inner) {
+    return std::nullopt;
+  }
+  mlir::stablehlo::MulOp cubicTerm;
+  Value input;
+  Value cubicCoefficient;
+  Value inputCubed;
+  for (auto [possibleInput, possibleCubic] :
+       {std::pair<Value, Value>{inner.getLhs(), inner.getRhs()},
+        std::pair<Value, Value>{inner.getRhs(), inner.getLhs()}}) {
+    auto multiply = possibleCubic.getDefiningOp<mlir::stablehlo::MulOp>();
+    if (!multiply) {
+      continue;
+    }
+    Value coefficient;
+    Value cubed;
+    if (isTypedFloatSplat(multiply.getLhs(), type, 0.044677734375)) {
+      coefficient = multiply.getLhs();
+      cubed = multiply.getRhs();
+    } else if (isTypedFloatSplat(multiply.getRhs(), type, 0.044677734375)) {
+      coefficient = multiply.getRhs();
+      cubed = multiply.getLhs();
+    } else {
+      continue;
+    }
+    if (cubicTerm) {
+      return std::nullopt;
+    }
+    cubicTerm = multiply;
+    input = possibleInput;
+    cubicCoefficient = coefficient;
+    inputCubed = cubed;
+  }
+  if (!cubicTerm || input.getType() != type) {
+    return std::nullopt;
+  }
+  auto inputCubedOp = inputCubed.getDefiningOp<mlir::stablehlo::MulOp>();
+  Value inputSquared = getOtherBinaryOperand(inputCubedOp, input);
+  auto inputSquaredOp =
+      inputSquared ? inputSquared.getDefiningOp<mlir::stablehlo::MulOp>()
+                   : mlir::stablehlo::MulOp();
+  if (!inputCubedOp || !inputSquaredOp || inputSquaredOp.getLhs() != input ||
+      inputSquaredOp.getRhs() != input) {
+    return std::nullopt;
+  }
+
+  auto threeInputSquared = findUniqueBinaryUser<mlir::stablehlo::MulOp>(
+      inputSquared,
+      [&](Value other) { return isTypedFloatSplat(other, type, 3.0); });
+  Value three = getOtherBinaryOperand(threeInputSquared, inputSquared);
+  auto halfInput = findUniqueBinaryUser<mlir::stablehlo::MulOp>(
+      input, [&](Value other) { return isTypedFloatSplat(other, type, 0.5); });
+  Value half = getOtherBinaryOperand(halfInput, input);
+  if (!threeInputSquared || !three || !halfInput || !half) {
+    return std::nullopt;
+  }
+
+  mlir::stablehlo::SubtractOp oneMinusTanh;
+  for (Operation *user : tanh.getResult().getUsers()) {
+    auto subtract = dyn_cast<mlir::stablehlo::SubtractOp>(user);
+    if (!subtract || subtract.getRhs() != tanh.getResult() ||
+        !isTypedFloatSplat(subtract.getLhs(), type, 1.0)) {
+      continue;
+    }
+    if (oneMinusTanh) {
+      return std::nullopt;
+    }
+    oneMinusTanh = subtract;
+  }
+  auto onePlusTanh = findUniqueBinaryUser<mlir::stablehlo::AddOp>(
+      tanh.getResult(),
+      [&](Value other) { return isTypedFloatSplat(other, type, 1.0); });
+  Value one = getOtherBinaryOperand(onePlusTanh, tanh.getResult());
+  if (!oneMinusTanh || !onePlusTanh || !one || oneMinusTanh.getLhs() != one) {
+    return std::nullopt;
+  }
+  auto output = findUniqueBinaryUser<mlir::stablehlo::MulOp>(
+      onePlusTanh.getResult(),
+      [&](Value other) { return other == halfInput.getResult(); });
+  if (!output) {
+    return std::nullopt;
+  }
+
+  // Reverse: match the exact canonical VJP, including its deliberately
+  // factored (1-tanh)*(1+tanh) spelling and reuse of 3*x^2.
+  mlir::stablehlo::MulOp halfInputTimesGrad;
+  Value outputGrad;
+  auto tanhDerivativeLeft = findUniqueBinaryUser<mlir::stablehlo::MulOp>(
+      oneMinusTanh.getResult(), [&](Value other) {
+        auto multiply = other.getDefiningOp<mlir::stablehlo::MulOp>();
+        Value possibleGrad =
+            getOtherBinaryOperand(multiply, halfInput.getResult());
+        if (!multiply || !possibleGrad || possibleGrad.getType() != type) {
+          return false;
+        }
+        halfInputTimesGrad = multiply;
+        outputGrad = possibleGrad;
+        return true;
+      });
+  if (!tanhDerivativeLeft || !halfInputTimesGrad || !outputGrad) {
+    return std::nullopt;
+  }
+  auto gradTimesOnePlus = findUniqueBinaryUser<mlir::stablehlo::MulOp>(
+      onePlusTanh.getResult(),
+      [&](Value other) { return other == outputGrad; });
+  auto tanhDerivativeRight = findUniqueBinaryUser<mlir::stablehlo::MulOp>(
+      tanhDerivativeLeft.getResult(),
+      [&](Value other) { return other == tanh.getResult(); });
+  if (!gradTimesOnePlus || !tanhDerivativeRight) {
+    return std::nullopt;
+  }
+  auto tanhDerivative = findUniqueBinaryUser<mlir::stablehlo::AddOp>(
+      tanhDerivativeLeft.getResult(),
+      [&](Value other) { return other == tanhDerivativeRight.getResult(); });
+  if (!tanhDerivative) {
+    return std::nullopt;
+  }
+  auto scaledTanhDerivative = findUniqueBinaryUser<mlir::stablehlo::MulOp>(
+      tanhDerivative.getResult(),
+      [&](Value other) { return other == tanhScale; });
+  if (!scaledTanhDerivative) {
+    return std::nullopt;
+  }
+  auto scaledCubicDerivative = findUniqueBinaryUser<mlir::stablehlo::MulOp>(
+      scaledTanhDerivative.getResult(),
+      [&](Value other) { return other == cubicCoefficient; });
+  if (!scaledCubicDerivative) {
+    return std::nullopt;
+  }
+  auto cubicDerivative = findUniqueBinaryUser<mlir::stablehlo::MulOp>(
+      scaledCubicDerivative.getResult(),
+      [&](Value other) { return other == threeInputSquared.getResult(); });
+  if (!cubicDerivative) {
+    return std::nullopt;
+  }
+  auto innerDerivative = findUniqueBinaryUser<mlir::stablehlo::AddOp>(
+      scaledTanhDerivative.getResult(),
+      [&](Value other) { return other == cubicDerivative.getResult(); });
+  auto linearDerivative = findUniqueBinaryUser<mlir::stablehlo::MulOp>(
+      gradTimesOnePlus.getResult(), [&](Value other) { return other == half; });
+  if (!innerDerivative || !linearDerivative) {
+    return std::nullopt;
+  }
+  auto inputGrad = findUniqueBinaryUser<mlir::stablehlo::AddOp>(
+      innerDerivative.getResult(),
+      [&](Value other) { return other == linearDerivative.getResult(); });
+  if (!inputGrad || inputGrad.getResult().use_empty()) {
+    return std::nullopt;
+  }
+
+  // Prove that every retained forward intermediate is used only by this pair.
+  // Besides making false positives harder, this guarantees that canonical DCE
+  // can remove the old VJP uses so the forward values stop crossing the FFN
+  // contraction boundary.
+  if (!hasExactlyUsers(inputSquared, {inputCubedOp, threeInputSquared}) ||
+      !hasExactlyUsers(inputCubed, {cubicTerm}) ||
+      !hasExactlyUsers(cubicTerm.getResult(), {inner}) ||
+      !hasExactlyUsers(inner.getResult(), {tanhArgument}) ||
+      !hasExactlyUsers(tanhArgument.getResult(), {tanh}) ||
+      !hasExactlyUsers(halfInput.getResult(), {output, halfInputTimesGrad}) ||
+      !hasExactlyUsers(tanh.getResult(),
+                       {oneMinusTanh, onePlusTanh, tanhDerivativeRight}) ||
+      !hasExactlyUsers(oneMinusTanh.getResult(), {tanhDerivativeLeft}) ||
+      !hasExactlyUsers(onePlusTanh.getResult(), {output, gradTimesOnePlus}) ||
+      !hasExactlyUsers(threeInputSquared.getResult(), {cubicDerivative}) ||
+      !hasExactlyUsers(halfInputTimesGrad.getResult(), {tanhDerivativeLeft}) ||
+      !hasExactlyUsers(tanhDerivativeLeft.getResult(),
+                       {tanhDerivativeRight, tanhDerivative}) ||
+      !hasExactlyUsers(tanhDerivativeRight.getResult(), {tanhDerivative}) ||
+      !hasExactlyUsers(tanhDerivative.getResult(), {scaledTanhDerivative}) ||
+      !hasExactlyUsers(scaledTanhDerivative.getResult(),
+                       {scaledCubicDerivative, innerDerivative}) ||
+      !hasExactlyUsers(scaledCubicDerivative.getResult(), {cubicDerivative}) ||
+      !hasExactlyUsers(cubicDerivative.getResult(), {innerDerivative}) ||
+      !hasExactlyUsers(gradTimesOnePlus.getResult(), {linearDerivative}) ||
+      !hasExactlyUsers(innerDerivative.getResult(), {inputGrad}) ||
+      !hasExactlyUsers(linearDerivative.getResult(), {inputGrad}) ||
+      output.getResult().use_empty()) {
+    return std::nullopt;
+  }
+
+  Operation *outputGradDef = outputGrad.getDefiningOp();
+  Block *block = tanh->getBlock();
+  SmallVector<Operation *> matchedOps = {tanhArgument,
+                                         inner,
+                                         cubicTerm,
+                                         inputCubedOp,
+                                         inputSquaredOp,
+                                         threeInputSquared,
+                                         halfInput,
+                                         oneMinusTanh,
+                                         onePlusTanh,
+                                         output,
+                                         halfInputTimesGrad,
+                                         tanhDerivativeLeft,
+                                         gradTimesOnePlus,
+                                         tanhDerivativeRight,
+                                         tanhDerivative,
+                                         scaledTanhDerivative,
+                                         scaledCubicDerivative,
+                                         cubicDerivative,
+                                         innerDerivative,
+                                         linearDerivative,
+                                         inputGrad};
+  if (!outputGradDef || outputGradDef->getBlock() != block ||
+      llvm::any_of(
+          matchedOps,
+          [block](Operation *op) { return op->getBlock() != block; }) ||
+      !output->isBeforeInBlock(outputGradDef) ||
+      !outputGradDef->isBeforeInBlock(inputGrad)) {
+    return std::nullopt;
+  }
+
+  return PairedTanhGeluMatch{
+      input,        outputGrad, inputGrad.getResult(), one,
+      half,         three,      cubicCoefficient,      tanhScale,
+      outputGradDef};
+}
+
+static void rewritePairedTanhGelu(PairedTanhGeluMatch match) {
+  OpBuilder builder(match.outputGradDef);
+  builder.setInsertionPointAfter(match.outputGradDef);
+  Location loc = match.inputGrad.getLoc();
+  auto barrier = mlir::stablehlo::OptimizationBarrierOp::create(
+      builder, loc, ValueRange{match.input, match.outputGrad});
+  Value input = barrier->getResult(0);
+  Value outputGrad = barrier->getResult(1);
+
+  // Reproduce JAX's rematerialized computation and VJP operation order. Keep
+  // the two x*x operations distinct here; the canonicalizer may CSE them after
+  // both have been placed on the backward side of the barrier.
+  Value halfInput =
+      mlir::stablehlo::MulOp::create(builder, loc, match.half, input);
+  Value inputSquaredForCube =
+      mlir::stablehlo::MulOp::create(builder, loc, input, input);
+  Value inputCubed =
+      mlir::stablehlo::MulOp::create(builder, loc, inputSquaredForCube, input);
+  Value inputSquaredForDerivative =
+      mlir::stablehlo::MulOp::create(builder, loc, input, input);
+  Value threeInputSquared = mlir::stablehlo::MulOp::create(
+      builder, loc, match.three, inputSquaredForDerivative);
+  Value cubicTerm = mlir::stablehlo::MulOp::create(
+      builder, loc, match.cubicCoefficient, inputCubed);
+  Value inner = mlir::stablehlo::AddOp::create(builder, loc, input, cubicTerm);
+  Value tanhArgument =
+      mlir::stablehlo::MulOp::create(builder, loc, match.tanhScale, inner);
+  Value tanh = mlir::stablehlo::TanhOp::create(builder, loc, tanhArgument);
+  Value oneMinusTanh =
+      mlir::stablehlo::SubtractOp::create(builder, loc, match.one, tanh);
+  Value onePlusTanh =
+      mlir::stablehlo::AddOp::create(builder, loc, match.one, tanh);
+  Value halfInputTimesGrad =
+      mlir::stablehlo::MulOp::create(builder, loc, halfInput, outputGrad);
+  Value tanhDerivativeLeft = mlir::stablehlo::MulOp::create(
+      builder, loc, halfInputTimesGrad, oneMinusTanh);
+  Value tanhDerivativeRight =
+      mlir::stablehlo::MulOp::create(builder, loc, tanhDerivativeLeft, tanh);
+  Value tanhDerivative = mlir::stablehlo::AddOp::create(
+      builder, loc, tanhDerivativeLeft, tanhDerivativeRight);
+  Value scaledTanhDerivative = mlir::stablehlo::MulOp::create(
+      builder, loc, match.tanhScale, tanhDerivative);
+  Value scaledCubicDerivative = mlir::stablehlo::MulOp::create(
+      builder, loc, match.cubicCoefficient, scaledTanhDerivative);
+  Value cubicDerivative = mlir::stablehlo::MulOp::create(
+      builder, loc, scaledCubicDerivative, threeInputSquared);
+  Value innerDerivative = mlir::stablehlo::AddOp::create(
+      builder, loc, scaledTanhDerivative, cubicDerivative);
+  Value gradTimesOnePlus =
+      mlir::stablehlo::MulOp::create(builder, loc, outputGrad, onePlusTanh);
+  Value linearDerivative = mlir::stablehlo::MulOp::create(
+      builder, loc, match.half, gradTimesOnePlus);
+  Value inputGrad = mlir::stablehlo::AddOp::create(
+      builder, loc, innerDerivative, linearDerivative);
+  match.inputGrad.replaceAllUsesWith(inputGrad);
+}
+
+static void rematerializePairedTanhGelu(ModuleOp module) {
+  const char *value = std::getenv("IREE_METAL_GELU_REMAT");
+  if (!value || StringRef(value) != "1") {
+    return;
+  }
+  SmallVector<mlir::stablehlo::TanhOp> candidates;
+  module.walk(
+      [&](mlir::stablehlo::TanhOp tanh) { candidates.push_back(tanh); });
+  for (mlir::stablehlo::TanhOp candidate : candidates) {
+    std::optional<PairedTanhGeluMatch> match = matchPairedTanhGelu(candidate);
+    if (match) {
+      rewritePairedTanhGelu(*match);
+    }
+  }
+}
+
 static void raisePairedAttention(ModuleOp module) {
   SmallVector<mlir::stablehlo::DotGeneralOp> candidates;
   module.walk(
@@ -1612,6 +1987,8 @@ struct ConvertFlashAttentionDispatch final
   void runOnOperation() override {
     ModuleOp module = getOperation();
     MLIRContext *ctx = &getContext();
+
+    rematerializePairedTanhGelu(module);
 
     // The native paired raise and the legacy external-Metal forward raise are
     // intentionally mutually exclusive. An explicitly requested native pass
