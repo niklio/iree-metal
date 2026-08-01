@@ -11,8 +11,11 @@ func.func @attention(%q: tensor<2x10x4096x128xf16>, %k: tensor<2x10x4096x128xf16
                      -> tensor<2x10x4096x128xf16> {
   %scale = arith.constant 0.125 : f16
   %acc = tensor.empty() : tensor<2x10x4096x128xf16>
+  // This test only checks configuration transport. The StableHLO raise test
+  // separately proves the semantic provenance of the causal marker.
   %out = iree_linalg_ext.attention
-         {indexing_maps = [#map, #map1, #map2, #map3, #map4]}
+         {decomposition_config = {iree_codegen.apple_attention_causal},
+          indexing_maps = [#map, #map1, #map2, #map3, #map4]}
          ins(%q, %k, %v, %scale : tensor<2x10x4096x128xf16>, tensor<2x10x4096x128xf16>, tensor<2x10x4096x128xf16>, f16)
          outs(%acc : tensor<2x10x4096x128xf16>) {
               ^bb0(%score: f32):
@@ -30,6 +33,7 @@ func.func @attention(%q: tensor<2x10x4096x128xf16>, %k: tensor<2x10x4096x128xf16
 // CHECK-DAG: %[[MAX_FILL:.+]] = linalg.fill ins(%[[MAX_INIT]]
 // CHECK-DAG: %[[SUM_FILL:.+]] = linalg.fill ins(%[[SUM_INIT]]
 // CHECK: %[[OUT:.+]]:3 = iree_linalg_ext.online_attention
+// CHECK-SAME: decomposition_config = {iree_codegen.apple_attention_causal}
 // CHECK-SAME:         ins(%[[Q]], %[[K]], %[[V]]
 // CHECK-SAME:         outs(%[[ACC_FILL]], %[[MAX_FILL]], %[[SUM_FILL]]
 // CHECK-NEXT:             ^[[BLOCK:.+]](%[[SCORE:.+]]: f32):

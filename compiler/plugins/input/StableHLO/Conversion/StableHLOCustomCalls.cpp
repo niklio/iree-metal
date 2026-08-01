@@ -1244,17 +1244,26 @@ static void rewritePairedAttention(PairedAttentionMatch match) {
     forwardMaps.push_back(maskMap);
   }
   forwardMaps.append({outputMap, logsumexpMap});
-  DictionaryAttr decompositionConfig =
+  DictionaryAttr baseDecompositionConfig =
       forwardBuilder.getDictionaryAttr({forwardBuilder.getNamedAttr(
           IREE::LinalgExt::AttentionOp::getUseExp2AttrStr(),
           forwardBuilder.getBoolAttr(false))});
-  DictionaryAttr backwardDecompositionConfig = decompositionConfig;
+  DictionaryAttr forwardDecompositionConfig = baseDecompositionConfig;
+  DictionaryAttr backwardDecompositionConfig = baseDecompositionConfig;
   if (match.mask) {
     // `match.mask` is present only after the exact lower-triangular StableHLO
     // matcher above has proved row_iota >= column_iota. Do not use the local
     // `mask`: padded unmasked encoder attention creates a key-validity mask
     // later and is not causal.
-    NamedAttrList backwardConfig(decompositionConfig);
+    NamedAttrList forwardConfig(baseDecompositionConfig);
+    forwardConfig.set("iree_codegen.apple_attention_causal",
+                      forwardBuilder.getUnitAttr());
+    forwardDecompositionConfig =
+        forwardConfig.getDictionary(forwardBuilder.getContext());
+
+    // Keep the forward-only marker out of the backward aggregate. Each
+    // backward contraction has its own independently consumed causal marker.
+    NamedAttrList backwardConfig(baseDecompositionConfig);
     for (StringRef role :
          {IREE::LinalgExt::AttentionBackwardOp::getDQAttrStr(),
           IREE::LinalgExt::AttentionBackwardOp::getDKAttrStr(),
@@ -1272,7 +1281,8 @@ static void rewritePairedAttention(PairedAttentionMatch match) {
   auto attention = IREE::LinalgExt::AttentionOp::create(
       forwardBuilder, loc, forwardResultTypes, query, key, value, scale, mask,
       outputInit, logsumexpInit,
-      forwardBuilder.getAffineMapArrayAttr(forwardMaps), decompositionConfig);
+      forwardBuilder.getAffineMapArrayAttr(forwardMaps),
+      forwardDecompositionConfig);
   {
     OpBuilder::InsertionGuard guard(forwardBuilder);
     Block *body = forwardBuilder.createBlock(&attention.getRegion());

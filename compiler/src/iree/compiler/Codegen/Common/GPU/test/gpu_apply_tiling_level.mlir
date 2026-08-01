@@ -7,6 +7,7 @@
 // RUN: iree-opt --split-input-file --mlir-print-local-scope --pass-pipeline="builtin.module(func.func(iree-codegen-gpu-apply-tiling-level{tiling-level=serial}, canonicalize, cse))" %s | FileCheck %s --check-prefix=SERIAL
 // RUN: iree-opt --split-input-file --mlir-print-local-scope --pass-pipeline="builtin.module(func.func(iree-codegen-gpu-apply-tiling-level))" %s | FileCheck %s --check-prefix=CAUSAL-OFF
 // RUN: iree-opt --split-input-file --mlir-print-local-scope --pass-pipeline="builtin.module(func.func(iree-codegen-gpu-apply-tiling-level{shorten-causal-attention-backward-reductions=true}))" %s | FileCheck %s --check-prefixes=CAUSAL-DQ,CAUSAL-DK,CAUSAL-DV,CAUSAL-CONTROL
+// RUN: iree-opt --split-input-file --mlir-print-local-scope --pass-pipeline="builtin.module(func.func(iree-codegen-gpu-apply-tiling-level{shorten-causal-attention-forward-reductions=true}))" %s | FileCheck %s --check-prefixes=CAUSAL-FWD,CAUSAL-FWD-CONTROL
 
 #config = #iree_gpu.lowering_config<{thread = [2, 16], subgroup = [2, 16]}>
 #map = affine_map<(d0, d1) -> (d0, d1)>
@@ -1011,3 +1012,123 @@ func.func @unmarked_dq_control(
 // CAUSAL-CONTROL-LABEL: func.func @unmarked_dq_control
 // CAUSAL-CONTROL-DAG:   %[[CONTROL_C512:.+]] = arith.constant 512 : index
 // CAUSAL-CONTROL:       scf.for %{{.*}} = %{{.*}} to %[[CONTROL_C512]] step %{{.*}}
+
+// -----
+
+#forward_q = affine_map<(b, m, k1, k2, n) -> (b, m, k1)>
+#forward_k = affine_map<(b, m, k1, k2, n) -> (b, k2, k1)>
+#forward_v = affine_map<(b, m, k1, k2, n) -> (b, k2, n)>
+#forward_scale = affine_map<(b, m, k1, k2, n) -> ()>
+#forward_mask = affine_map<(b, m, k1, k2, n) -> (m, k2)>
+#forward_out = affine_map<(b, m, k1, k2, n) -> (b, m, n)>
+#forward_row = affine_map<(b, m, k1, k2, n) -> (b, m)>
+#forward_reduction = #iree_gpu.lowering_config<{
+  reduction = [0, 0, 0, 128, 0]
+}>
+
+func.func @causal_forward_bounds(
+    %query: tensor<1x512x64xbf16>, %key: tensor<1x512x64xbf16>,
+    %value: tensor<1x512x64xbf16>, %mask: tensor<512x512xi1>,
+    %m0: index) -> tensor<1x64x64xf32> {
+  %query_owner = tensor.extract_slice %query[0, %m0, 0] [1, 64, 64]
+      [1, 1, 1] : tensor<1x512x64xbf16> to tensor<1x64x64xbf16>
+  %mask_owner = tensor.extract_slice %mask[%m0, 0] [64, 512] [1, 1]
+      : tensor<512x512xi1> to tensor<64x512xi1>
+  %output_empty = tensor.empty() : tensor<1x64x64xf32>
+  %row_empty = tensor.empty() : tensor<1x64xf32>
+  %zero = arith.constant 0.0 : f32
+  %lowest = arith.constant -3.40282347E+38 : f32
+  %scale = arith.constant 0.125 : bf16
+  %output_init = linalg.fill ins(%zero : f32)
+      outs(%output_empty : tensor<1x64x64xf32>) -> tensor<1x64x64xf32>
+  %max_init = linalg.fill ins(%lowest : f32)
+      outs(%row_empty : tensor<1x64xf32>) -> tensor<1x64xf32>
+  %sum_init = linalg.fill ins(%zero : f32)
+      outs(%row_empty : tensor<1x64xf32>) -> tensor<1x64xf32>
+  %result:3 = iree_linalg_ext.online_attention {
+      decomposition_config = {
+        iree_codegen.apple_attention_causal, use_exp2 = false
+      },
+      indexing_maps = [#forward_q, #forward_k, #forward_v, #forward_scale,
+                       #forward_mask, #forward_out, #forward_row, #forward_row],
+      lowering_config = #forward_reduction
+    } ins(%query_owner, %key, %value, %scale, %mask_owner
+      : tensor<1x64x64xbf16>, tensor<1x512x64xbf16>,
+        tensor<1x512x64xbf16>, bf16, tensor<64x512xi1>)
+      outs(%output_init, %max_init, %sum_init
+        : tensor<1x64x64xf32>, tensor<1x64xf32>, tensor<1x64xf32>) {
+    ^bb0(%score: f32):
+      iree_linalg_ext.yield %score : f32
+    } -> tensor<1x64x64xf32>, tensor<1x64xf32>, tensor<1x64xf32>
+  return %result#0 : tensor<1x64x64xf32>
+}
+
+// CAUSAL-OFF-LABEL: func.func @causal_forward_bounds
+// CAUSAL-OFF-DAG:   %[[FWD_OFF_C512:.+]] = arith.constant 512 : index
+// CAUSAL-OFF:       scf.for %{{.*}} = %{{.*}} to %[[FWD_OFF_C512]] step %{{.*}}
+// CAUSAL-FWD-LABEL: func.func @causal_forward_bounds
+// CAUSAL-FWD-SAME:  %[[M0:[A-Za-z0-9_]+]]: index
+// CAUSAL-FWD-DAG:   %[[C0:.+]] = arith.constant 0 : index
+// CAUSAL-FWD-DAG:   %[[C64:.+]] = arith.constant 64 : index
+// CAUSAL-FWD-DAG:   %[[C128:.+]] = arith.constant 128 : index
+// CAUSAL-FWD-DAG:   %[[C512:.+]] = arith.constant 512 : index
+// CAUSAL-FWD:       %[[OWNER_END:.+]] = arith.addi %[[M0]], %[[C64]] : index
+// CAUSAL-FWD:       %[[TILES:.+]] = arith.ceildivui %[[OWNER_END]], %[[C128]] : index
+// CAUSAL-FWD:       %[[ROUNDED_RELATIVE:.+]] = arith.muli %[[TILES]], %[[C128]] : index
+// CAUSAL-FWD:       %[[UB:.+]] = arith.minui %[[ROUNDED_RELATIVE]], %[[C512]] : index
+// CAUSAL-FWD:       scf.for %{{.*}} = %[[C0]] to %[[UB]] step %[[C128]]
+// CAUSAL-FWD:       iree_linalg_ext.online_attention
+// CAUSAL-FWD-SAME:  decomposition_config = {iree_codegen.apple_attention_causal, use_exp2 = false}
+
+// -----
+
+#control_q = affine_map<(b, m, k1, k2, n) -> (b, m, k1)>
+#control_k = affine_map<(b, m, k1, k2, n) -> (b, k2, k1)>
+#control_v = affine_map<(b, m, k1, k2, n) -> (b, k2, n)>
+#control_scale = affine_map<(b, m, k1, k2, n) -> ()>
+#control_mask = affine_map<(b, m, k1, k2, n) -> (m, k2)>
+#control_out = affine_map<(b, m, k1, k2, n) -> (b, m, n)>
+#control_row = affine_map<(b, m, k1, k2, n) -> (b, m)>
+#control_reduction = #iree_gpu.lowering_config<{
+  reduction = [0, 0, 0, 128, 0]
+}>
+
+func.func @unmarked_forward_control(
+    %query: tensor<1x512x64xbf16>, %key: tensor<1x512x64xbf16>,
+    %value: tensor<1x512x64xbf16>, %mask: tensor<512x512xi1>,
+    %m0: index) -> tensor<1x64x64xf32> {
+  %query_owner = tensor.extract_slice %query[0, %m0, 0] [1, 64, 64]
+      [1, 1, 1] : tensor<1x512x64xbf16> to tensor<1x64x64xbf16>
+  %mask_owner = tensor.extract_slice %mask[%m0, 0] [64, 512] [1, 1]
+      : tensor<512x512xi1> to tensor<64x512xi1>
+  %output_empty = tensor.empty() : tensor<1x64x64xf32>
+  %row_empty = tensor.empty() : tensor<1x64xf32>
+  %zero = arith.constant 0.0 : f32
+  %lowest = arith.constant -3.40282347E+38 : f32
+  %scale = arith.constant 0.125 : bf16
+  %output_init = linalg.fill ins(%zero : f32)
+      outs(%output_empty : tensor<1x64x64xf32>) -> tensor<1x64x64xf32>
+  %max_init = linalg.fill ins(%lowest : f32)
+      outs(%row_empty : tensor<1x64xf32>) -> tensor<1x64xf32>
+  %sum_init = linalg.fill ins(%zero : f32)
+      outs(%row_empty : tensor<1x64xf32>) -> tensor<1x64xf32>
+  %result:3 = iree_linalg_ext.online_attention {
+      decomposition_config = {use_exp2 = false},
+      indexing_maps = [#control_q, #control_k, #control_v, #control_scale,
+                       #control_mask, #control_out, #control_row, #control_row],
+      lowering_config = #control_reduction
+    } ins(%query_owner, %key, %value, %scale, %mask_owner
+      : tensor<1x64x64xbf16>, tensor<1x512x64xbf16>,
+        tensor<1x512x64xbf16>, bf16, tensor<64x512xi1>)
+      outs(%output_init, %max_init, %sum_init
+        : tensor<1x64x64xf32>, tensor<1x64xf32>, tensor<1x64xf32>) {
+    ^bb0(%score: f32):
+      iree_linalg_ext.yield %score : f32
+    } -> tensor<1x64x64xf32>, tensor<1x64xf32>, tensor<1x64xf32>
+  return %result#0 : tensor<1x64x64xf32>
+}
+
+// CAUSAL-FWD-CONTROL-LABEL: func.func @unmarked_forward_control
+// CAUSAL-FWD-CONTROL-DAG:   %[[CONTROL_C512:.+]] = arith.constant 512 : index
+// CAUSAL-FWD-CONTROL-NOT:   arith.ceildivui
+// CAUSAL-FWD-CONTROL:       scf.for %{{.*}} = %{{.*}} to %[[CONTROL_C512]] step %{{.*}}

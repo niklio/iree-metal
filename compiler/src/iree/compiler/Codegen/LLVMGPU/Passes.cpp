@@ -764,6 +764,11 @@ void addGPUVectorDistributePassPipeline(OpPassManager &funcPassManager,
         std::getenv("IREE_METAL_CAUSAL_BWD_BOUNDS");
     options.shortenCausalAttentionBackwardReductions =
         !forROCDL && causalBounds && StringRef(causalBounds) == "1";
+    const char *causalForwardBounds =
+        std::getenv("IREE_METAL_CAUSAL_FWD_BOUNDS");
+    options.shortenCausalAttentionForwardReductions =
+        !forROCDL && causalForwardBounds &&
+        StringRef(causalForwardBounds) == "1";
     funcPassManager.addPass(createGPUApplyTilingLevelPass(options));
     funcPassManager.addPass(affine::createLoopCoalescingPass());
     funcPassManager.addPass(createConfigTrackingCanonicalizerPass());

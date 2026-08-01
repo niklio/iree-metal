@@ -29,11 +29,10 @@
 // RAISED-NOT: stablehlo.exponential
 // RAISED-NOT: stablehlo.dot_general
 // RAISED: %[[ATTN:.+]]:2 = iree_linalg_ext.attention
-// RAISED-SAME: decomposition_config = {use_exp2 = false}
+// RAISED-SAME: decomposition_config = {iree_codegen.apple_attention_causal, use_exp2 = false}
 // RAISED: ins(%[[Q]], %[[K]], %[[V]], %[[SCALE]], %[[MASK]]
 // RAISED: %[[BWD:.+]]:3 = iree_linalg_ext.attention_backward
-// RAISED-SAME: decomposition_config = {
-// RAISED-SAME: dk_attrs = {iree_codegen.apple_attention_backward_causal}
+// RAISED-SAME: decomposition_config = {dk_attrs = {iree_codegen.apple_attention_backward_causal}
 // RAISED-SAME: dq_attrs = {iree_codegen.apple_attention_backward_causal}
 // RAISED-SAME: dv_attrs = {iree_codegen.apple_attention_backward_causal}
 // RAISED-SAME: use_exp2 = false}
@@ -171,6 +170,7 @@
 // PADDED-DAG: %[[PAD_V:.+]] = tensor.pad %arg2
 // PADDED-SAME: high[0, 0, 8, 0]
 // PADDED: %[[ATTN:.+]]:2 = iree_linalg_ext.attention
+// PADDED-SAME: decomposition_config = {use_exp2 = false}
 // PADDED-SAME: indexing_maps = [{{.*}}#[[KEY_MASK_MAP]], {{.*}}]
 // PADDED-SAME: ins(%[[PAD_Q]], %[[PAD_K]], %[[PAD_V]],
 // PADDED-SAME: %[[KEY_MASK]]

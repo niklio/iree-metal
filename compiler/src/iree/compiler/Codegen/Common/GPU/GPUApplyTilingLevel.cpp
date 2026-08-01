@@ -12,6 +12,8 @@
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUEnums.h"
 #include "iree/compiler/Codegen/Dialect/GPU/Transforms/Transforms.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
+#include "iree/compiler/Dialect/LinalgExt/Utils/IndexingUtils.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLForwardCompat.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -50,6 +52,8 @@ static constexpr StringLiteral kAppleAttentionBackwardRole =
     "iree_codegen.apple_attention_backward_role";
 static constexpr StringLiteral kAppleAttentionBackwardCausal =
     "iree_codegen.apple_attention_backward_causal";
+static constexpr StringLiteral kAppleAttentionCausal =
+    "iree_codegen.apple_attention_causal";
 
 // Returns the workgroup/reduction-tiled slice of the score tensor consumed by
 // a native attention-backward contraction. Apple operand promotion inserts a
@@ -202,6 +206,199 @@ static LogicalResult applyCausalAttentionBackwardReductionShortening(
   return success();
 }
 
+// Collect the extract_slice ownership chain for an attention operand. The
+// Apple attention pipeline may place a linalg.copy around an owner slice when
+// promoting the operand; only that transparent spelling is peeled here.
+static SmallVector<tensor::ExtractSliceOp>
+getAttentionOperandSlices(Value operand) {
+  SmallVector<tensor::ExtractSliceOp> slices;
+  while (Operation *definingOp = operand.getDefiningOp()) {
+    if (auto copy = dyn_cast<linalg::CopyOp>(definingOp)) {
+      operand = copy.getDpsInputOperand(0)->get();
+      continue;
+    }
+    auto slice = dyn_cast<tensor::ExtractSliceOp>(definingOp);
+    if (!slice) {
+      break;
+    }
+    slices.push_back(slice);
+    operand = slice.getSource();
+  }
+  return slices;
+}
+
+// With finite inputs, the exact lower-triangular mask proved by the native
+// attention raise makes keys at k > m contribute zero. Keep the existing
+// owner/query grid and full-size K2 reduction tiles, but shorten each owner's
+// loop to:
+//
+//   keys [old_lb, min(old_ub,
+//       old_lb + ceil((query_end - old_lb) / R) * R))
+//
+// Clamping query_end to old_lb before subtracting avoids an unsigned underflow.
+// Outward alignment preserves the diagonal/boundary tile and all static tile
+// shapes. This is intentionally opt-in: skipping masked arithmetic can differ
+// from multiplying a zero weight by NaN/Inf, so the benchmark enables it only
+// under its finite-input semantic contract.
+static LogicalResult applyCausalAttentionForwardReductionShortening(
+    FunctionOpInterface funcOp, IRRewriter &rewriter) {
+  DominanceInfo dominance(funcOp);
+  SmallVector<IREE::LinalgExt::OnlineAttentionOp> causalAttentionOps;
+  funcOp->walk([&](IREE::LinalgExt::OnlineAttentionOp op) {
+    DictionaryAttr config = op.getDecompositionConfigAttr();
+    if (config && config.getAs<UnitAttr>(kAppleAttentionCausal)) {
+      causalAttentionOps.push_back(op);
+    }
+  });
+
+  llvm::SmallDenseSet<Operation *> shortenedLoops;
+  for (IREE::LinalgExt::OnlineAttentionOp op : causalAttentionOps) {
+    auto opInfo = IREE::LinalgExt::AttentionOpDetail::get(
+        op.getQueryMap(), op.getKeyMap(), op.getValueMap(), op.getOutputMap());
+    if (failed(opInfo) || opInfo->getMDims().size() != 1 ||
+        opInfo->getK2Dims().size() != 1) {
+      return op.emitOpError(
+          "causal forward shortening requires exactly one M and one K2 "
+          "dimension");
+    }
+
+    scf::ForOp reductionLoop = op->getParentOfType<scf::ForOp>();
+    if (!reductionLoop) {
+      return op.emitOpError("failed to find the tiled causal K2 reduction");
+    }
+    if (!shortenedLoops.insert(reductionLoop.getOperation()).second) {
+      return op.emitOpError(
+          "expected exactly one marked online attention per K2 loop");
+    }
+
+    MLIRContext *context = op.getContext();
+    std::optional<unsigned> querySequenceDim =
+        op.getQueryMap().getResultPosition(
+            getAffineDimExpr(opInfo->getMDims().front(), context));
+    std::optional<unsigned> keySequenceDim = op.getKeyMap().getResultPosition(
+        getAffineDimExpr(opInfo->getK2Dims().front(), context));
+    if (!querySequenceDim || !keySequenceDim) {
+      return op.emitOpError(
+          "failed to map the causal M and K2 dimensions to Q and K");
+    }
+
+    SmallVector<tensor::ExtractSliceOp> querySlices =
+        getAttentionOperandSlices(op.getQuery());
+    SmallVector<tensor::ExtractSliceOp> keySlices =
+        getAttentionOperandSlices(op.getKey());
+    if (querySlices.empty() || keySlices.empty()) {
+      return op.emitOpError(
+          "causal Q and K operands must retain extract_slice ownership");
+    }
+
+    // Reduction tiling may add an identity Q slice inside the pre-existing
+    // workgroup owner slice. The outermost slice carries the owner's M offset.
+    tensor::ExtractSliceOp queryOwnerSlice = querySlices.back();
+    SmallVector<OpFoldResult> queryOffsets = queryOwnerSlice.getMixedOffsets();
+    SmallVector<OpFoldResult> querySizes = queryOwnerSlice.getMixedSizes();
+    SmallVector<OpFoldResult> queryStrides = queryOwnerSlice.getMixedStrides();
+    if (queryOffsets.size() != querySizes.size() ||
+        queryOffsets.size() != queryStrides.size() ||
+        op.getQueryMap().getNumResults() != queryOffsets.size() ||
+        *querySequenceDim >= queryOffsets.size() ||
+        getConstantIntValue(queryStrides[*querySequenceDim]) != 1) {
+      return op.emitOpError(
+          "expected a non-rank-reduced unit-stride causal Q owner slice");
+    }
+
+    // Find the K slice introduced by this reduction loop. This also proves
+    // that the selected scf.for owns K2 rather than another reduction.
+    tensor::ExtractSliceOp keyReductionSlice;
+    for (tensor::ExtractSliceOp slice : keySlices) {
+      SmallVector<OpFoldResult> offsets = slice.getMixedOffsets();
+      if (*keySequenceDim >= offsets.size()) {
+        continue;
+      }
+      auto offset = dyn_cast<Value>(offsets[*keySequenceDim]);
+      if (offset && offset == reductionLoop.getInductionVar()) {
+        keyReductionSlice = slice;
+        break;
+      }
+    }
+    if (!keyReductionSlice) {
+      return op.emitOpError(
+          "causal K slice is not driven by the K2 reduction loop");
+    }
+    SmallVector<OpFoldResult> keyOffsets = keyReductionSlice.getMixedOffsets();
+    SmallVector<OpFoldResult> keySizes = keyReductionSlice.getMixedSizes();
+    SmallVector<OpFoldResult> keyStrides = keyReductionSlice.getMixedStrides();
+    if (keyOffsets.size() != keySizes.size() ||
+        keyOffsets.size() != keyStrides.size() ||
+        op.getKeyMap().getNumResults() != keyOffsets.size() ||
+        *keySequenceDim >= keyOffsets.size() ||
+        getConstantIntValue(keyStrides[*keySequenceDim]) != 1) {
+      return op.emitOpError(
+          "expected a non-rank-reduced unit-stride causal K2 slice");
+    }
+
+    auto querySourceType =
+        dyn_cast<RankedTensorType>(queryOwnerSlice.getSource().getType());
+    auto keySourceType =
+        dyn_cast<RankedTensorType>(keyReductionSlice.getSource().getType());
+    if (!querySourceType || !keySourceType ||
+        *querySequenceDim >= static_cast<unsigned>(querySourceType.getRank()) ||
+        *keySequenceDim >= static_cast<unsigned>(keySourceType.getRank())) {
+      return op.emitOpError("expected ranked causal Q and K owner tensors");
+    }
+    int64_t querySequence = querySourceType.getDimSize(*querySequenceDim);
+    int64_t keySequence = keySourceType.getDimSize(*keySequenceDim);
+    if (ShapedType::isDynamic(querySequence) || querySequence <= 0 ||
+        querySequence != keySequence) {
+      return op.emitOpError(
+          "causal Q and K owner slices must share a positive static sequence");
+    }
+
+    std::optional<int64_t> reductionTile =
+        getConstantIntValue(reductionLoop.getStep());
+    if (!reductionTile || *reductionTile <= 0) {
+      return op.emitOpError(
+          "causal K2 reduction requires a positive static tile size");
+    }
+    auto dominatesReductionLoop = [&](OpFoldResult value) {
+      auto dynamicValue = dyn_cast<Value>(value);
+      return !dynamicValue ||
+             dominance.dominates(dynamicValue, reductionLoop.getOperation());
+    };
+    OpFoldResult queryOffset = queryOffsets[*querySequenceDim];
+    OpFoldResult querySize = querySizes[*querySequenceDim];
+    if (!dominatesReductionLoop(queryOffset) ||
+        !dominatesReductionLoop(querySize)) {
+      return op.emitOpError(
+          "causal Q owner offset and size must dominate the K2 loop");
+    }
+
+    rewriter.setInsertionPoint(reductionLoop);
+    Location loc = reductionLoop.getLoc();
+    Value oldLowerBound = reductionLoop.getLowerBound();
+    Value oldUpperBound = reductionLoop.getUpperBound();
+    Value tile = reductionLoop.getStep();
+    Value ownerOffset =
+        getValueOrCreateConstantIndexOp(rewriter, loc, queryOffset);
+    Value ownerSize = getValueOrCreateConstantIndexOp(rewriter, loc, querySize);
+    Value ownerEnd =
+        arith::AddIOp::create(rewriter, loc, ownerOffset, ownerSize);
+    Value clampedEnd =
+        arith::MaxUIOp::create(rewriter, loc, ownerEnd, oldLowerBound);
+    Value relativeEnd =
+        arith::SubIOp::create(rewriter, loc, clampedEnd, oldLowerBound);
+    Value reductionTiles =
+        arith::CeilDivUIOp::create(rewriter, loc, relativeEnd, tile);
+    Value roundedRelativeEnd =
+        arith::MulIOp::create(rewriter, loc, reductionTiles, tile);
+    Value roundedEnd =
+        arith::AddIOp::create(rewriter, loc, oldLowerBound, roundedRelativeEnd);
+    Value newUpperBound =
+        arith::MinUIOp::create(rewriter, loc, roundedEnd, oldUpperBound);
+    reductionLoop.setUpperBound(newUpperBound);
+  }
+  return success();
+}
+
 static llvm::SmallDenseSet<TilingInterface>
 getTiledOps(Operation *funcOp, IREE::GPU::TilingLevel tilingLevel) {
   llvm::SmallDenseSet<TilingInterface> targets;
@@ -247,6 +444,12 @@ void GPUApplyTilingLevelPass::runOnOperation() {
       shortenCausalAttentionBackwardReductions &&
       failed(applyCausalAttentionBackwardReductionShortening(funcOp,
                                                              rewriter))) {
+    return signalPassFailure();
+  }
+  if (tilingLevel == IREE::GPU::TilingLevel::Reduction &&
+      shortenCausalAttentionForwardReductions &&
+      failed(applyCausalAttentionForwardReductionShortening(funcOp,
+                                                            rewriter))) {
     return signalPassFailure();
   }
 

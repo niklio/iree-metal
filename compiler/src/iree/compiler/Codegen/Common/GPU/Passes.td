@@ -383,7 +383,11 @@ def GPUApplyTilingLevelPass :
     Option<"shortenCausalAttentionBackwardReductions",
            "shorten-causal-attention-backward-reductions", "bool",
            /*default=*/"false",
-           "Shorten marked finite causal attention-backward reductions">
+           "Shorten marked finite causal attention-backward reductions">,
+    Option<"shortenCausalAttentionForwardReductions",
+           "shorten-causal-attention-forward-reductions", "bool",
+           /*default=*/"false",
+           "Shorten marked finite causal attention-forward reductions">
   ];
 }
 
