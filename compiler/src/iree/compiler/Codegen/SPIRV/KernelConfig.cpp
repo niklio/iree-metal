@@ -2182,6 +2182,87 @@ static bool dispatchHasTransposeOutput(mlir::FunctionOpInterface funcOp) {
   return hasTranspose;
 }
 
+static LogicalResult
+verifyCompactCausalAttentionConfig(linalg::LinalgOp op) {
+  Attribute alignmentContract = op->getAttr(
+      "iree_codegen.apple_attention_backward_causal_score_alignment");
+  if (!alignmentContract) {
+    return success();
+  }
+  auto alignment = dyn_cast<IntegerAttr>(alignmentContract);
+  if (!alignment) {
+    return op.emitOpError(
+        "compact causal score alignment must be an integer");
+  }
+  if (alignment.getInt() <= 0) {
+    return op.emitOpError(
+        "compact causal score alignment must be positive");
+  }
+  auto role = op->getAttrOfType<StringAttr>(
+      "iree_codegen.apple_attention_backward_role");
+  if (!role) {
+    return op.emitOpError(
+        "compact causal score alignment requires an attention-backward role");
+  }
+  if (role.getValue() == "qk_attrs" || role.getValue() == "dp_attrs") {
+    if (!op->hasAttr(
+            "iree_codegen.apple_attention_backward_causal_score")) {
+      return op.emitOpError(
+          "compact causal score producer requires its causal score marker");
+    }
+    return success();
+  }
+  if (role.getValue() != "dq_attrs" && role.getValue() != "dk_attrs" &&
+      role.getValue() != "dv_attrs") {
+    return op.emitOpError("unknown compact causal attention-backward role");
+  }
+  if (!op->hasAttr("iree_codegen.apple_attention_backward_causal")) {
+    return op.emitOpError(
+        "compact causal score consumer requires its causal marker");
+  }
+
+  FailureOr<linalg::ContractionDimensions> contractionDims =
+      linalg::inferContractionDims(op);
+  if (failed(contractionDims) || contractionDims->m.size() != 1) {
+    return op.emitOpError(
+        "compact causal consumer requires one M contraction dimension");
+  }
+  auto loweringConfig = getLoweringConfig(op);
+  if (!loweringConfig) {
+    return op.emitOpError(
+        "compact causal consumer requires a lowering configuration");
+  }
+  SmallVector<int64_t> workgroupTileSizes =
+      loweringConfig.getWorkgroupTileSizes();
+  SmallVector<int64_t> loopRanges = op.getStaticLoopRanges();
+  unsigned outputSequenceDim = contractionDims->m.front();
+  if (outputSequenceDim >= workgroupTileSizes.size() ||
+      outputSequenceDim >= loopRanges.size()) {
+    return op.emitOpError(
+        "compact causal consumer has an incomplete workgroup tile");
+  }
+  int64_t outputExtent = loopRanges[outputSequenceDim];
+  if (ShapedType::isDynamic(outputExtent) || outputExtent <= 0 ||
+      outputExtent % alignment.getInt() != 0) {
+    return op.emitOpError(
+        "compact causal consumer sequence extent must be a positive static "
+        "multiple of the score alignment");
+  }
+  int64_t outputTile = workgroupTileSizes[outputSequenceDim];
+  if (outputTile == 0) {
+    outputTile = outputExtent;
+  }
+  if (outputTile <= 0 || alignment.getInt() % outputTile != 0) {
+    return op.emitOpError(
+        "compact causal consumer workgroup tile must divide the score "
+        "alignment");
+  }
+  op->setAttr(
+      "iree_codegen.apple_attention_backward_causal_score_workgroup_aligned",
+      UnitAttr::get(op.getContext()));
+  return success();
+}
+
 static LogicalResult setSPIRVOpConfig(IREE::GPU::TargetAttr target,
                                       mlir::FunctionOpInterface entryPointFn,
                                       Operation *rootOp) {
@@ -2194,8 +2275,12 @@ static LogicalResult setSPIRVOpConfig(IREE::GPU::TargetAttr target,
             target, entryPointFn, linalgOp,
             CodeGenPipeline::SPIRVAppleVectorDistributeAttention,
             /*appleSimdgroupOnly=*/true))) {
-      return success();
+      return verifyCompactCausalAttentionConfig(linalgOp);
     }
+  }
+  if (rootOp->hasAttr(
+          "iree_codegen.apple_attention_backward_causal_score_alignment")) {
+    return failure();
   }
 
   // First try to find a proper CodeGen configuration to tile and vectorize for
@@ -2365,6 +2450,13 @@ static LogicalResult setConfigForKernel(IREE::GPU::TargetAttr target,
 
   if (succeeded(setSPIRVOpConfig(target, funcOp, rootOp))) {
     return success();
+  }
+
+  if (rootOp->hasAttr(
+          "iree_codegen.apple_attention_backward_causal_score_alignment")) {
+    return rootOp->emitOpError(
+        "compact causal score grid requires the native Apple attention "
+        "pipeline");
   }
 
   if (succeeded(setDefaultOpConfig(target, rootOp))) {

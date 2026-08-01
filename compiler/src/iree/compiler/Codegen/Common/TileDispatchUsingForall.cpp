@@ -12,6 +12,7 @@
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtDialect.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/MathExtras.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
@@ -24,6 +25,8 @@
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Support/WalkResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+
+#include <cstdlib>
 
 #define DEBUG_TYPE "tile-and-distribute-to-workgroups-using-forall-op"
 
@@ -166,6 +169,275 @@ static SmallVector<Attribute> getMapping(MLIRContext *context,
   return llvm::to_vector(llvm::reverse(mapping));
 }
 
+static constexpr StringLiteral kAppleAttentionBackwardRole =
+    "iree_codegen.apple_attention_backward_role";
+static constexpr StringLiteral kAppleAttentionBackwardCausalScore =
+    "iree_codegen.apple_attention_backward_causal_score";
+static constexpr StringLiteral kAppleAttentionBackwardCausalScoreAlignment =
+    "iree_codegen.apple_attention_backward_causal_score_alignment";
+
+static bool useCausalAttentionTriangularGrid(Operation *op) {
+  const char *value = std::getenv("IREE_METAL_CAUSAL_TRIANGULAR_GRID");
+  if (!value || StringRef(value) != "1" ||
+      !op->hasAttr(kAppleAttentionBackwardCausalScore)) {
+    return false;
+  }
+  auto role = op->getAttrOfType<StringAttr>(kAppleAttentionBackwardRole);
+  return role &&
+         (role.getValue() == "qk_attrs" || role.getValue() == "dp_attrs");
+}
+
+// Creates a genuinely compact launch grid for a static lower-triangular score
+// contraction. The original square row/column workgroup dimensions are
+// replaced by one X-mapped triangular ordinal. A unit Y-mapped dimension keeps
+// the workgroup mapping well-formed, while all pre-existing batch dimensions
+// retain their Z delinearization.
+//
+// The score grid is compacted in square macrotiles whose size matches the
+// outward-aligned reduction tiles consumed by dQ/dK/dV. Every producer tile in
+// a diagonal macrotile is retained, including its fine-grained upper triangle:
+// those values are read by the consumers even though they are mathematically
+// masked. For a macro-grid ordinal `u`, the mapping is:
+//
+//   macro_row = max r where r * (r + 1) / 2 <= u
+//   macro_col = u - macro_row * (macro_row + 1) / 2
+//   row = macro_row * rows_per_macro + intra_macro_row
+//   col = macro_col * cols_per_macro + intra_macro_col
+//
+// Static select thresholds avoid a floating-point inverse-triangle operation
+// in the shader and make the bijection straightforward to inspect.
+static FailureOr<scf::SCFTilingOptions::CustomLoopHeaderInfo>
+generateCausalAttentionTriangularGridHeader(
+    RewriterBase &rewriter, Location loc, ArrayRef<Range> loopRanges,
+    ArrayRef<OpFoldResult> givenTileSizes, ValueRange outerDestinationTensors,
+    unsigned rowDim, unsigned colDim, Operation *rootOp) {
+  if (loopRanges.size() != givenTileSizes.size() ||
+      rowDim >= loopRanges.size() || colDim >= loopRanges.size() ||
+      rowDim == colDim) {
+    return rootOp->emitOpError(
+        "invalid loop domain for causal triangular workgroup grid");
+  }
+
+  auto requireStaticUnitRange =
+      [&](unsigned dim) -> FailureOr<std::tuple<int64_t, int64_t>> {
+    std::optional<int64_t> offset = getConstantIntValue(loopRanges[dim].offset);
+    std::optional<int64_t> size = getConstantIntValue(loopRanges[dim].size);
+    std::optional<int64_t> stride = getConstantIntValue(loopRanges[dim].stride);
+    std::optional<int64_t> tile = getConstantIntValue(givenTileSizes[dim]);
+    if (!offset || *offset != 0 || !size || *size <= 0 || !stride ||
+        *stride != 1 || !tile || *tile <= 0 || *size % *tile != 0) {
+      return rootOp->emitOpError(
+          "causal triangular workgroup grid requires a static, zero-based, "
+          "unit-stride, exactly tiled domain");
+    }
+    return std::tuple<int64_t, int64_t>{*size, *tile};
+  };
+
+  FailureOr<std::tuple<int64_t, int64_t>> rowShape =
+      requireStaticUnitRange(rowDim);
+  FailureOr<std::tuple<int64_t, int64_t>> colShape =
+      requireStaticUnitRange(colDim);
+  if (failed(rowShape) || failed(colShape)) {
+    return failure();
+  }
+  auto [rowSize, rowTile] = *rowShape;
+  auto [colSize, colTile] = *colShape;
+  auto scoreAlignmentAttr = rootOp->getAttrOfType<IntegerAttr>(
+      kAppleAttentionBackwardCausalScoreAlignment);
+  if (!scoreAlignmentAttr || scoreAlignmentAttr.getInt() <= 0) {
+    return rootOp->emitOpError(
+        "causal triangular workgroup grid requires a positive score "
+        "alignment contract");
+  }
+  int64_t scoreAlignment = scoreAlignmentAttr.getInt();
+  if (rowSize != colSize || rowSize % scoreAlignment != 0 ||
+      scoreAlignment % rowTile != 0 || scoreAlignment % colTile != 0) {
+    return rootOp->emitOpError(
+        "causal triangular workgroup grid requires a square score domain "
+        "exactly tiled by the contracted score alignment");
+  }
+  int64_t rowsPerMacro = scoreAlignment / rowTile;
+  int64_t colsPerMacro = scoreAlignment / colTile;
+  int64_t coarseTileCount = colSize / scoreAlignment;
+  int64_t tilesPerMacro;
+  int64_t coarseTileCountPlusOne;
+  int64_t triangularCount;
+  if (llvm::MulOverflow(rowsPerMacro, colsPerMacro, tilesPerMacro) ||
+      llvm::AddOverflow(coarseTileCount, int64_t{1},
+                        coarseTileCountPlusOne) ||
+      llvm::MulOverflow(tilesPerMacro, coarseTileCount, triangularCount) ||
+      llvm::MulOverflow(triangularCount, coarseTileCountPlusOne,
+                        triangularCount)) {
+    return rootOp->emitOpError(
+        "causal triangular workgroup grid count overflows i64");
+  }
+  triangularCount /= 2;
+
+  SmallVector<unsigned> preservedDims;
+  for (unsigned dim = 0; dim < loopRanges.size(); ++dim) {
+    if (dim == rowDim || dim == colDim || isZeroInteger(givenTileSizes[dim])) {
+      continue;
+    }
+    if (failed(requireStaticUnitRange(dim))) {
+      return failure();
+    }
+    preservedDims.push_back(dim);
+  }
+
+  SmallVector<OpFoldResult> lowerBounds;
+  SmallVector<OpFoldResult> upperBounds;
+  SmallVector<OpFoldResult> steps;
+  SmallVector<Attribute> mapping;
+  lowerBounds.reserve(preservedDims.size() + 2);
+  upperBounds.reserve(preservedDims.size() + 2);
+  steps.reserve(preservedDims.size() + 2);
+  mapping.reserve(preservedDims.size() + 2);
+
+  for (auto [index, dim] : llvm::enumerate(preservedDims)) {
+    lowerBounds.push_back(loopRanges[dim].offset);
+    upperBounds.push_back(loopRanges[dim].size);
+    steps.push_back(givenTileSizes[dim]);
+    int64_t delinearizedDim = preservedDims.size() - index - 1;
+    mapping.push_back(IREE::Codegen::WorkgroupMappingAttr::get(
+        rewriter.getContext(), IREE::Codegen::WorkgroupId::IdZ,
+        delinearizedDim));
+  }
+  OpFoldResult zero = rewriter.getIndexAttr(0);
+  OpFoldResult one = rewriter.getIndexAttr(1);
+  lowerBounds.append({zero, zero});
+  upperBounds.append({one, rewriter.getIndexAttr(triangularCount)});
+  steps.append({one, one});
+  mapping.push_back(IREE::Codegen::WorkgroupMappingAttr::get(
+      rewriter.getContext(), IREE::Codegen::WorkgroupId::IdY));
+  mapping.push_back(IREE::Codegen::WorkgroupMappingAttr::get(
+      rewriter.getContext(), IREE::Codegen::WorkgroupId::IdX));
+  if (failed(IREE::Codegen::WorkgroupMappingAttr::verifyAttrList(
+          rewriter.getContext(), loc, mapping))) {
+    return failure();
+  }
+
+  auto forallOp = scf::ForallOp::create(rewriter, loc, lowerBounds, upperBounds,
+                                        steps, outerDestinationTensors,
+                                        rewriter.getArrayAttr(mapping));
+  rewriter.setInsertionPoint(forallOp.getTerminator());
+  SmallVector<Value> inductionVars = forallOp.getInductionVars();
+  Value ordinal = inductionVars.back();
+
+  Value coarseOrdinal = ordinal;
+  Value intraMacroOrdinal = arith::ConstantIndexOp::create(rewriter, loc, 0);
+  if (tilesPerMacro != 1) {
+    Value ratio =
+        arith::ConstantIndexOp::create(rewriter, loc, tilesPerMacro);
+    coarseOrdinal =
+        arith::DivUIOp::create(rewriter, loc, ordinal, ratio).getResult();
+    intraMacroOrdinal =
+        arith::RemUIOp::create(rewriter, loc, ordinal, ratio).getResult();
+  }
+  Value coarseRow = arith::ConstantIndexOp::create(rewriter, loc, 0);
+  Value coarseRowBase = coarseRow;
+  for (int64_t candidateRow = 1; candidateRow < coarseTileCount;
+       ++candidateRow) {
+    int64_t candidateBase = candidateRow * (candidateRow + 1) / 2;
+    Value base = arith::ConstantIndexOp::create(rewriter, loc, candidateBase);
+    Value isAtOrPastRow = arith::CmpIOp::create(
+        rewriter, loc, arith::CmpIPredicate::uge, coarseOrdinal, base);
+    Value candidate =
+        arith::ConstantIndexOp::create(rewriter, loc, candidateRow);
+    coarseRow = arith::SelectOp::create(rewriter, loc, isAtOrPastRow, candidate,
+                                        coarseRow);
+    coarseRowBase = arith::SelectOp::create(rewriter, loc, isAtOrPastRow, base,
+                                            coarseRowBase);
+  }
+  Value coarseCol =
+      arith::SubIOp::create(rewriter, loc, coarseOrdinal, coarseRowBase);
+
+  Value intraMacroRow = intraMacroOrdinal;
+  Value intraMacroCol = arith::ConstantIndexOp::create(rewriter, loc, 0);
+  if (colsPerMacro != 1) {
+    Value columnCount =
+        arith::ConstantIndexOp::create(rewriter, loc, colsPerMacro);
+    intraMacroRow =
+        arith::DivUIOp::create(rewriter, loc, intraMacroOrdinal, columnCount);
+    intraMacroCol =
+        arith::RemUIOp::create(rewriter, loc, intraMacroOrdinal, columnCount);
+  }
+  auto addIntraMacroIndex = [&](Value coarseIndex, int64_t tilesPerDimension,
+                                Value intraIndex) {
+    if (tilesPerDimension == 1) {
+      return coarseIndex;
+    }
+    Value scale = arith::ConstantIndexOp::create(rewriter, loc,
+                                                 tilesPerDimension);
+    Value coarseStart =
+        arith::MulIOp::create(rewriter, loc, coarseIndex, scale);
+    return arith::AddIOp::create(rewriter, loc, coarseStart, intraIndex)
+        .getResult();
+  };
+  Value row = addIntraMacroIndex(coarseRow, rowsPerMacro, intraMacroRow);
+  Value col = addIntraMacroIndex(coarseCol, colsPerMacro, intraMacroCol);
+
+  SmallVector<Value> preservedInductionVars(loopRanges.size());
+  for (auto [index, dim] : llvm::enumerate(preservedDims)) {
+    preservedInductionVars[dim] = inductionVars[index];
+  }
+  SmallVector<OpFoldResult> offsets(loopRanges.size());
+  SmallVector<OpFoldResult> sizes(loopRanges.size());
+  for (unsigned dim = 0; dim < loopRanges.size(); ++dim) {
+    if (isZeroInteger(givenTileSizes[dim])) {
+      offsets[dim] = loopRanges[dim].offset;
+      sizes[dim] = loopRanges[dim].size;
+      continue;
+    }
+    Value tile =
+        getValueOrCreateConstantIndexOp(rewriter, loc, givenTileSizes[dim]);
+    if (dim == rowDim || dim == colDim) {
+      Value tileIndex = dim == rowDim ? row : col;
+      offsets[dim] =
+          arith::MulIOp::create(rewriter, loc, tileIndex, tile).getResult();
+    } else {
+      offsets[dim] = preservedInductionVars[dim];
+    }
+    sizes[dim] = givenTileSizes[dim];
+  }
+
+  SmallVector<Value> regionOutArgs;
+  for (auto argument : forallOp.getRegionOutArgs()) {
+    regionOutArgs.push_back(argument);
+  }
+  return scf::SCFTilingOptions::CustomLoopHeaderInfo{
+      {cast<LoopLikeOpInterface>(forallOp.getOperation())},
+      offsets,
+      sizes,
+      regionOutArgs};
+}
+
+static LogicalResult generateCausalAttentionTriangularGridTerminator(
+    RewriterBase &rewriter, Location loc, ArrayRef<LoopLikeOpInterface> loops,
+    ValueRange tiledResults, ArrayRef<SmallVector<OpFoldResult>> resultOffsets,
+    ArrayRef<SmallVector<OpFoldResult>> resultSizes,
+    ValueRange destinationTensors) {
+  if (loops.size() != 1) {
+    return emitError(loc) << "expected one causal triangular workgroup loop";
+  }
+  LoopLikeOpInterface loop = loops.front();
+  scf::ForallOp *forallOp = dyn_cast<scf::ForallOp>(&loop);
+  if (!forallOp) {
+    return emitError(loc)
+           << "expected an scf.forall causal triangular workgroup loop";
+  }
+  rewriter.setInsertionPointToEnd(forallOp->getTerminator().getBody());
+  for (auto [tiledValue, destinationTensor, resultOffset, resultSize] :
+       llvm::zip_equal(tiledResults, destinationTensors, resultOffsets,
+                       resultSizes)) {
+    SmallVector<OpFoldResult> resultStrides(resultOffset.size(),
+                                            rewriter.getIndexAttr(1));
+    tensor::ParallelInsertSliceOp::create(rewriter, loc, tiledValue,
+                                          destinationTensor, resultOffset,
+                                          resultSize, resultStrides);
+  }
+  return success();
+}
+
 /// Checks whether we have static dimension for all the loop bounds and steps.
 /// This is a requirement if the reordering strategy is set to `transpose`.
 static bool areAllStaticLoopBounds(scf::ForallOp forallOp) {
@@ -267,6 +539,52 @@ void TileAndDistributeToWorkgroupsUsingForallOpPass::runOnOperation() {
           context, funcOp.getLoc(), deviceMappingAttribute))) {
     return signalPassFailure();
   }
+  std::optional<std::pair<unsigned, unsigned>> causalScoreDims;
+  if (useCausalAttentionTriangularGrid(tilingInfo->tilableOp)) {
+    if (llvm::any_of(llvm::enumerate(tilingInfo->interchange),
+                     [](auto indexedDim) {
+                       return indexedDim.index() != indexedDim.value();
+                     })) {
+      tilingInfo->tilableOp->emitOpError(
+          "causal triangular workgroup grid requires identity interchange");
+      return signalPassFailure();
+    }
+    IREE::Codegen::TranslationInfoAttr translationInfo =
+        getTranslationInfo(funcOp);
+    if (!translationInfo ||
+        translationInfo.getDispatchLoweringPassPipeline() !=
+            IREE::Codegen::DispatchLoweringPassPipeline::
+                SPIRVAppleVectorDistributeAttention) {
+      tilingInfo->tilableOp->emitOpError(
+          "causal triangular workgroup grid requires the native Apple "
+          "attention pipeline");
+      return signalPassFailure();
+    }
+    const char *causalBoundsValue = std::getenv("IREE_METAL_CAUSAL_BWD_BOUNDS");
+    if (!causalBoundsValue || StringRef(causalBoundsValue) != "1") {
+      tilingInfo->tilableOp->emitOpError(
+          "causal triangular workgroup grid requires "
+          "IREE_METAL_CAUSAL_BWD_BOUNDS=1");
+      return signalPassFailure();
+    }
+    auto contraction = dyn_cast<linalg::LinalgOp>(tilingInfo->tilableOp);
+    if (!contraction) {
+      tilingInfo->tilableOp->emitOpError(
+          "causal triangular workgroup grid requires a linalg contraction");
+      return signalPassFailure();
+    }
+    FailureOr<linalg::ContractionDimensions> contractionDims =
+        linalg::inferContractionDims(contraction);
+    if (failed(contractionDims) || contractionDims->m.size() != 1 ||
+        contractionDims->n.size() != 1) {
+      tilingInfo->tilableOp->emitOpError(
+          "causal triangular workgroup grid requires one M and one N "
+          "contraction dimension");
+      return signalPassFailure();
+    }
+    causalScoreDims = std::pair<unsigned, unsigned>{contractionDims->m.front(),
+                                                    contractionDims->n.front()};
+  }
   scf::SCFTilingOptions tilingOptions;
   tilingOptions.setTileSizes(tilingInfo->tileSizes);
   tilingOptions.setInterchange(tilingInfo->interchange);
@@ -274,7 +592,25 @@ void TileAndDistributeToWorkgroupsUsingForallOpPass::runOnOperation() {
 
   IREE::Codegen::WorkgroupReorderingAttrInterface workgroupReorderingStrategy =
       getLoweringConfig(tilingInfo->tilableOp).getWorkgroupReorderingStrategy();
-  if (workgroupReorderingStrategy) {
+  if (causalScoreDims) {
+    unsigned rowDim = causalScoreDims->first;
+    unsigned colDim = causalScoreDims->second;
+    Operation *rootOp = tilingInfo->tilableOp;
+    scf::SCFTilingOptions::GenerateLoopHeaderFn loopHeaderFn =
+        [rowDim, colDim, rootOp](RewriterBase &rewriter, Location loc,
+                                 ArrayRef<Range> loopRanges,
+                                 ArrayRef<OpFoldResult> givenTileSizes,
+                                 ValueRange outerDestinationTensors)
+        -> FailureOr<scf::SCFTilingOptions::CustomLoopHeaderInfo> {
+      return generateCausalAttentionTriangularGridHeader(
+          rewriter, loc, loopRanges, givenTileSizes, outerDestinationTensors,
+          rowDim, colDim, rootOp);
+    };
+    scf::SCFTilingOptions::GenerateLoopTerminatorFn terminatorFn =
+        generateCausalAttentionTriangularGridTerminator;
+    tilingOptions.setLoopType(scf::SCFTilingOptions::LoopType::CustomOp);
+    tilingOptions.setCustomLoopGenerationFns(loopHeaderFn, terminatorFn);
+  } else if (workgroupReorderingStrategy) {
     scf::SCFTilingOptions::GenerateLoopHeaderFn loopHeaderFn =
         [&workgroupReorderingStrategy](RewriterBase &rewriter, Location loc,
                                        ArrayRef<Range> loopRanges,
@@ -401,7 +737,7 @@ void TileAndDistributeToWorkgroupsUsingForallOpPass::runOnOperation() {
     // #iree.codegen.workgroup_id_x and #iree.codegen.workgroup_id_y.
     // Only reorders if the loop bounds are static.
     auto forallOp = cast<scf::ForallOp>(tilingLoops[0]);
-    if (transposeWorkgroup) {
+    if (transposeWorkgroup && !causalScoreDims) {
       SmallVector<Attribute> mappingAttrs(forallOp.getMappingAttr().getValue());
       int64_t mappingSize = mappingAttrs.size();
       if (areAllStaticLoopBounds(forallOp) && mappingSize >= 2) {

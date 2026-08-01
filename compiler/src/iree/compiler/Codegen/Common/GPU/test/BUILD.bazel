@@ -27,6 +27,8 @@ iree_lit_test_suite(
             "gpu_apply_padding_online_attention.mlir",
             "gpu_apply_padding_partial_reduction.mlir",
             "gpu_apply_tiling_level.mlir",
+            "gpu_apply_tiling_level_causal_compact_contract.mlir",
+            "gpu_apply_tiling_level_causal_compact_contract_invalid.mlir",
             "gpu_bubble_resource_casts.mlir",
             "gpu_check_resource_usage.mlir",
             "gpu_combine_layout_transformation.mlir",

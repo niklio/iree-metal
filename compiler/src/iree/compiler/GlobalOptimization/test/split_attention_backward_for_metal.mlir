@@ -48,11 +48,11 @@ func.func @metal_only(
 // CHECK-LABEL: func.func @metal_eligible
 // CHECK:         iree_linalg_ext.attention_backward {
 // CHECK-SAME:      decomposition_config = {
-// CHECK-SAME:      dk_attrs = {iree_codegen.apple_attention_backward_causal, iree_codegen.apple_attention_backward_role = "dk_attrs"}
-// CHECK-SAME:      dp_attrs = {iree_codegen.apple_attention_backward_role = "dp_attrs"}
-// CHECK-SAME:      dq_attrs = {iree_codegen.apple_attention_backward_causal, iree_codegen.apple_attention_backward_role = "dq_attrs"}
-// CHECK-SAME:      dv_attrs = {iree_codegen.apple_attention_backward_causal, iree_codegen.apple_attention_backward_role = "dv_attrs"}
-// CHECK-SAME:      qk_attrs = {existing = 7 : i64, iree_codegen.apple_attention_backward_role = "qk_attrs"}
+// CHECK-SAME:      dk_attrs = {iree_codegen.apple_attention_backward_causal, iree_codegen.apple_attention_backward_causal_score_alignment = 128 : i64, iree_codegen.apple_attention_backward_role = "dk_attrs"}
+// CHECK-SAME:      dp_attrs = {iree_codegen.apple_attention_backward_causal_score, iree_codegen.apple_attention_backward_causal_score_alignment = 128 : i64, iree_codegen.apple_attention_backward_role = "dp_attrs"}
+// CHECK-SAME:      dq_attrs = {iree_codegen.apple_attention_backward_causal, iree_codegen.apple_attention_backward_causal_score_alignment = 128 : i64, iree_codegen.apple_attention_backward_role = "dq_attrs"}
+// CHECK-SAME:      dv_attrs = {iree_codegen.apple_attention_backward_causal, iree_codegen.apple_attention_backward_causal_score_alignment = 128 : i64, iree_codegen.apple_attention_backward_role = "dv_attrs"}
+// CHECK-SAME:      qk_attrs = {existing = 7 : i64, iree_codegen.apple_attention_backward_causal_score, iree_codegen.apple_attention_backward_causal_score_alignment = 128 : i64, iree_codegen.apple_attention_backward_role = "qk_attrs"}
 // CHECK-SAME:      use_exp2 = false
 func.func @metal_eligible(
     %query: tensor<1x2x8x8xbf16>, %key: tensor<1x2x8x8xbf16>,
@@ -67,10 +67,22 @@ func.func @metal_eligible(
   %value_grad = tensor.empty() : tensor<1x2x8x8xbf16>
   %result:3 = iree_linalg_ext.attention_backward {
       decomposition_config = {
-        dk_attrs = {iree_codegen.apple_attention_backward_causal},
-        dq_attrs = {iree_codegen.apple_attention_backward_causal},
-        dv_attrs = {iree_codegen.apple_attention_backward_causal},
-        qk_attrs = {existing = 7 : i64},
+        dk_attrs = {
+          iree_codegen.apple_attention_backward_causal,
+          iree_codegen.apple_attention_backward_causal_score_alignment = 128 : i64},
+        dp_attrs = {
+          iree_codegen.apple_attention_backward_causal_score,
+          iree_codegen.apple_attention_backward_causal_score_alignment = 128 : i64},
+        dq_attrs = {
+          iree_codegen.apple_attention_backward_causal,
+          iree_codegen.apple_attention_backward_causal_score_alignment = 128 : i64},
+        dv_attrs = {
+          iree_codegen.apple_attention_backward_causal,
+          iree_codegen.apple_attention_backward_causal_score_alignment = 128 : i64},
+        qk_attrs = {
+          existing = 7 : i64,
+          iree_codegen.apple_attention_backward_causal_score,
+          iree_codegen.apple_attention_backward_causal_score_alignment = 128 : i64},
         use_exp2 = false},
       indexing_maps = [
         #q, #k, #v, #o, #o, #lse, #scalar, #q, #k, #v]}

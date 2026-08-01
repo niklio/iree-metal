@@ -8,10 +8,15 @@
 // RUN: env IREE_METAL_DISABLE_NATIVE_ATTENTION=1 iree-opt --split-input-file --pass-pipeline="builtin.module(inline,func.func(canonicalize,iree-stablehlo-canonicalize,cse),iree-stablehlo-convert-flash-attention-dispatch)" %s | FileCheck %s --check-prefix=OPTION-OFF
 // RUN: env IREE_METAL_COOP_RAISE_FLASH=1 iree-opt --split-input-file --pass-pipeline="builtin.module(inline,func.func(canonicalize,iree-stablehlo-canonicalize,cse),iree-stablehlo-convert-flash-attention-dispatch{suppress-legacy-attention-raise=true})" %s | FileCheck %s --check-prefix=OPTION-OFF
 // RUN: env IREE_METAL_DISABLE_NATIVE_ATTENTION=1 iree-opt --split-input-file --pass-pipeline="builtin.module(inline,func.func(canonicalize,iree-stablehlo-canonicalize,cse),iree-stablehlo-convert-flash-attention-dispatch{raise-native-attention=true},func.func(canonicalize,iree-stablehlo-canonicalize,cse))" %s | FileCheck %s --check-prefixes=RAISED,NEGATIVE
+// RUN: env -u IREE_METAL_DISABLE_NATIVE_ATTENTION -u IREE_METAL_CAUSAL_TRIANGULAR_POISON IREE_METAL_CAUSAL_TRIANGULAR_GRID=1 iree-opt --split-input-file --pass-pipeline="builtin.module(inline,func.func(canonicalize,iree-stablehlo-canonicalize,cse),iree-stablehlo-convert-flash-attention-dispatch{raise-native-attention=true},func.func(canonicalize,iree-stablehlo-canonicalize,cse))" %s | FileCheck %s --check-prefix=TRIANGULAR
+// RUN: env IREE_METAL_DISABLE_NATIVE_ATTENTION=1 IREE_METAL_CAUSAL_TRIANGULAR_GRID=1 iree-opt --split-input-file --pass-pipeline="builtin.module(inline,func.func(canonicalize,iree-stablehlo-canonicalize,cse),iree-stablehlo-convert-flash-attention-dispatch{raise-native-attention=true},func.func(canonicalize,iree-stablehlo-canonicalize,cse))" %s | FileCheck %s --check-prefix=TRIANGULAR-ROLLBACK
+// RUN: env -u IREE_METAL_DISABLE_NATIVE_ATTENTION IREE_METAL_CAUSAL_TRIANGULAR_GRID=1 IREE_METAL_CAUSAL_TRIANGULAR_POISON=16 iree-opt --split-input-file --pass-pipeline="builtin.module(inline,func.func(canonicalize,iree-stablehlo-canonicalize,cse),iree-stablehlo-convert-flash-attention-dispatch{raise-native-attention=true},func.func(canonicalize,iree-stablehlo-canonicalize,cse))" %s | FileCheck %s --check-prefix=POISON-POSITIVE
+// RUN: env -u IREE_METAL_DISABLE_NATIVE_ATTENTION IREE_METAL_CAUSAL_TRIANGULAR_GRID=1 IREE_METAL_CAUSAL_TRIANGULAR_POISON=-32 iree-opt --split-input-file --pass-pipeline="builtin.module(inline,func.func(canonicalize,iree-stablehlo-canonicalize,cse),iree-stablehlo-convert-flash-attention-dispatch{raise-native-attention=true},func.func(canonicalize,iree-stablehlo-canonicalize,cse))" %s | FileCheck %s --check-prefix=POISON-NEGATIVE
 // RUN: env -u IREE_METAL_DISABLE_NATIVE_ATTENTION iree-opt --split-input-file --iree-stablehlo-input-transformation-pipeline %s | FileCheck %s --check-prefix=PIPELINE-OFF
 // RUN: env IREE_METAL_DISABLE_NATIVE_ATTENTION=1 iree-opt --split-input-file --iree-stablehlo-input-transformation-pipeline="enable-native-attention=true" %s | FileCheck %s --check-prefix=PIPELINE-OFF
 // RUN: env -u IREE_METAL_DISABLE_NATIVE_ATTENTION iree-opt --split-input-file --iree-stablehlo-input-transformation-pipeline="enable-native-attention=true" %s | FileCheck %s --check-prefixes=PIPELINE,PIPELINE-NEGATIVE
 // RUN: env -u IREE_METAL_DISABLE_NATIVE_ATTENTION IREE_METAL_ATTN_PAD_SEQUENCE=16 iree-opt --split-input-file --iree-stablehlo-input-transformation-pipeline="enable-native-attention=true" %s | FileCheck %s --check-prefix=PADDED
+// RUN: env -u IREE_METAL_DISABLE_NATIVE_ATTENTION IREE_METAL_ATTN_PAD_SEQUENCE=16 IREE_METAL_CAUSAL_TRIANGULAR_GRID=1 iree-opt --split-input-file --iree-stablehlo-input-transformation-pipeline="enable-native-attention=true" %s | FileCheck %s --check-prefix=TRIANGULAR-PADDED
 
 // This is a compact JAX 0.6.1 lowering of the bf16 causal attention used by
 // iree-fork-bench/bench.py, including its value_and_grad graph. B, H, T, and D
@@ -38,6 +43,33 @@
 // RAISED-SAME: use_exp2 = false}
 // RAISED: ins(%[[Q]], %[[K]], %[[V]], %[[ATTN]]#0, {{%[^,]+}}, %[[ATTN]]#1, %[[SCALE]], %[[MASK]]
 // RAISED: return {{.*}}%[[BWD]]#0, %[[BWD]]#1, %[[BWD]]#2
+
+// TRIANGULAR-LABEL: func.func public @main(
+// TRIANGULAR: iree_linalg_ext.attention_backward
+// TRIANGULAR-SAME: decomposition_config = {dk_attrs = {iree_codegen.apple_attention_backward_causal,
+// TRIANGULAR-SAME: iree_codegen.apple_attention_backward_causal_score_alignment = 128 : i64}
+// TRIANGULAR-SAME: dp_attrs = {iree_codegen.apple_attention_backward_causal_score,
+// TRIANGULAR-SAME: iree_codegen.apple_attention_backward_causal_score_alignment = 128 : i64}
+// TRIANGULAR-SAME: dq_attrs = {iree_codegen.apple_attention_backward_causal,
+// TRIANGULAR-SAME: iree_codegen.apple_attention_backward_causal_score_alignment = 128 : i64}
+// TRIANGULAR-SAME: dv_attrs = {iree_codegen.apple_attention_backward_causal,
+// TRIANGULAR-SAME: iree_codegen.apple_attention_backward_causal_score_alignment = 128 : i64}
+// TRIANGULAR-SAME: qk_attrs = {iree_codegen.apple_attention_backward_causal_score,
+// TRIANGULAR-SAME: iree_codegen.apple_attention_backward_causal_score_alignment = 128 : i64}
+// TRIANGULAR: return
+
+// TRIANGULAR-ROLLBACK-LABEL: func.func public @main(
+// TRIANGULAR-ROLLBACK: iree_linalg_ext.attention_backward
+// TRIANGULAR-ROLLBACK-NOT: iree_codegen.apple_attention_backward_causal_score
+// TRIANGULAR-ROLLBACK: return
+
+// POISON-POSITIVE-LABEL: func.func public @main(
+// POISON-POSITIVE-COUNT-5: iree_codegen.apple_attention_backward_causal_score_poison = 1.600000e+01 : f64
+// POISON-POSITIVE: return
+
+// POISON-NEGATIVE-LABEL: func.func public @main(
+// POISON-NEGATIVE-COUNT-5: iree_codegen.apple_attention_backward_causal_score_poison = -3.200000e+01 : f64
+// POISON-NEGATIVE: return
 
 // NEGATIVE-LABEL: func.func public @unsupported_native_shape
 // NEGATIVE-NOT: iree_linalg_ext.attention
@@ -139,6 +171,11 @@
 // RAISED: ins(%[[UQ]], %[[UK]], %[[UV]], %[[UATTN]]#0, {{%[^,]+}}, %[[UATTN]]#1, %[[USCALE]] :
 // RAISED: return {{.*}}%[[UBWD]]#0, %[[UBWD]]#1, %[[UBWD]]#2
 
+// TRIANGULAR-LABEL: func.func public @unmasked_main(
+// TRIANGULAR: iree_linalg_ext.attention_backward
+// TRIANGULAR-NOT: iree_codegen.apple_attention_backward_causal_score
+// TRIANGULAR: return
+
 // OPTION-OFF-LABEL: func.func public @unmasked_main(
 // OPTION-OFF-NOT: iree_linalg_ext.attention
 // OPTION-OFF: stablehlo.exponential
@@ -190,6 +227,11 @@
 // PADDED: tensor.extract_slice %[[GRAD_BARRIER]]#1
 // PADDED: tensor.extract_slice %[[GRAD_BARRIER]]#2
 // PADDED: return
+
+// TRIANGULAR-PADDED-LABEL: func.func public @unmasked_main(
+// TRIANGULAR-PADDED: iree_linalg_ext.attention_backward
+// TRIANGULAR-PADDED-NOT: iree_codegen.apple_attention_backward_causal_score
+// TRIANGULAR-PADDED: return
 
 // An eligible unmasked forward without its shared VJP must remain untouched.
 // NEGATIVE-LABEL: func.func public @unmasked_incomplete_backward

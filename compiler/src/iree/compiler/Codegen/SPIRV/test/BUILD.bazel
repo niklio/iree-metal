@@ -28,6 +28,8 @@ iree_lit_test_suite(
             "config_amd_matmul_cooperative_ops.mlir",
             "config_amd_matvec.mlir",
             "config_apple_attention.mlir",
+            "config_apple_attention_backward_compact_contract.mlir",
+            "config_apple_attention_backward_compact_contract_invalid.mlir",
             "config_apple_attention_backward_materialized.mlir",
             "config_apple_attention_isolation.mlir",
             "config_default_conv.mlir",

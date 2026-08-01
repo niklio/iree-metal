@@ -52,6 +52,11 @@ static constexpr StringLiteral kAppleAttentionBackwardRole =
     "iree_codegen.apple_attention_backward_role";
 static constexpr StringLiteral kAppleAttentionBackwardCausal =
     "iree_codegen.apple_attention_backward_causal";
+static constexpr StringLiteral kAppleAttentionBackwardCausalScoreAlignment =
+    "iree_codegen.apple_attention_backward_causal_score_alignment";
+static constexpr StringLiteral
+    kAppleAttentionBackwardCausalScoreWorkgroupAligned =
+        "iree_codegen.apple_attention_backward_causal_score_workgroup_aligned";
 static constexpr StringLiteral kAppleAttentionCausal =
     "iree_codegen.apple_attention_causal";
 
@@ -83,6 +88,10 @@ getAttentionBackwardScoreSlice(linalg::LinalgOp op) {
 // under its finite-value contract.
 static LogicalResult applyCausalAttentionBackwardReductionShortening(
     FunctionOpInterface funcOp, IRRewriter &rewriter) {
+  const char *triangularGridValue =
+      std::getenv("IREE_METAL_CAUSAL_TRIANGULAR_GRID");
+  bool triangularGridEnabled =
+      triangularGridValue && StringRef(triangularGridValue) == "1";
   DominanceInfo dominance(funcOp);
   SmallVector<linalg::LinalgOp> causalContractions;
   funcOp->walk([&](linalg::LinalgOp op) {
@@ -154,6 +163,43 @@ static LogicalResult applyCausalAttentionBackwardReductionShortening(
       return op.emitOpError(
           "causal reduction requires a positive static tile size");
     }
+    auto scoreAlignment = op->getAttrOfType<IntegerAttr>(
+        kAppleAttentionBackwardCausalScoreAlignment);
+    bool requireScoreAlignment =
+        triangularGridEnabled || scoreAlignment ||
+        op->hasAttr(kAppleAttentionBackwardCausalScoreWorkgroupAligned);
+    if (requireScoreAlignment && !scoreAlignment) {
+      return op.emitOpError(
+          "compact causal score grid requires a score alignment contract");
+    }
+    if (requireScoreAlignment &&
+        !op->hasAttr(kAppleAttentionBackwardCausalScoreWorkgroupAligned)) {
+      return op.emitOpError(
+          "compact causal score grid requires aligned workgroup provenance");
+    }
+    if (scoreAlignment &&
+        (scoreAlignment.getInt() <= 0 ||
+         scoreAlignment.getInt() != *reductionTile)) {
+      return op.emitOpError(
+          "causal score alignment contract does not match the reduction tile");
+    }
+    if (requireScoreAlignment) {
+      int64_t outputExtent = scoreType.getDimSize(*outputSequenceDim);
+      int64_t reductionExtent =
+          scoreType.getDimSize(*reductionSequenceDim);
+      std::optional<int64_t> outputTile =
+          getConstantIntValue(sizes[*outputSequenceDim]);
+      if (ShapedType::isDynamic(outputExtent) ||
+          ShapedType::isDynamic(reductionExtent) ||
+          outputExtent != reductionExtent ||
+          outputExtent % scoreAlignment.getInt() != 0 || !outputTile ||
+          *outputTile <= 0 ||
+          scoreAlignment.getInt() % *outputTile != 0) {
+        return op.emitOpError(
+            "compact causal consumer requires a square aligned score domain "
+            "and an output tile dividing the score alignment");
+      }
+    }
     auto dominatesReductionLoop = [&](OpFoldResult value) {
       auto dynamicValue = dyn_cast<Value>(value);
       return !dynamicValue ||
@@ -171,6 +217,19 @@ static LogicalResult applyCausalAttentionBackwardReductionShortening(
     Value outputOffset = getValueOrCreateConstantIndexOp(
         rewriter, loc, offsets[*outputSequenceDim]);
     Value oldLowerBound = reductionLoop.getLowerBound();
+    if (requireScoreAlignment) {
+      std::optional<int64_t> lowerBound =
+          getConstantIntValue(oldLowerBound);
+      std::optional<int64_t> upperBound =
+          getConstantIntValue(reductionLoop.getUpperBound());
+      if (!lowerBound || *lowerBound != 0 || !upperBound ||
+          *upperBound <= 0 ||
+          *upperBound % scoreAlignment.getInt() != 0) {
+        return op.emitOpError(
+            "compact causal reduction requires a zero-based static domain "
+            "aligned to the score contract");
+      }
+    }
     if (isDQ) {
       Value outputSize = getValueOrCreateConstantIndexOp(
           rewriter, loc, sizes[*outputSequenceDim]);

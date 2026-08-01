@@ -1264,15 +1264,60 @@ static void rewritePairedAttention(PairedAttentionMatch match) {
     // Keep the forward-only marker out of the backward aggregate. Each
     // backward contraction has its own independently consumed causal marker.
     NamedAttrList backwardConfig(baseDecompositionConfig);
+    const char *triangularGridValue =
+        std::getenv("IREE_METAL_CAUSAL_TRIANGULAR_GRID");
+    bool useTriangularGrid =
+        triangularGridValue && StringRef(triangularGridValue) == "1" &&
+        !std::getenv("IREE_METAL_DISABLE_NATIVE_ATTENTION");
+    constexpr int64_t kCausalScoreAlignment = 128;
+    FloatAttr causalScorePoison;
+    if (useTriangularGrid) {
+      const char *poisonValue =
+          std::getenv("IREE_METAL_CAUSAL_TRIANGULAR_POISON");
+      if (poisonValue && StringRef(poisonValue) == "16") {
+        causalScorePoison = forwardBuilder.getF64FloatAttr(16.0);
+      } else if (poisonValue && StringRef(poisonValue) == "-32") {
+        causalScorePoison = forwardBuilder.getF64FloatAttr(-32.0);
+      }
+    }
     for (StringRef role :
          {IREE::LinalgExt::AttentionBackwardOp::getDQAttrStr(),
           IREE::LinalgExt::AttentionBackwardOp::getDKAttrStr(),
           IREE::LinalgExt::AttentionBackwardOp::getDVAttrStr()}) {
+      NamedAttrList roleConfig;
+      roleConfig.set("iree_codegen.apple_attention_backward_causal",
+                     forwardBuilder.getUnitAttr());
+      if (useTriangularGrid) {
+        roleConfig.set(
+            "iree_codegen.apple_attention_backward_causal_score_alignment",
+            forwardBuilder.getI64IntegerAttr(kCausalScoreAlignment));
+        if (causalScorePoison) {
+          roleConfig.set(
+              "iree_codegen.apple_attention_backward_causal_score_poison",
+              causalScorePoison);
+        }
+      }
       backwardConfig.set(
-          role,
-          forwardBuilder.getDictionaryAttr({forwardBuilder.getNamedAttr(
-              "iree_codegen.apple_attention_backward_causal",
-              forwardBuilder.getUnitAttr())}));
+          role, roleConfig.getDictionary(forwardBuilder.getContext()));
+    }
+    if (useTriangularGrid) {
+      for (StringRef role :
+           {IREE::LinalgExt::AttentionBackwardOp::getQKAttrStr(),
+            IREE::LinalgExt::AttentionBackwardOp::getDPAttrStr()}) {
+        NamedAttrList roleConfig;
+        roleConfig.set("iree_codegen.apple_attention_backward_causal_score",
+                       forwardBuilder.getUnitAttr());
+        roleConfig.set(
+            "iree_codegen.apple_attention_backward_causal_score_alignment",
+            forwardBuilder.getI64IntegerAttr(kCausalScoreAlignment));
+        if (causalScorePoison) {
+          roleConfig.set(
+              "iree_codegen.apple_attention_backward_causal_score_poison",
+              causalScorePoison);
+        }
+        backwardConfig.set(
+            role, roleConfig.getDictionary(forwardBuilder.getContext()));
+      }
     }
     backwardDecompositionConfig =
         backwardConfig.getDictionary(forwardBuilder.getContext());

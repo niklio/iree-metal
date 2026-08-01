@@ -6,7 +6,7 @@
 // RUN: iree-opt --split-input-file --mlir-print-local-scope --pass-pipeline="builtin.module(func.func(iree-codegen-gpu-apply-tiling-level{normalize-loops}, canonicalize, cse))" %s | FileCheck %s --check-prefix=NORM-REDUCTION
 // RUN: iree-opt --split-input-file --mlir-print-local-scope --pass-pipeline="builtin.module(func.func(iree-codegen-gpu-apply-tiling-level{tiling-level=serial}, canonicalize, cse))" %s | FileCheck %s --check-prefix=SERIAL
 // RUN: iree-opt --split-input-file --mlir-print-local-scope --pass-pipeline="builtin.module(func.func(iree-codegen-gpu-apply-tiling-level))" %s | FileCheck %s --check-prefix=CAUSAL-OFF
-// RUN: iree-opt --split-input-file --mlir-print-local-scope --pass-pipeline="builtin.module(func.func(iree-codegen-gpu-apply-tiling-level{shorten-causal-attention-backward-reductions=true}))" %s | FileCheck %s --check-prefixes=CAUSAL-DQ,CAUSAL-DK,CAUSAL-DV,CAUSAL-CONTROL
+// RUN: env -u IREE_METAL_CAUSAL_TRIANGULAR_GRID iree-opt --split-input-file --mlir-print-local-scope --pass-pipeline="builtin.module(func.func(iree-codegen-gpu-apply-tiling-level{shorten-causal-attention-backward-reductions=true}))" %s | FileCheck %s --check-prefixes=CAUSAL-DQ,CAUSAL-DK,CAUSAL-DV,CAUSAL-CONTROL
 // RUN: iree-opt --split-input-file --mlir-print-local-scope --pass-pipeline="builtin.module(func.func(iree-codegen-gpu-apply-tiling-level{shorten-causal-attention-forward-reductions=true}))" %s | FileCheck %s --check-prefixes=CAUSAL-FWD,CAUSAL-FWD-CONTROL
 
 #config = #iree_gpu.lowering_config<{thread = [2, 16], subgroup = [2, 16]}>
@@ -959,6 +959,8 @@ func.func @causal_dv_copy_bounds(
         indexing_maps = [#dv_score, #dv_rhs, #dv_out],
         iterator_types = ["parallel", "parallel", "parallel", "reduction"],
         iree_codegen.apple_attention_backward_causal,
+        iree_codegen.apple_attention_backward_causal_score_alignment = 128 : i64,
+        iree_codegen.apple_attention_backward_causal_score_workgroup_aligned,
         iree_codegen.apple_attention_backward_role = "dv_attrs"
       } ins(%score_copy, %rhs_tile :
           tensor<1x128x64xbf16>, tensor<1x128x64xbf16>)

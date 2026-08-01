@@ -84,6 +84,22 @@ static Value createZeroTensor(OpBuilder &builder, Location loc, AffineMap map,
   return linalg::FillOp::create(builder, loc, zero, empty).getResult(0);
 }
 
+static Value poisonTensorDestination(OpBuilder &builder, Location loc,
+                                     Value destination,
+                                     std::optional<double> poison) {
+  if (!poison) {
+    return destination;
+  }
+  Type elementType = getElementTypeOrSelf(destination.getType());
+  Value poisonValue = arith::ConstantOp::create(
+      builder, loc, builder.getFloatAttr(elementType, *poison));
+  Value filled = linalg::FillOp::create(builder, loc, poisonValue, destination)
+                     .getResult(0);
+  return IREE::Util::OptimizationBarrierOp::create(builder, loc,
+                                                    ValueRange{filled})
+      .getResult(0);
+}
+
 static Value computeMatmul(OpBuilder &builder, Location loc, AffineMap lhsMap,
                            AffineMap rhsMap, AffineMap outputMap, Value lhs,
                            Value rhs, Value output, DictionaryAttr attrs = {},
@@ -189,7 +205,8 @@ static Value convertTensor(OpBuilder &builder, Location loc, AffineMap inputMap,
 // low-precision type as their primal operand while accumulating in f32.
 static Value castContractionLhsToRhsType(OpBuilder &builder, Location loc,
                                          AffineMap lhsMap, Value lhs,
-                                         Value rhs) {
+                                         Value rhs,
+                                         std::optional<double> poison = {}) {
   Type lhsElementType = getElementTypeOrSelf(lhs.getType());
   Type rhsElementType = getElementTypeOrSelf(rhs.getType());
   if (lhsElementType == rhsElementType ||
@@ -198,6 +215,8 @@ static Value castContractionLhsToRhsType(OpBuilder &builder, Location loc,
   }
   Value converted = tensor::EmptyOp::create(
       builder, loc, tensor::getMixedSizes(builder, loc, lhs), rhsElementType);
+  converted =
+      poisonTensorDestination(builder, loc, converted, std::move(poison));
   return convertTensor(builder, loc, lhsMap, lhsMap, lhs, converted);
 }
 
@@ -205,6 +224,17 @@ static bool hasAppleAttentionBackwardRole(DictionaryAttr attrs) {
   return attrs &&
          static_cast<bool>(attrs.getAs<StringAttr>(
              "iree_codegen.apple_attention_backward_role"));
+}
+
+static std::optional<double>
+getAppleAttentionBackwardCausalScorePoison(DictionaryAttr attrs) {
+  if (!attrs) {
+    return std::nullopt;
+  }
+  auto poison = attrs.getAs<FloatAttr>(
+      "iree_codegen.apple_attention_backward_causal_score_poison");
+  return poison ? std::optional<double>(poison.getValueAsDouble())
+                : std::nullopt;
 }
 
 static Value getIntegerMaskCondition(OpBuilder &builder, Location loc,
@@ -269,7 +299,8 @@ static Value computeProbabilities(OpBuilder &builder, Location loc,
                                   AffineMap scoreMap, AffineMap logsumexpMap,
                                   Value scores, Value logsumexp, Value mask,
                                   std::optional<AffineMap> maskMap,
-                                  Type probabilityElementType, bool useExp2) {
+                                  Type probabilityElementType, bool useExp2,
+                                  std::optional<double> poisonDestination) {
   bool useIntegerMask = hasIntegerMask(mask);
   SmallVector<AffineMap> maps{logsumexpMap};
   SmallVector<Value> inputs{logsumexp};
@@ -287,6 +318,8 @@ static Value computeProbabilities(OpBuilder &builder, Location loc,
       tensor::getMixedSizes(builder, loc, scores);
   Value probabilityInit = tensor::EmptyOp::create(
       builder, loc, probabilitySizes, probabilityElementType);
+  probabilityInit = poisonTensorDestination(builder, loc, probabilityInit,
+                                            poisonDestination);
   unsigned scoreOperandIndex = inputs.size() - 1;
   auto genericOp = linalg::GenericOp::create(
       builder, loc, probabilityInit.getType(), inputs, probabilityInit, maps,
@@ -417,6 +450,94 @@ LogicalResult AttentionBackwardOp::verify() {
           attrs && !isa<DictionaryAttr>(attrs)) {
         return emitOpError() << "expected decomposition_config entry '"
                              << attrName << "' to be a dictionary";
+      }
+    }
+
+    constexpr StringLiteral alignmentName =
+        "iree_codegen.apple_attention_backward_causal_score_alignment";
+    constexpr StringLiteral poisonName =
+        "iree_codegen.apple_attention_backward_causal_score_poison";
+    constexpr StringLiteral roleName =
+        "iree_codegen.apple_attention_backward_role";
+    constexpr StringLiteral scoreMarkerName =
+        "iree_codegen.apple_attention_backward_causal_score";
+    constexpr StringLiteral consumerMarkerName =
+        "iree_codegen.apple_attention_backward_causal";
+    std::array<StringRef, 5> configNames = {
+        getQKAttrStr(), getDPAttrStr(), getDQAttrStr(), getDKAttrStr(),
+        getDVAttrStr()};
+    std::array<StringRef, 5> expectedRoles = {
+        "qk_attrs", "dp_attrs", "dq_attrs", "dk_attrs", "dv_attrs"};
+    std::array<DictionaryAttr, 5> contractionAttrs;
+    bool hasCompactScoreContract = false;
+    for (auto [index, configName] : llvm::enumerate(configNames)) {
+      DictionaryAttr attrs = config.getAs<DictionaryAttr>(configName);
+      contractionAttrs[index] = attrs;
+      if (!attrs) {
+        continue;
+      }
+      if (Attribute poison = attrs.get(poisonName);
+          poison && !isa<FloatAttr>(poison)) {
+        return emitOpError()
+               << "expected '" << poisonName
+               << "' to be a floating-point attribute";
+      }
+      hasCompactScoreContract |= static_cast<bool>(attrs.get(alignmentName));
+    }
+
+    if (hasCompactScoreContract) {
+      std::optional<int64_t> commonAlignment;
+      bool hasAnyRole = llvm::any_of(contractionAttrs, [&](DictionaryAttr attrs) {
+        return attrs && static_cast<bool>(attrs.get(roleName));
+      });
+      bool hasAllRoles = llvm::all_of(contractionAttrs, [&](DictionaryAttr attrs) {
+        return attrs && static_cast<bool>(attrs.get(roleName));
+      });
+      if (hasAnyRole != hasAllRoles) {
+        return emitOpError(
+            "compact causal score roles must be absent before role tagging or "
+            "present on all attention-backward contractions");
+      }
+      for (auto [index, attrs] : llvm::enumerate(contractionAttrs)) {
+        StringRef configName = configNames[index];
+        if (!attrs) {
+          return emitOpError()
+                 << "compact causal score contract requires "
+                    "decomposition_config entry '"
+                 << configName << "'";
+        }
+        auto alignment = attrs.getAs<IntegerAttr>(alignmentName);
+        auto alignmentType =
+            alignment ? dyn_cast<IntegerType>(alignment.getType())
+                      : IntegerType{};
+        if (!alignment || !alignmentType || alignmentType.getWidth() != 64 ||
+            alignment.getInt() <= 0) {
+          return emitOpError()
+                 << "compact causal score contract requires a positive i64 '"
+                 << alignmentName << "' in '" << configName << "'";
+        }
+        if (commonAlignment && *commonAlignment != alignment.getInt()) {
+          return emitOpError(
+              "compact causal score alignments must match across all "
+              "attention-backward contractions");
+        }
+        commonAlignment = alignment.getInt();
+
+        if (hasAllRoles) {
+          auto role = attrs.getAs<StringAttr>(roleName);
+          if (!role || role.getValue() != expectedRoles[index]) {
+            return emitOpError()
+                   << "compact causal score contract requires role '"
+                   << expectedRoles[index] << "' in '" << configName << "'";
+          }
+        }
+        StringRef markerName =
+            index < 2 ? scoreMarkerName : consumerMarkerName;
+        if (!isa_and_nonnull<UnitAttr>(attrs.get(markerName))) {
+          return emitOpError()
+                 << "compact causal score contract requires unit marker '"
+                 << markerName << "' in '" << configName << "'";
+        }
       }
     }
   }
@@ -740,7 +861,8 @@ AttentionBackwardOp::decomposeOperation(OpBuilder &builder) {
       nativeQK ? getElementTypeOrSelf(getQuery().getType()) : f32Type;
   Value probabilities = computeProbabilities(
       builder, loc, scoreMap, getLogsumexpMap(), scores, getLogsumexp(),
-      probabilityMask, getMaskMap(), probabilityElementType, useExp2);
+      probabilityMask, getMaskMap(), probabilityElementType, useExp2,
+      getAppleAttentionBackwardCausalScorePoison(qkAttrs));
   if (nativeQK) {
     probabilities = IREE::Util::OptimizationBarrierOp::create(
                         builder, loc, ValueRange{probabilities})
@@ -779,6 +901,9 @@ AttentionBackwardOp::decomposeOperation(OpBuilder &builder) {
   Value scoreGradInit = tensor::EmptyOp::create(
       builder, loc, tensor::getMixedSizes(builder, loc, probabilityGrad),
       f32Type);
+  scoreGradInit = poisonTensorDestination(
+      builder, loc, scoreGradInit,
+      getAppleAttentionBackwardCausalScorePoison(dpAttrs));
   Value scoreGrad = computePointwise<arith::SubFOp>(
       builder, loc, scoreMap, getLogsumexpMap(), scoreMap, probabilityGrad,
       rowDot, scoreGradInit);
@@ -793,7 +918,9 @@ AttentionBackwardOp::decomposeOperation(OpBuilder &builder) {
       createZeroTensor(builder, loc, getQueryMap(), domainSizes, f32Type);
   Value queryScoreGrad =
       nativeDQ ? castContractionLhsToRhsType(builder, loc, scoreMap, scoreGrad,
-                                             getKey())
+                                             getKey(),
+                                             getAppleAttentionBackwardCausalScorePoison(
+                                                 dqAttrs))
                : scoreGrad;
   if (nativeDQ) {
     queryScoreGrad = IREE::Util::OptimizationBarrierOp::create(
@@ -808,7 +935,9 @@ AttentionBackwardOp::decomposeOperation(OpBuilder &builder) {
       createZeroTensor(builder, loc, getKeyMap(), domainSizes, f32Type);
   Value keyScoreGrad = nativeDK
                            ? castContractionLhsToRhsType(builder, loc, scoreMap,
-                                                         scoreGrad, getQuery())
+                                                         scoreGrad, getQuery(),
+                                                         getAppleAttentionBackwardCausalScorePoison(
+                                                             dkAttrs))
                            : scoreGrad;
   if (nativeDK) {
     keyScoreGrad = IREE::Util::OptimizationBarrierOp::create(

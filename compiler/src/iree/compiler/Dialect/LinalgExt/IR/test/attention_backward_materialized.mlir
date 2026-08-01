@@ -19,16 +19,30 @@ func.func @materialized_backward(
   %dv = tensor.empty() : tensor<1x2x5x6xbf16>
   %result:3 = iree_linalg_ext.attention_backward {
       decomposition_config = {
-        qk_attrs = {iree_codegen.apple_attention_backward_role = "qk_attrs"},
-        dp_attrs = {iree_codegen.apple_attention_backward_role = "dp_attrs"},
+        qk_attrs = {
+          iree_codegen.apple_attention_backward_causal_score,
+          iree_codegen.apple_attention_backward_causal_score_alignment = 128 : i64,
+          iree_codegen.apple_attention_backward_causal_score_poison = 16.0 : f64,
+          iree_codegen.apple_attention_backward_role = "qk_attrs"},
+        dp_attrs = {
+          iree_codegen.apple_attention_backward_causal_score,
+          iree_codegen.apple_attention_backward_causal_score_alignment = 128 : i64,
+          iree_codegen.apple_attention_backward_causal_score_poison = 16.0 : f64,
+          iree_codegen.apple_attention_backward_role = "dp_attrs"},
         dq_attrs = {
           iree_codegen.apple_attention_backward_causal,
+          iree_codegen.apple_attention_backward_causal_score_alignment = 128 : i64,
+          iree_codegen.apple_attention_backward_causal_score_poison = 16.0 : f64,
           iree_codegen.apple_attention_backward_role = "dq_attrs"},
         dk_attrs = {
           iree_codegen.apple_attention_backward_causal,
+          iree_codegen.apple_attention_backward_causal_score_alignment = 128 : i64,
+          iree_codegen.apple_attention_backward_causal_score_poison = 16.0 : f64,
           iree_codegen.apple_attention_backward_role = "dk_attrs"},
         dv_attrs = {
           iree_codegen.apple_attention_backward_causal,
+          iree_codegen.apple_attention_backward_causal_score_alignment = 128 : i64,
+          iree_codegen.apple_attention_backward_causal_score_poison = 16.0 : f64,
           iree_codegen.apple_attention_backward_role = "dv_attrs"},
         use_exp2 = false},
       indexing_maps = [#q, #k, #v, #o, #o, #lse, #scalar, #q, #k, #v]}
@@ -50,23 +64,34 @@ func.func @materialized_backward(
 // CHECK-DAG:   #[[CANON_RHS:map[0-9]+]] = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d4, d3)>
 // CHECK-DAG:   #[[CANON_OUT:map[0-9]+]] = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3)>
 // CHECK-LABEL: func.func @materialized_backward
+// CHECK-DAG:   %[[POISON_F32:[a-zA-Z0-9_]+]] = arith.constant 1.600000e+01 : f32
+// CHECK-DAG:   %[[POISON_BF16:[a-zA-Z0-9_]+]] = arith.constant 1.600000e+01 : bf16
 // CHECK:       iree_codegen.apple_attention_backward_role = "qk_attrs"
-// CHECK:       %[[P16:[0-9]+]] = linalg.generic{{.*}} ins({{.*}} : tensor<1x2x3xf32>, tensor<1x2x3x5xf32>) outs({{.*}} : tensor<1x2x3x5xbf16>)
+// CHECK:       %[[P_POISON:[0-9]+]] = linalg.fill ins(%[[POISON_BF16]] : bf16)
+// CHECK:       %[[P_INIT:[0-9]+]] = util.optimization_barrier %[[P_POISON]]
+// CHECK:       %[[P16:[0-9]+]] = linalg.generic{{.*}} ins({{.*}} : tensor<1x2x3xf32>, tensor<1x2x3x5xf32>) outs(%[[P_INIT]] : tensor<1x2x3x5xbf16>)
 // CHECK:       math.exp
 // CHECK:       arith.truncf {{.*}} : f32 to bf16
 // CHECK:       %[[P_BARRIER:[0-9]+]] = util.optimization_barrier %[[P16]]
 // CHECK:       util.optimization_barrier
 // CHECK:       iree_codegen.apple_attention_backward_role = "dp_attrs"
-// CHECK:       %[[DS:[0-9]+]] = linalg.generic{{.*}} ins({{.*}} : tensor<1x2x3x5xf32>) outs({{.*}} : tensor<1x2x3x5xbf16>)
+// CHECK:       %[[DS_F32_POISON:[0-9]+]] = linalg.fill ins(%[[POISON_F32]] : f32)
+// CHECK:       %[[DS_F32_INIT:[0-9]+]] = util.optimization_barrier %[[DS_F32_POISON]]
+// CHECK:       %[[DS_SUB:[0-9]+]] = linalg.generic{{.*}} outs(%[[DS_F32_INIT]] : tensor<1x2x3x5xf32>)
+// CHECK:       %[[DS_MUL:[0-9]+]] = linalg.generic{{.*}} ins(%[[P_BARRIER]], %[[DS_SUB]] : tensor<1x2x3x5xbf16>, tensor<1x2x3x5xf32>) outs(%[[DS_SUB]] : tensor<1x2x3x5xf32>)
+// CHECK:       %[[DS_FINAL:[0-9]+]] = linalg.generic{{.*}} ins(%[[DS_MUL]], {{.*}} : tensor<1x2x3x5xf32>, bf16) outs(%[[DS_MUL]] : tensor<1x2x3x5xf32>)
+// CHECK:       %[[DQ_POISON_INIT:[0-9]+]] = util.optimization_barrier %[[P_POISON]]
+// CHECK:       %[[DQ_DS:[0-9]+]] = linalg.generic{{.*}} ins(%[[DS_FINAL]] : tensor<1x2x3x5xf32>) outs(%[[DQ_POISON_INIT]] : tensor<1x2x3x5xbf16>)
 // CHECK:       arith.truncf {{.*}} : f32 to bf16
-// CHECK:       %[[DQ_BARRIER:[0-9]+]] = util.optimization_barrier %[[DS]]
+// CHECK:       %[[DQ_BARRIER:[0-9]+]] = util.optimization_barrier %[[DQ_DS]]
 // CHECK:       iree_codegen.apple_attention_backward_causal
 // CHECK:       iree_codegen.apple_attention_backward_role = "dq_attrs"
-// CHECK:       %[[DK_BARRIER:[0-9]+]] = util.optimization_barrier %[[DS]]
+// CHECK:       %[[DK_POISON_INIT:[0-9]+]] = util.optimization_barrier %[[P_POISON]]
+// CHECK:       %[[DK_DS:[0-9]+]] = linalg.generic{{.*}} ins(%[[DS_FINAL]] : tensor<1x2x3x5xf32>) outs(%[[DK_POISON_INIT]] : tensor<1x2x3x5xbf16>)
+// CHECK:       %[[DK_BARRIER:[0-9]+]] = util.optimization_barrier %[[DK_DS]]
 // CHECK:       linalg.generic {indexing_maps = [#[[CANON_LHS]], #[[CANON_RHS]], #[[CANON_OUT]]]
 // CHECK-SAME:  iree_codegen.apple_attention_backward_causal
 // CHECK-SAME:  iree_codegen.apple_attention_backward_role = "dk_attrs"
-// CHECK-NOT:   linalg.generic{{.*}} ins({{.*}} : tensor<1x2x3x5xf32>) outs({{.*}} : tensor<1x2x3x5xbf16>)
 // CHECK:       util.optimization_barrier %[[P_BARRIER]]
 // CHECK:       linalg.generic {indexing_maps = [#[[CANON_LHS]], #[[CANON_RHS]], #[[CANON_OUT]]]
 // CHECK-SAME:  iree_codegen.apple_attention_backward_causal
