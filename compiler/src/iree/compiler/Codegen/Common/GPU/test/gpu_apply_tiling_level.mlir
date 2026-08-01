@@ -5,6 +5,8 @@
 // RUN: iree-opt --split-input-file --mlir-print-local-scope --pass-pipeline="builtin.module(func.func(iree-codegen-gpu-apply-tiling-level{tiling-level=partial_reduction}, canonicalize, cse))" %s | FileCheck %s --check-prefix=PARTRED
 // RUN: iree-opt --split-input-file --mlir-print-local-scope --pass-pipeline="builtin.module(func.func(iree-codegen-gpu-apply-tiling-level{normalize-loops}, canonicalize, cse))" %s | FileCheck %s --check-prefix=NORM-REDUCTION
 // RUN: iree-opt --split-input-file --mlir-print-local-scope --pass-pipeline="builtin.module(func.func(iree-codegen-gpu-apply-tiling-level{tiling-level=serial}, canonicalize, cse))" %s | FileCheck %s --check-prefix=SERIAL
+// RUN: iree-opt --split-input-file --mlir-print-local-scope --pass-pipeline="builtin.module(func.func(iree-codegen-gpu-apply-tiling-level))" %s | FileCheck %s --check-prefix=CAUSAL-OFF
+// RUN: iree-opt --split-input-file --mlir-print-local-scope --pass-pipeline="builtin.module(func.func(iree-codegen-gpu-apply-tiling-level{shorten-causal-attention-backward-reductions=true}))" %s | FileCheck %s --check-prefixes=CAUSAL-DQ,CAUSAL-DK,CAUSAL-DV,CAUSAL-CONTROL
 
 #config = #iree_gpu.lowering_config<{thread = [2, 16], subgroup = [2, 16]}>
 #map = affine_map<(d0, d1) -> (d0, d1)>
@@ -829,3 +831,183 @@ func.func @matmul_transpose_b_with_swizzle(%5: tensor<64x64xf32>, %6: tensor<64x
 // THREAD-LABEL: func.func @matmul_transpose_b_with_swizzle
 //       THREAD:     %2 = tensor.empty() : tensor<64x4xf16>
 //       THREAD:     %3 = iree_codegen.swizzle_hint %2[#iree_codegen.xor_shuffle<256, 32>] : tensor<64x4xf16>
+
+// -----
+
+#dq_score = affine_map<(b, m, n, k) -> (b, m, k)>
+#dq_rhs = affine_map<(b, m, n, k) -> (b, k, n)>
+#dq_out = affine_map<(b, m, n, k) -> (b, m, n)>
+func.func @causal_dq_bounds(
+    %score: tensor<1x512x512xbf16>, %rhs: tensor<1x512x64xbf16>,
+    %init: tensor<1x64x64xf32>, %m0: index,
+    %existing_lower_bound: index) -> tensor<1x64x64xf32> {
+  %c128 = arith.constant 128 : index
+  %c512 = arith.constant 512 : index
+  %result = scf.for %k = %existing_lower_bound to %c512 step %c128
+      iter_args(%acc = %init) -> tensor<1x64x64xf32> {
+    %score_tile = tensor.extract_slice %score[0, %m0, %k] [1, 64, 128]
+        [1, 1, 1] : tensor<1x512x512xbf16> to tensor<1x64x128xbf16>
+    %rhs_tile = tensor.extract_slice %rhs[0, %k, 0] [1, 128, 64]
+        [1, 1, 1] : tensor<1x512x64xbf16> to tensor<1x128x64xbf16>
+    %next = linalg.generic {
+        indexing_maps = [#dq_score, #dq_rhs, #dq_out],
+        iterator_types = ["parallel", "parallel", "parallel", "reduction"],
+        iree_codegen.apple_attention_backward_causal,
+        iree_codegen.apple_attention_backward_role = "dq_attrs"
+      } ins(%score_tile, %rhs_tile :
+          tensor<1x64x128xbf16>, tensor<1x128x64xbf16>)
+        outs(%acc : tensor<1x64x64xf32>) {
+      ^bb0(%lhs: bf16, %rhs_value: bf16, %old: f32):
+        %lhs_f32 = arith.extf %lhs : bf16 to f32
+        %rhs_f32 = arith.extf %rhs_value : bf16 to f32
+        %product = arith.mulf %lhs_f32, %rhs_f32 : f32
+        %sum = arith.addf %old, %product : f32
+        linalg.yield %sum : f32
+      } -> tensor<1x64x64xf32>
+    scf.yield %next : tensor<1x64x64xf32>
+  }
+  return %result : tensor<1x64x64xf32>
+}
+
+// CAUSAL-OFF-LABEL: func.func @causal_dq_bounds
+// CAUSAL-OFF-DAG:   %[[DQ_C512:.+]] = arith.constant 512 : index
+// CAUSAL-OFF:       scf.for %{{.*}} = %{{.*}} to %[[DQ_C512]] step %{{.*}}
+// CAUSAL-DQ-LABEL:  func.func @causal_dq_bounds
+// CAUSAL-DQ-SAME:   %[[M0:[A-Za-z0-9]+]]: index
+// CAUSAL-DQ-SAME:   %[[OLD_LB:[A-Za-z0-9]+]]: index
+// CAUSAL-DQ:        %[[END:.+]] = arith.addi %{{.*}}, %{{.*}} : index
+// CAUSAL-DQ:        %[[CLAMPED:.+]] = arith.maxui %[[END]], %[[OLD_LB]] : index
+// CAUSAL-DQ:        %[[RELATIVE:.+]] = arith.subi %[[CLAMPED]], %[[OLD_LB]] : index
+// CAUSAL-DQ:        %[[TILES:.+]] = arith.ceildivui %[[RELATIVE]], %{{.*}} : index
+// CAUSAL-DQ:        %[[ROUNDED_RELATIVE:.+]] = arith.muli %[[TILES]], %{{.*}} : index
+// CAUSAL-DQ:        %[[ROUNDED:.+]] = arith.addi %[[OLD_LB]], %[[ROUNDED_RELATIVE]] : index
+// CAUSAL-DQ:        %[[UB:.+]] = arith.minui %[[ROUNDED]], %{{.*}} : index
+// CAUSAL-DQ:        scf.for %{{.*}} = %{{.*}} to %[[UB]] step %{{.*}}
+
+// -----
+
+#dk_score = affine_map<(b, m, n, k) -> (b, k, m)>
+#dk_rhs = affine_map<(b, m, n, k) -> (b, k, n)>
+#dk_out = affine_map<(b, m, n, k) -> (b, m, n)>
+func.func @causal_dk_bounds(
+    %score: tensor<1x512x512xbf16>, %rhs: tensor<1x512x64xbf16>,
+    %init: tensor<1x64x64xf32>, %k0: index,
+    %existing_lower_bound: index) -> tensor<1x64x64xf32> {
+  %c128 = arith.constant 128 : index
+  %c512 = arith.constant 512 : index
+  %result = scf.for %m = %existing_lower_bound to %c512 step %c128
+      iter_args(%acc = %init) -> tensor<1x64x64xf32> {
+    %score_tile = tensor.extract_slice %score[0, %m, %k0] [1, 128, 64]
+        [1, 1, 1] : tensor<1x512x512xbf16> to tensor<1x128x64xbf16>
+    %rhs_tile = tensor.extract_slice %rhs[0, %m, 0] [1, 128, 64]
+        [1, 1, 1] : tensor<1x512x64xbf16> to tensor<1x128x64xbf16>
+    %next = linalg.generic {
+        indexing_maps = [#dk_score, #dk_rhs, #dk_out],
+        iterator_types = ["parallel", "parallel", "parallel", "reduction"],
+        iree_codegen.apple_attention_backward_causal,
+        iree_codegen.apple_attention_backward_role = "dk_attrs"
+      } ins(%score_tile, %rhs_tile :
+          tensor<1x128x64xbf16>, tensor<1x128x64xbf16>)
+        outs(%acc : tensor<1x64x64xf32>) {
+      ^bb0(%lhs: bf16, %rhs_value: bf16, %old: f32):
+        %lhs_f32 = arith.extf %lhs : bf16 to f32
+        %rhs_f32 = arith.extf %rhs_value : bf16 to f32
+        %product = arith.mulf %lhs_f32, %rhs_f32 : f32
+        %sum = arith.addf %old, %product : f32
+        linalg.yield %sum : f32
+      } -> tensor<1x64x64xf32>
+    scf.yield %next : tensor<1x64x64xf32>
+  }
+  return %result : tensor<1x64x64xf32>
+}
+
+// CAUSAL-OFF-LABEL: func.func @causal_dk_bounds
+// CAUSAL-OFF-DAG:   %[[DK_C512:.+]] = arith.constant 512 : index
+// CAUSAL-OFF:       scf.for %{{.*}} = %{{.*}} to %[[DK_C512]] step %{{.*}}
+// CAUSAL-DK-LABEL:  func.func @causal_dk_bounds
+// CAUSAL-DK-SAME:   %[[K0:[A-Za-z0-9]+]]: index
+// CAUSAL-DK-SAME:   %[[OLD_LB:[A-Za-z0-9]+]]: index
+// CAUSAL-DK:        %[[CLAMPED:.+]] = arith.maxui %[[K0]], %[[OLD_LB]] : index
+// CAUSAL-DK:        %[[RELATIVE:.+]] = arith.subi %[[CLAMPED]], %[[OLD_LB]] : index
+// CAUSAL-DK:        %[[TILES:.+]] = arith.divui %[[RELATIVE]], %{{.*}} : index
+// CAUSAL-DK:        %[[ROUNDED:.+]] = arith.muli %[[TILES]], %{{.*}} : index
+// CAUSAL-DK:        %[[LB:.+]] = arith.addi %[[OLD_LB]], %[[ROUNDED]] : index
+// CAUSAL-DK:        scf.for %{{.*}} = %[[LB]] to %{{.*}} step %{{.*}}
+
+// -----
+
+#dv_score = affine_map<(b, m, n, k) -> (b, k, m)>
+#dv_rhs = affine_map<(b, m, n, k) -> (b, k, n)>
+#dv_out = affine_map<(b, m, n, k) -> (b, m, n)>
+func.func @causal_dv_copy_bounds(
+    %score: tensor<1x512x512xbf16>, %rhs: tensor<1x512x64xbf16>,
+    %init: tensor<1x64x64xf32>, %k0: index) -> tensor<1x64x64xf32> {
+  %c0 = arith.constant 0 : index
+  %c128 = arith.constant 128 : index
+  %c512 = arith.constant 512 : index
+  %result = scf.for %m = %c0 to %c512 step %c128
+      iter_args(%acc = %init) -> tensor<1x64x64xf32> {
+    %score_tile = tensor.extract_slice %score[0, %m, %k0] [1, 128, 64]
+        [1, 1, 1] : tensor<1x512x512xbf16> to tensor<1x128x64xbf16>
+    %copy_init = tensor.empty() : tensor<1x128x64xbf16>
+    %score_copy = linalg.copy ins(%score_tile : tensor<1x128x64xbf16>)
+        outs(%copy_init : tensor<1x128x64xbf16>) -> tensor<1x128x64xbf16>
+    %rhs_tile = tensor.extract_slice %rhs[0, %m, 0] [1, 128, 64]
+        [1, 1, 1] : tensor<1x512x64xbf16> to tensor<1x128x64xbf16>
+    %next = linalg.generic {
+        indexing_maps = [#dv_score, #dv_rhs, #dv_out],
+        iterator_types = ["parallel", "parallel", "parallel", "reduction"],
+        iree_codegen.apple_attention_backward_causal,
+        iree_codegen.apple_attention_backward_role = "dv_attrs"
+      } ins(%score_copy, %rhs_tile :
+          tensor<1x128x64xbf16>, tensor<1x128x64xbf16>)
+        outs(%acc : tensor<1x64x64xf32>) {
+      ^bb0(%lhs: bf16, %rhs_value: bf16, %old: f32):
+        %lhs_f32 = arith.extf %lhs : bf16 to f32
+        %rhs_f32 = arith.extf %rhs_value : bf16 to f32
+        %product = arith.mulf %lhs_f32, %rhs_f32 : f32
+        %sum = arith.addf %old, %product : f32
+        linalg.yield %sum : f32
+      } -> tensor<1x64x64xf32>
+    scf.yield %next : tensor<1x64x64xf32>
+  }
+  return %result : tensor<1x64x64xf32>
+}
+
+// CAUSAL-OFF-LABEL: func.func @causal_dv_copy_bounds
+// CAUSAL-OFF-DAG:   %[[DV_C512:.+]] = arith.constant 512 : index
+// CAUSAL-OFF:       scf.for %{{.*}} = %{{.*}} to %[[DV_C512]] step %{{.*}}
+// CAUSAL-DV-LABEL:  func.func @causal_dv_copy_bounds
+// CAUSAL-DV-SAME:   %[[K0:[A-Za-z0-9]+]]: index
+// CAUSAL-DV:        %[[TILES:.+]] = arith.divui %[[K0]], %{{.*}} : index
+// CAUSAL-DV:        %[[LB:.+]] = arith.muli %[[TILES]], %{{.*}} : index
+// CAUSAL-DV:        scf.for %{{.*}} = %[[LB]] to %{{.*}} step %{{.*}}
+// CAUSAL-DV:        linalg.copy
+
+// -----
+
+func.func @unmarked_dq_control(
+    %score: tensor<1x512x512xbf16>, %rhs: tensor<1x512x64xbf16>,
+    %init: tensor<1x64x64xf32>, %m0: index) -> tensor<1x64x64xf32> {
+  %c0 = arith.constant 0 : index
+  %c128 = arith.constant 128 : index
+  %c512 = arith.constant 512 : index
+  %result = scf.for %k = %c0 to %c512 step %c128
+      iter_args(%acc = %init) -> tensor<1x64x64xf32> {
+    %score_tile = tensor.extract_slice %score[0, %m0, %k] [1, 64, 128]
+        [1, 1, 1] : tensor<1x512x512xbf16> to tensor<1x64x128xbf16>
+    %rhs_tile = tensor.extract_slice %rhs[0, %k, 0] [1, 128, 64]
+        [1, 1, 1] : tensor<1x512x64xbf16> to tensor<1x128x64xbf16>
+    %next = linalg.batch_matmul {
+        iree_codegen.apple_attention_backward_role = "dq_attrs"
+      } ins(%score_tile, %rhs_tile :
+          tensor<1x64x128xbf16>, tensor<1x128x64xbf16>)
+        outs(%acc : tensor<1x64x64xf32>) -> tensor<1x64x64xf32>
+    scf.yield %next : tensor<1x64x64xf32>
+  }
+  return %result : tensor<1x64x64xf32>
+}
+
+// CAUSAL-CONTROL-LABEL: func.func @unmarked_dq_control
+// CAUSAL-CONTROL-DAG:   %[[CONTROL_C512:.+]] = arith.constant 512 : index
+// CAUSAL-CONTROL:       scf.for %{{.*}} = %{{.*}} to %[[CONTROL_C512]] step %{{.*}}

@@ -32,7 +32,11 @@
 // RAISED-SAME: decomposition_config = {use_exp2 = false}
 // RAISED: ins(%[[Q]], %[[K]], %[[V]], %[[SCALE]], %[[MASK]]
 // RAISED: %[[BWD:.+]]:3 = iree_linalg_ext.attention_backward
-// RAISED-SAME: decomposition_config = {use_exp2 = false}
+// RAISED-SAME: decomposition_config = {
+// RAISED-SAME: dk_attrs = {iree_codegen.apple_attention_backward_causal}
+// RAISED-SAME: dq_attrs = {iree_codegen.apple_attention_backward_causal}
+// RAISED-SAME: dv_attrs = {iree_codegen.apple_attention_backward_causal}
+// RAISED-SAME: use_exp2 = false}
 // RAISED: ins(%[[Q]], %[[K]], %[[V]], %[[ATTN]]#0, {{%[^,]+}}, %[[ATTN]]#1, %[[SCALE]], %[[MASK]]
 // RAISED: return {{.*}}%[[BWD]]#0, %[[BWD]]#1, %[[BWD]]#2
 
@@ -132,6 +136,7 @@
 // RAISED: ins(%[[UQ]], %[[UK]], %[[UV]], %[[USCALE]] :
 // RAISED: %[[UBWD:.+]]:3 = iree_linalg_ext.attention_backward
 // RAISED-SAME: decomposition_config = {use_exp2 = false}
+// RAISED-NOT: iree_codegen.apple_attention_backward_causal
 // RAISED: ins(%[[UQ]], %[[UK]], %[[UV]], %[[UATTN]]#0, {{%[^,]+}}, %[[UATTN]]#1, %[[USCALE]] :
 // RAISED: return {{.*}}%[[UBWD]]#0, %[[UBWD]]#1, %[[UBWD]]#2
 
@@ -175,7 +180,9 @@
 // PADDED: tensor.extract_slice
 // PADDED-SAME: tensor<2x2x16x8xbf16> to tensor<2x2x8x8xbf16>
 // PADDED: iree_linalg_ext.attention_backward
+// PADDED-SAME: decomposition_config = {use_exp2 = false}
 // PADDED-SAME: indexing_maps = [{{.*}}#[[KEY_MASK_MAP]], {{.*}}]
+// PADDED-NOT: iree_codegen.apple_attention_backward_causal
 // PADDED-SAME: ins({{.*}}%[[KEY_MASK]]
 // PADDED-SAME: tensor<2x2x16x8xbf16>
 // PADDED: %[[GRAD_BARRIER:.+]]:3 = util.optimization_barrier

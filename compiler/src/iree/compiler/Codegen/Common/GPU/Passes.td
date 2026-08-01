@@ -353,8 +353,9 @@ def GPUApplyTilingLevelPass :
     InterfacePass<"iree-codegen-gpu-apply-tiling-level", "mlir::FunctionOpInterface"> {
   let summary = "Pass to tile tensor ops based on tiling configs";
   let dependentDialects = [
-    "::mlir::affine::AffineDialect", "::mlir::gpu::GPUDialect",
-    "::mlir::scf::SCFDialect", "::mlir::tensor::TensorDialect"
+    "::mlir::affine::AffineDialect", "::mlir::arith::ArithDialect",
+    "::mlir::gpu::GPUDialect", "::mlir::scf::SCFDialect",
+    "::mlir::tensor::TensorDialect"
   ];
   let options = [
     Option<"tilingLevel", "tiling-level", "IREE::GPU::TilingLevel",
@@ -378,7 +379,11 @@ def GPUApplyTilingLevelPass :
     Option<"normalizeLoops", "normalize-loops", "bool", "false",
            "Enable normalization for scf loops">,
     Option<"fuseConsumers", "fuse-consumers", "bool", /*default=*/"true",
-           "Enable fusing consumers into scf.forall during tiling">
+           "Enable fusing consumers into scf.forall during tiling">,
+    Option<"shortenCausalAttentionBackwardReductions",
+           "shorten-causal-attention-backward-reductions", "bool",
+           /*default=*/"false",
+           "Shorten marked finite causal attention-backward reductions">
   ];
 }
 

@@ -21,9 +21,15 @@ func.func @materialized_backward(
       decomposition_config = {
         qk_attrs = {iree_codegen.apple_attention_backward_role = "qk_attrs"},
         dp_attrs = {iree_codegen.apple_attention_backward_role = "dp_attrs"},
-        dq_attrs = {iree_codegen.apple_attention_backward_role = "dq_attrs"},
-        dk_attrs = {iree_codegen.apple_attention_backward_role = "dk_attrs"},
-        dv_attrs = {iree_codegen.apple_attention_backward_role = "dv_attrs"},
+        dq_attrs = {
+          iree_codegen.apple_attention_backward_causal,
+          iree_codegen.apple_attention_backward_role = "dq_attrs"},
+        dk_attrs = {
+          iree_codegen.apple_attention_backward_causal,
+          iree_codegen.apple_attention_backward_role = "dk_attrs"},
+        dv_attrs = {
+          iree_codegen.apple_attention_backward_causal,
+          iree_codegen.apple_attention_backward_role = "dv_attrs"},
         use_exp2 = false},
       indexing_maps = [#q, #k, #v, #o, #o, #lse, #scalar, #q, #k, #v]}
       ins(%q, %k, %v, %o, %do, %lse, %scale :
@@ -54,13 +60,16 @@ func.func @materialized_backward(
 // CHECK:       %[[DS:[0-9]+]] = linalg.generic{{.*}} ins({{.*}} : tensor<1x2x3x5xf32>) outs({{.*}} : tensor<1x2x3x5xbf16>)
 // CHECK:       arith.truncf {{.*}} : f32 to bf16
 // CHECK:       %[[DQ_BARRIER:[0-9]+]] = util.optimization_barrier %[[DS]]
+// CHECK:       iree_codegen.apple_attention_backward_causal
 // CHECK:       iree_codegen.apple_attention_backward_role = "dq_attrs"
 // CHECK:       %[[DK_BARRIER:[0-9]+]] = util.optimization_barrier %[[DS]]
 // CHECK:       linalg.generic {indexing_maps = [#[[CANON_LHS]], #[[CANON_RHS]], #[[CANON_OUT]]]
+// CHECK-SAME:  iree_codegen.apple_attention_backward_causal
 // CHECK-SAME:  iree_codegen.apple_attention_backward_role = "dk_attrs"
 // CHECK-NOT:   linalg.generic{{.*}} ins({{.*}} : tensor<1x2x3x5xf32>) outs({{.*}} : tensor<1x2x3x5xbf16>)
 // CHECK:       util.optimization_barrier %[[P_BARRIER]]
 // CHECK:       linalg.generic {indexing_maps = [#[[CANON_LHS]], #[[CANON_RHS]], #[[CANON_OUT]]]
+// CHECK-SAME:  iree_codegen.apple_attention_backward_causal
 // CHECK-SAME:  iree_codegen.apple_attention_backward_role = "dv_attrs"
 
 // CHECK-LABEL: func.func @portable_contraction_attrs

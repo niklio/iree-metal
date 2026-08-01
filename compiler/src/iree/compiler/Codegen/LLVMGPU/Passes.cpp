@@ -7,6 +7,7 @@
 #include "iree/compiler/Dialect/LinalgExt/Transforms/Passes.h"
 
 #include <cstdint>
+#include <cstdlib>
 
 #include "iree-dialects/Dialect/LinalgTransform/Passes.h"
 #include "iree/compiler/Codegen/Common/CombineLayoutTransformation.h"
@@ -759,6 +760,10 @@ void addGPUVectorDistributePassPipeline(OpPassManager &funcPassManager,
     GPUApplyTilingLevelPassOptions options;
     options.tilingLevel = IREE::GPU::TilingLevel::Reduction;
     options.allowZeroSlices = true;
+    const char *causalBounds =
+        std::getenv("IREE_METAL_CAUSAL_BWD_BOUNDS");
+    options.shortenCausalAttentionBackwardReductions =
+        !forROCDL && causalBounds && StringRef(causalBounds) == "1";
     funcPassManager.addPass(createGPUApplyTilingLevelPass(options));
     funcPassManager.addPass(affine::createLoopCoalescingPass());
     funcPassManager.addPass(createConfigTrackingCanonicalizerPass());

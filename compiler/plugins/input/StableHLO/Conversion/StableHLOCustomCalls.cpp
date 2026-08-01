@@ -1247,6 +1247,26 @@ static void rewritePairedAttention(PairedAttentionMatch match) {
       forwardBuilder.getDictionaryAttr({forwardBuilder.getNamedAttr(
           IREE::LinalgExt::AttentionOp::getUseExp2AttrStr(),
           forwardBuilder.getBoolAttr(false))});
+  DictionaryAttr backwardDecompositionConfig = decompositionConfig;
+  if (match.mask) {
+    // `match.mask` is present only after the exact lower-triangular StableHLO
+    // matcher above has proved row_iota >= column_iota. Do not use the local
+    // `mask`: padded unmasked encoder attention creates a key-validity mask
+    // later and is not causal.
+    NamedAttrList backwardConfig(decompositionConfig);
+    for (StringRef role :
+         {IREE::LinalgExt::AttentionBackwardOp::getDQAttrStr(),
+          IREE::LinalgExt::AttentionBackwardOp::getDKAttrStr(),
+          IREE::LinalgExt::AttentionBackwardOp::getDVAttrStr()}) {
+      backwardConfig.set(
+          role,
+          forwardBuilder.getDictionaryAttr({forwardBuilder.getNamedAttr(
+              "iree_codegen.apple_attention_backward_causal",
+              forwardBuilder.getUnitAttr())}));
+    }
+    backwardDecompositionConfig =
+        backwardConfig.getDictionary(forwardBuilder.getContext());
+  }
   SmallVector<Type> forwardResultTypes = {outputType, logsumexpType};
   auto attention = IREE::LinalgExt::AttentionOp::create(
       forwardBuilder, loc, forwardResultTypes, query, key, value, scale, mask,
@@ -1298,7 +1318,8 @@ static void rewritePairedAttention(PairedAttentionMatch match) {
       attentionOutput, outputGrad, attentionLogsumexp, scale, mask,
       queryGradInit,
       keyGradInit, valueGradInit,
-      backwardBuilder.getAffineMapArrayAttr(backwardMaps), decompositionConfig);
+      backwardBuilder.getAffineMapArrayAttr(backwardMaps),
+      backwardDecompositionConfig);
 
   // Mutate only the externally visible leaves, and only after both operations
   // have been constructed. Replace the forward result last.
