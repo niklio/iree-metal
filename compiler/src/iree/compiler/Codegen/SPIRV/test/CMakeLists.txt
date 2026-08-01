@@ -27,6 +27,7 @@ iree_lit_test_suite(
     "config_apple_attention_backward_compact_contract_invalid.mlir"
     "config_apple_attention_backward_materialized.mlir"
     "config_apple_attention_isolation.mlir"
+    "config_apple_scatter.mlir"
     "config_default_conv.mlir"
     "config_default_linalg_ext_ops.mlir"
     "config_default_linalg_ops.mlir"

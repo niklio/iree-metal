@@ -37,6 +37,9 @@
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 
+#include <cstdlib>
+#include <cstring>
+
 #define DEBUG_TYPE "iree-spirv-kernel-config"
 
 using llvm::divideCeil;
@@ -1439,6 +1442,7 @@ static LogicalResult setFftOpConfig(IREE::GPU::TargetAttr target,
 // cross-thread race (no atomics needed). Restores parallelism.
 static LogicalResult setScatterOpConfig(IREE::GPU::TargetAttr target,
                                         IREE::LinalgExt::ScatterOp op) {
+  op->removeAttr("iree_codegen.apple_scatter_window_workgroups");
   int subgroupSize = target.getPreferredSubgroupSize();
   auto pipeline = CodeGenPipeline::SPIRVBaseDistribute;
   std::array<int64_t, 3> workgroupSize = {subgroupSize, 1, 1};
@@ -1453,6 +1457,17 @@ static LogicalResult setScatterOpConfig(IREE::GPU::TargetAttr target,
   // ScatterOp::generateScalarImplementation), duplicate indices are safe, so the batch IS parallel:
   // tile those reduction dims into a workgroup grid too.
   bool atomicParallel = getenv("IREE_METAL_SCATTER_ATOMIC") != nullptr;
+  const char *windowWorkgroupsFlag =
+      getenv("IREE_METAL_SCATTER_WINDOW_WORKGROUPS");
+  bool windowWorkgroups =
+      windowWorkgroupsFlag && strcmp(windowWorkgroupsFlag, "1") == 0;
+  if (windowWorkgroups && atomicParallel) {
+    op.emitWarning(
+        "IREE_METAL_SCATTER_WINDOW_WORKGROUPS=1 conflicts with "
+        "IREE_METAL_SCATTER_ATOMIC; disabling both scatter experiments");
+    windowWorkgroups = false;
+    atomicParallel = false;
+  }
   for (auto [i, it] : llvm::enumerate(its)) {
     if (it == utils::IteratorType::parallel) {
       wgTile[i] = 1;
@@ -1472,9 +1487,16 @@ static LogicalResult setScatterOpConfig(IREE::GPU::TargetAttr target,
   wgTile[lastParallel] = subgroupSize;
   threadTile[lastParallel] = 1;
   TileSizesListType tileSizes = {wgTile, threadTile};
-  return setOpConfigAndEntryPointFnTranslation(
-      op->getParentOfType<mlir::FunctionOpInterface>(), op, tileSizes, pipeline,
-      workgroupSize);
+  if (failed(setOpConfigAndEntryPointFnTranslation(
+          op->getParentOfType<mlir::FunctionOpInterface>(), op, tileSizes,
+          pipeline, workgroupSize))) {
+    return failure();
+  }
+  if (windowWorkgroups && target.isApple() && !op.getUniqueIndices()) {
+    op->setAttr("iree_codegen.apple_scatter_window_workgroups",
+                UnitAttr::get(op.getContext()));
+  }
+  return success();
 }
 
 //===----------------------------------------------------------------------===//

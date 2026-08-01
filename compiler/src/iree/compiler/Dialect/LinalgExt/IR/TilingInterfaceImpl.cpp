@@ -4,6 +4,9 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+#include <cstdlib>
+#include <cstring>
+
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtInterfaces.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/IndexingUtils.h"
@@ -304,7 +307,14 @@ LogicalResult ScatterOp::generateScalarImplementation(OpBuilder &b,
   // atomic, so the update dim becomes parallel and the config distributes it across the GPU. (Metal
   // supports atomic float add; spirv-cross emits OpAtomicFAddEXT.) Falls through to the store below
   // for any non-add combiner.
-  if (getenv("IREE_METAL_SCATTER_ATOMIC")) {
+  const char *scatterAtomicFlag = getenv("IREE_METAL_SCATTER_ATOMIC");
+  const char *scatterWindowWorkgroupsFlag =
+      getenv("IREE_METAL_SCATTER_WINDOW_WORKGROUPS");
+  bool enableScatterAtomic =
+      scatterAtomicFlag &&
+      !(scatterWindowWorkgroupsFlag &&
+        strcmp(scatterWindowWorkgroupsFlag, "1") == 0);
+  if (enableScatterAtomic) {
     Block &blk = getRegion().front();
     auto *term = blk.getTerminator();
     auto addf = term->getOperand(0).getDefiningOp<arith::AddFOp>();

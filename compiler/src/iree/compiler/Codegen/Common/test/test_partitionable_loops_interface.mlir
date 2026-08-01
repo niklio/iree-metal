@@ -281,3 +281,48 @@ func.func @attention_with_scalar_logsumexp(
 }
 // CHECK-LABEL: func.func @attention_with_scalar_logsumexp(
 //       CHECK:   util.unfoldable_constant dense<> : tensor<0xi32>
+
+// -----
+
+// A non-unique scatter models its update batch as reductions. Its trailing
+// update-window dimension is nevertheless collision-free because each loop
+// iteration addresses a distinct output column.
+func.func @nonunique_scatter_trailing_window(
+    %updates: tensor<8x512x768xbf16>,
+    %indices: tensor<8x512x1xi32>) -> tensor<50257x768xbf16> {
+  %init = tensor.empty() : tensor<50257x768xbf16>
+  %result = iree_linalg_ext.scatter {__test_interface__ = true}
+      dimension_map = [0] unique_indices(false)
+      ins(%updates, %indices :
+          tensor<8x512x768xbf16>, tensor<8x512x1xi32>)
+      outs(%init : tensor<50257x768xbf16>) {
+    ^bb0(%update: bf16, %current: bf16):
+      %sum = arith.addf %current, %update : bf16
+      iree_linalg_ext.yield %sum : bf16
+  } -> tensor<50257x768xbf16>
+  return %result : tensor<50257x768xbf16>
+}
+// CHECK-LABEL: func.func @nonunique_scatter_trailing_window(
+//       CHECK:   util.unfoldable_constant dense<> : tensor<0xi32>
+
+// -----
+
+func.func @marked_nonunique_scatter_trailing_window(
+    %updates: tensor<8x512x768xbf16>,
+    %indices: tensor<8x512x1xi32>) -> tensor<50257x768xbf16> {
+  %init = tensor.empty() : tensor<50257x768xbf16>
+  %result = iree_linalg_ext.scatter {
+      __test_interface__ = true,
+      iree_codegen.apple_scatter_window_workgroups}
+      dimension_map = [0] unique_indices(false)
+      ins(%updates, %indices :
+          tensor<8x512x768xbf16>, tensor<8x512x1xi32>)
+      outs(%init : tensor<50257x768xbf16>) {
+    ^bb0(%update: bf16, %current: bf16):
+      %sum = arith.addf %current, %update : bf16
+      iree_linalg_ext.yield %sum : bf16
+  } -> tensor<50257x768xbf16>
+  return %result : tensor<50257x768xbf16>
+}
+// CHECK-LABEL: func.func @marked_nonunique_scatter_trailing_window(
+//       CHECK:   util.unfoldable_constant dense<2> : tensor<1xi32>

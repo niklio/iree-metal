@@ -15,6 +15,7 @@
 #include "llvm/ADT/SmallVectorExtras.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 
 // clang-format off
@@ -226,6 +227,47 @@ struct AllParallelAsPartitionableLoops
   }
 };
 
+/// External model implementation for scatter operations.
+///
+/// Non-unique scatters model their leading update dimensions as reductions, so
+/// the generic outer-parallel policy hides trailing update-window dimensions
+/// from workgroup distribution. Those trailing dimensions address disjoint
+/// output slices and are safe to partition even when scattered indices collide.
+/// The Apple SPIR-V scatter configuration persists a marker only after choosing
+/// the matching workgroup and invocation tile scheme.
+struct ScatterOpPartitionableLoops
+    : PartitionableLoopsInterface::ExternalModel<
+          ScatterOpPartitionableLoops, IREE::LinalgExt::ScatterOp> {
+  llvm::SmallVector<unsigned>
+  getPartitionableLoops(Operation *op,
+                        std::optional<unsigned> maxNumPartitionedLoops) const {
+    auto scatterOp = cast<IREE::LinalgExt::ScatterOp>(op);
+    llvm::SmallVector<unsigned> partitionableLoops;
+    bool partitionTrailingParallelLoops =
+        op->hasAttrOfType<UnitAttr>(
+            "iree_codegen.apple_scatter_window_workgroups");
+    for (auto [index, iteratorType] :
+         llvm::enumerate(scatterOp.getLoopIteratorTypes())) {
+      if (iteratorType == utils::IteratorType::parallel) {
+        partitionableLoops.push_back(index);
+        continue;
+      }
+      if (!partitionTrailingParallelLoops) {
+        break;
+      }
+    }
+    if (maxNumPartitionedLoops.has_value() &&
+        partitionableLoops.size() > maxNumPartitionedLoops.value()) {
+      partitionableLoops.erase(
+          partitionableLoops.begin(),
+          std::next(partitionableLoops.begin(),
+                    partitionableLoops.size() -
+                        maxNumPartitionedLoops.value()));
+    }
+    return partitionableLoops;
+  }
+};
+
 /// Attention with an LSE result can only be partitioned along dimensions shared
 /// by both outputs. In particular, partitioning the value/output N dimension
 /// would make every N tile write the same complete batch/M LSE slice.
@@ -316,8 +358,8 @@ void registerPartitionableLoopsInterfaceModels(DialectRegistry &registry) {
     IREE::LinalgExt::FftOp::attachInterface<FftOpPartitionableLoops>(*ctx);
     IREE::LinalgExt::ScanOp::attachInterface<
         AllParallelAsPartitionableLoops<IREE::LinalgExt::ScanOp>>(*ctx);
-    IREE::LinalgExt::ScatterOp::attachInterface<
-        OuterParallelAsPartitionableLoops<IREE::LinalgExt::ScatterOp>>(*ctx);
+    IREE::LinalgExt::ScatterOp::attachInterface<ScatterOpPartitionableLoops>(
+        *ctx);
     IREE::LinalgExt::GatherOp::attachInterface<
         AllParallelAsPartitionableLoops<IREE::LinalgExt::GatherOp>>(*ctx);
     IREE::LinalgExt::SortOp::attachInterface<

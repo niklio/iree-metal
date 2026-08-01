@@ -10,6 +10,7 @@
 #include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
@@ -66,8 +67,54 @@ getSPIRVTileSizeComputeFn(mlir::FunctionOpInterface funcOp, int tilingLevel) {
   if (failed(tileSizes)) {
     return failure();
   }
+
+  // iree-metal (IREE_METAL_SCATTER_WINDOW_WORKGROUPS): non-unique scatters
+  // keep their leading update loops serial, but their trailing update-window
+  // loops can be safely distributed because they address disjoint output
+  // slices. When such a scatter is initialized by a fused fill, tile only that
+  // fill's innermost loop to one element per invocation. Applying the scatter's
+  // thread tile sizes to every producer instead would also distribute index
+  // normalization across reduction dimensions without a synchronization
+  // barrier.
+  SmallVector<Operation *> laneTiledScatterFills;
+  if (tilingLevel == 1) {
+    SmallVector<Operation *> computeOps = getComputeOps(funcOp);
+    FailureOr<Operation *> configOp =
+        getLoweringConfigCarryingOp<IREE::Codegen::LoweringConfigAttr>(
+            computeOps);
+    if (succeeded(configOp)) {
+      auto scatterOp = dyn_cast<IREE::LinalgExt::ScatterOp>(*configOp);
+      if (scatterOp && !scatterOp.getUniqueIndices() &&
+          scatterOp->hasAttrOfType<UnitAttr>(
+              "iree_codegen.apple_scatter_window_workgroups")) {
+        if (auto fillOp =
+                scatterOp.getOriginal().getDefiningOp<linalg::FillOp>()) {
+          laneTiledScatterFills.push_back(fillOp);
+        }
+        for (Operation *candidate : computeOps) {
+          auto fillOp = dyn_cast<linalg::FillOp>(candidate);
+          if (fillOp &&
+              fillOp.getOutputs().front() == scatterOp.getOriginal()) {
+            laneTiledScatterFills.push_back(fillOp);
+          }
+        }
+      }
+    }
+  }
   linalg::TileSizeComputationFunction computeFn =
-      [tileSizes](OpBuilder &builder, Operation *op) {
+      [tileSizes, laneTiledScatterFills](OpBuilder &builder, Operation *op) {
+        if (llvm::is_contained(laneTiledScatterFills, op)) {
+          int64_t numLoops =
+              cast<TilingInterface>(op).getLoopIteratorTypes().size();
+          SmallVector<Value> fillTileSizes;
+          fillTileSizes.reserve(numLoops);
+          for (int64_t i = 0; i < numLoops; ++i) {
+            int64_t size = i == numLoops - 1 ? 1 : 0;
+            fillTileSizes.push_back(arith::ConstantIndexOp::create(
+                builder, op->getLoc(), size));
+          }
+          return fillTileSizes;
+        }
         auto range = llvm::map_range(*tileSizes, [&](int64_t size) -> Value {
           return arith::ConstantIndexOp::create(builder, op->getLoc(), size);
         });

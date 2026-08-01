@@ -30,6 +30,7 @@ iree_lit_test_suite(
     "fold_unit_dims.mlir"
     "pad_contraction_to_block_size.mlir"
     "reshape_fusion.mlir"
+    "scatter_atomic_env.mlir"
     "split_reduction.mlir"
     "tiling.mlir"
   TOOLS

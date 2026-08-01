@@ -66,3 +66,76 @@ hal.executable private @static_scatter_update_slice  {
 //  CHECK-SAME:         unique_indices(true)
 //  CHECK-SAME:         ins(%[[T_UPDATE]], %[[T_INDEX]]
 //  CHECK-SAME:         outs(%[[T_TARGET]]
+
+// -----
+
+#config = #iree_codegen.lowering_config<tile_sizes = [[0, 0, 32], [0, 0, 1]]>
+#translation = #iree_codegen.translation_info<pipeline = SPIRVBaseDistribute>
+#pipeline_layout = #hal.pipeline.layout<bindings = [
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>
+]>
+
+// This is the buffer-form body of one workgroup after the trailing 32-column
+// scatter slice has been formed. The fill and non-unique scatter intentionally
+// share the same output memref.
+hal.executable private @nonunique_scatter_window_fill {
+  hal.executable.variant @metal_spirv_fb target(<"metal-spirv", "metal-msl-fb">) {
+    hal.executable.export public @nonunique_scatter_window_fill
+        layout(#pipeline_layout) attributes {
+      translation_info = #translation,
+      workgroup_size = [32 : index, 1 : index, 1 : index]
+    }
+    builtin.module {
+      func.func @nonunique_scatter_window_fill() {
+        %updates = hal.interface.binding.subspan
+            layout(#pipeline_layout) binding(0) :
+            memref<8x512x32xbf16>
+        %indices = hal.interface.binding.subspan
+            layout(#pipeline_layout) binding(1) :
+            memref<8x512x1xi32>
+        %output = hal.interface.binding.subspan
+            layout(#pipeline_layout) binding(2) :
+            memref<50257x32xbf16>
+        %zero = arith.constant 0.000000e+00 : bf16
+        linalg.fill ins(%zero : bf16)
+            outs(%output : memref<50257x32xbf16>)
+        iree_linalg_ext.scatter {
+            iree_codegen.apple_scatter_window_workgroups,
+            lowering_config = #config}
+            dimension_map = [0] unique_indices(false)
+            ins(%updates, %indices :
+                memref<8x512x32xbf16>, memref<8x512x1xi32>)
+            outs(%output : memref<50257x32xbf16>) {
+          ^bb0(%update: bf16, %current: bf16):
+            %sum = arith.addf %current, %update : bf16
+            iree_linalg_ext.yield %sum : bf16
+        }
+        return
+      }
+    }
+  }
+}
+
+// CHECK-LABEL: func.func @nonunique_scatter_window_fill()
+//   CHECK-DAG: %[[UPDATES:.+]] = hal.interface.binding.subspan
+//   CHECK-DAG: %[[INDICES:.+]] = hal.interface.binding.subspan
+//   CHECK-DAG: %[[OUTPUT:.+]] = hal.interface.binding.subspan
+//       CHECK: %[[FILL_TID:.+]] = gpu.thread_id x
+//       CHECK: %[[FILL_DIM:.+]] = gpu.block_dim x
+//       CHECK: scf.for %[[FILL_IV:.+]] = %[[FILL_TID]] to %{{.+}} step %[[FILL_DIM]]
+//       CHECK:   %[[FILL_SLICE:.+]] = memref.subview %[[OUTPUT]][0, %[[FILL_IV]]] [50257, 1] [1, 1]
+//       CHECK:   linalg.fill
+//  CHECK-SAME:     outs(%[[FILL_SLICE]]
+//       CHECK: %[[SCATTER_TID:.+]] = gpu.thread_id x
+//       CHECK: %[[SCATTER_DIM:.+]] = gpu.block_dim x
+//       CHECK: scf.for %[[SCATTER_IV:.+]] = %[[SCATTER_TID]] to %{{.+}} step %[[SCATTER_DIM]]
+//       CHECK:   %[[UPDATE_SLICE:.+]] = memref.subview %[[UPDATES]][0, 0, %[[SCATTER_IV]]] [8, 512, 1] [1, 1, 1]
+//       CHECK:   %[[INDEX_FULL:.+]] = memref.cast %[[INDICES]]
+//       CHECK:   %[[OUTPUT_SLICE:.+]] = memref.subview %[[OUTPUT]][0, %[[SCATTER_IV]]] [50257, 1] [1, 1]
+//       CHECK:   iree_linalg_ext.scatter
+//  CHECK-SAME:       unique_indices(false)
+//  CHECK-SAME:       ins(%[[UPDATE_SLICE]], %[[INDEX_FULL]]
+//  CHECK-SAME:       outs(%[[OUTPUT_SLICE]]
+//   CHECK-NOT: memref.atomic_rmw
