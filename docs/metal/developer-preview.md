@@ -118,6 +118,12 @@ Release evidence is sanitized to remove credentials and private filesystem
 paths. Benchmark claims are valid only for the disclosed hardware, software,
 inputs, tolerances, synchronization, and aggregation method.
 
+Maintainers package a passing run with
+`build_tools/iree_metal/package_verifier_evidence.py`. The command rejects a
+candidate manifest with runtime overrides, wheel hashes that differ from the
+release wheelhouse, an incomplete or failing 166-case board, a corrupt evidence
+database, private filesystem paths, or common credential patterns.
+
 ## Known limitations
 
 - Dynamic shapes, multiple devices, distributed execution, and broad JAX test
