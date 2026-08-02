@@ -6,7 +6,7 @@ GPUs. Use it in a dedicated virtual environment and retain a CPU fallback.
 ## What is in this release
 
 - `iree_base_compiler_iree_metal-VERSION-cp312-abi3-macosx_*_arm64.whl`
-- `iree_pjrt_plugin_metal-VERSION-py3-none-macosx_*_arm64.whl`
+- `iree_pjrt_plugin_metal_iree_metal-VERSION-py3-none-macosx_*_arm64.whl`
 - `SHA256SUMS`
 - `iree-metal-preview-VERSION.manifest.txt`
 - `THIRD_PARTY_LICENSES.txt`

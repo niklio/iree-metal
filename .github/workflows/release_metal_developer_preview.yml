@@ -1,0 +1,127 @@
+name: Draft iree-metal developer preview release
+
+on:
+  push:
+    tags:
+      - "iree-metal-v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: iree-metal-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      IREE_METAL_PYTHON: python3
+      IREE_METAL_WHEELHOUSE: ${{ github.workspace }}/wheelhouse
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_MAXSIZE: 2G
+      CMAKE_BUILD_PARALLEL_LEVEL: 1
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Derive and validate version
+        run: |
+          version="${GITHUB_REF_NAME#iree-metal-v}"
+          python3 -c 'import re, sys; raise SystemExit(not re.fullmatch(r"3\\.11\\.0\\.dev[0-9]{8}", sys.argv[1]))' "${version}"
+          echo "IREE_METAL_VERSION=${version}" >> "${GITHUB_ENV}"
+
+      - name: Install build tools
+        run: |
+          brew install ccache
+          ccache --max-size "${CCACHE_MAXSIZE}"
+          python3 -m pip install --upgrade pip wheel ninja cmake packaging
+
+      - uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: ~/Library/Caches/ccache
+          key: iree-metal-release-ccache-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          restore-keys: |
+            iree-metal-release-ccache-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Verify immutable recursive source
+        run: |
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          test -z "$(git status --porcelain --untracked-files=no)"
+          ! git submodule status --recursive | grep -E '^[+-U]'
+
+      - name: Test packaged profile selection
+        env:
+          PYTHONPATH: integrations/pjrt/python_packages/iree_metal_plugin
+        run: python3 -m unittest discover -s integrations/pjrt/python_packages/iree_metal_plugin/tests -v
+
+      - name: Build release assets
+        run: |
+          ./build_tools/iree_metal/build_preview_wheels.sh
+          python3 build_tools/iree_metal/package_preview_release.py \
+            wheelhouse "${IREE_METAL_VERSION}"
+
+      - name: Attest release assets
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
+        with:
+          subject-path: |
+            wheelhouse/*.whl
+            wheelhouse/SHA256SUMS
+            wheelhouse/*.spdx.json
+            wheelhouse/iree-metal-preview-*-macos-arm64.tar.gz
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: iree-metal-release-${{ github.ref_name }}
+          path: wheelhouse
+          if-no-files-found: error
+          retention-days: 30
+
+  draft-release:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: iree-metal-release
+    permissions:
+      contents: write
+    steps:
+      - name: Download attested release assets
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: iree-metal-release-${{ github.ref_name }}
+          path: wheelhouse
+
+      - name: Create immutable draft prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#iree-metal-v}"
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --draft \
+            --prerelease \
+            --title "iree-metal ${version} — Developer Preview 1" \
+            --notes-file wheelhouse/RELEASE_NOTES.md \
+            wheelhouse/*.whl \
+            wheelhouse/SHA256SUMS \
+            wheelhouse/THIRD_PARTY_LICENSES.txt \
+            wheelhouse/INSTALL.md \
+            wheelhouse/RELEASE_NOTES.md \
+            wheelhouse/requirements-macos-arm64-py312.txt \
+            wheelhouse/*.manifest.txt \
+            wheelhouse/*.spdx.json \
+            wheelhouse/iree-metal-preview-*-macos-arm64.tar.gz \
+            wheelhouse/iree-metal-preview-*-macos-arm64.tar.gz.sha256

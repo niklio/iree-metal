@@ -16,22 +16,22 @@ regenerated after the performance campaign lands.
 - [x] Add a preview-specific issue template.
 - [x] Reject strong credential patterns, unexpected top-level wheel contents,
       and non-system dylib dependencies.
-- [ ] Check native debug/string tables for embedded build paths and make the
-      wheel build reproducible across two clean workspaces.
+- [x] Reject private build paths, normalize wheel archives, and suppress
+      nondeterministic Mach-O UUIDs.
 - [x] Generate a source license inventory beside release assets.
 - [x] Verify the fork marker and reject an environment containing stock IREE.
-- [ ] Test an offline install from only the documented release bundle.
-- [ ] Decide whether the first distribution is GitHub Releases only or also PyPI;
-      reserve package names before announcing them.
-- [ ] Draft release notes with an explicit feedback channel and deprecation policy.
+- [ ] Test an offline install from only the final GitHub release bundle.
+- [x] Select GitHub Releases only for the first preview and give both project
+      distributions fork-specific names.
+- [x] Draft release notes with an explicit feedback channel and deprecation policy.
 - [ ] Configure a sufficiently resourced macOS builder if the standard hosted
       runner cannot complete the compiler wheel within its RAM/disk limits.
 
 ## Must wait for the parity campaign's release candidate
 
 - [ ] Rebase this branch onto the selected, clean parity commit.
-- [ ] Ensure every modified submodule revision is committed and reachable from a
-      public remote; a superproject tag must never depend on a dirty submodule.
+- [x] Carry every third-party change as a checksummed source overlay and verify
+      its exact resulting Git tree from public upstream submodule bases.
 - [ ] Build from a fresh recursive clone, not the campaign checkout.
 - [ ] Run the full correctness board against the exact wheels being released.
 - [ ] Rerun baselines on the disclosed hardware and store hardware metadata.

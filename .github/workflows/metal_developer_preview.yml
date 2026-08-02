@@ -1,15 +1,19 @@
-name: Build iree-metal developer preview
+name: Validate iree-metal preview packaging
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: PEP 440 preview version (for example 3.11.0.dev20260801)
+        description: PEP 440 preview version (for example 3.11.0.dev20260802)
         required: true
         type: string
 
 permissions:
   contents: read
+
+concurrency:
+  group: metal-preview-candidate-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-and-validate:
@@ -22,12 +26,13 @@ jobs:
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
       CCACHE_MAXSIZE: 2G
+      CMAKE_BUILD_PARALLEL_LEVEL: 1
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           submodules: recursive
 
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
           cache: pip
@@ -36,7 +41,7 @@ jobs:
         run: |
           brew install ccache
           ccache --max-size "${CCACHE_MAXSIZE}"
-          python3 -m pip install --upgrade pip build wheel ninja cmake
+          python3 -m pip install --upgrade pip wheel ninja cmake packaging
 
       - uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
         with:
@@ -45,17 +50,28 @@ jobs:
           restore-keys: |
             iree-metal-ccache-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Build wheels and provenance
+      - name: Verify clean recursive source
+        run: |
+          test -z "$(git status --porcelain --untracked-files=no)"
+          ! git submodule status --recursive | grep -E '^[+-U]'
+
+      - name: Test packaged profile selection
+        env:
+          PYTHONPATH: integrations/pjrt/python_packages/iree_metal_plugin
+        run: python3 -m unittest discover -s integrations/pjrt/python_packages/iree_metal_plugin/tests -v
+
+      - name: Build wheels, dependency lock, provenance, and SBOM
         run: ./build_tools/iree_metal/build_preview_wheels.sh
 
+      - name: Assemble offline bundle
+        run: |
+          python3 build_tools/iree_metal/package_preview_release.py \
+            wheelhouse "${IREE_METAL_VERSION}"
+
       - name: Upload candidate bundle
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: iree-metal-preview-${{ inputs.version }}-macos-arm64
-          path: |
-            wheelhouse/*.whl
-            wheelhouse/SHA256SUMS
-            wheelhouse/*.manifest.txt
-            wheelhouse/THIRD_PARTY_LICENSES.txt
+          path: wheelhouse
           if-no-files-found: error
           retention-days: 14

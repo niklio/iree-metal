@@ -1,14 +1,8 @@
 blank_issues_enabled: true
 contact_links:
   - name: 📄 Blank Issue
-    url: https://github.com/iree-org/iree/issues/new
-    about: If you know what you're doing (especially collaborators)
-  - name: 📧 Send an email to our mailing list
-    url: https://lists.lfaidata.foundation/g/iree-technical-discussion
-    about: For asynchronous discussion
-  - name: 🗣 Start a discussion on GitHub
-    url: https://github.com/iree-org/iree/discussions
-    about: An alternative platform for asynchronous discussion
-  - name: 💬 Join us on Discord
-    url: https://discord.gg/wEWh6Z9nMU
-    about: For realtime communication with the team and collaborators
+    url: https://github.com/niklio/iree-metal/issues/new
+    about: Open a fork-specific issue that does not fit a template
+  - name: Upstream IREE
+    url: https://github.com/iree-org/iree/issues
+    about: Report issues reproduced with an unmodified upstream IREE build

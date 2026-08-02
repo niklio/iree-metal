@@ -1,20 +1,45 @@
-# How to contribute
+# Contributing to iree-metal
 
-We'd love to accept your patches and contributions to this project.
+Thanks for helping improve the open Apple-GPU path for JAX. By participating,
+you agree to follow the [code of conduct](CODE_OF_CONDUCT.md) and to certify
+your commits under the Developer Certificate of Origin using `git commit -s`.
 
-To get started with contributing, please take a look at the
-[Contributing](https://iree.dev/developers/general/contributing/) guide.
+## Before opening a change
 
-## Getting in touch
+Use a GitHub issue for substantial compiler behavior, public API, packaging, or
+support-envelope changes. Small fixes can go directly to a pull request. For a
+bug, start from the iree-metal preview issue template and reduce it to the
+smallest JAX program that still reproduces the problem.
 
-*   [GitHub issues](https://github.com/iree-org/iree/issues): Feature requests,
-    bugs, and other work tracking
-*   [IREE Discord server](https://discord.gg/wEWh6Z9nMU): Daily development
-    discussions with the core team and collaborators
-*   [iree-technical-discussion email list](https://lists.lfaidata.foundation/g/iree-technical-discussion):
-    General and low-priority discussion
+Never include private model weights, credentials, personal paths, or customer
+data in issues, traces, compiler dumps, or verifier evidence.
 
-## Community guidelines
+## Development workflow
 
-This project follows the
-[LF Projects code of conduct](https://lfprojects.org/policies/code-of-conduct/).
+1. Recursively clone your fork and create a topic branch.
+2. Keep changes scoped to one compiler/runtime concern when possible.
+3. Add focused IR tests for compiler transformations and a JAX reproducer for
+   user-visible behavior.
+4. Run the affected IREE test targets plus the wheel structural validator.
+5. For Metal runtime or performance work, test on physical Apple silicon and
+   report correctness separately from timing.
+
+Release wheels are never built from unrecorded source. Changes to LLVM,
+SPIRV-Cross, or StableHLO must regenerate the corresponding patch and locked
+tree/checksum in `submodule-patches/`; both are reviewed in the same pull
+request.
+
+## Benchmark reports
+
+Disclose hardware, macOS/Xcode versions, power mode, model and revision,
+shapes, dtype, forward/backward direction, warmups, timed iterations,
+synchronization, statistic, baseline versions, tolerances, failures, and all
+compiler profile changes. A compile or timing result without an output check is
+not accepted as correctness evidence.
+
+## Upstream-first changes
+
+This repository is based on IREE. If a fix is backend-independent or useful to
+the wider IREE community, maintainers may ask that it be proposed to upstream
+IREE first or in parallel. Do not represent a fork pull request as an upstream
+IREE review.
