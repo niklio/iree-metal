@@ -1688,6 +1688,14 @@ static LogicalResult setReductionConfig(IREE::GPU::TargetAttr target,
     return failure();
   }
 
+  // The SPIR-V subgroup pipeline only lowers rank-1 vector transfers. Tiling
+  // multiple reduction dimensions produces rank-N transfers and also makes a
+  // propagated reduction tile correspond to a parallel dimension in fused row
+  // reductions. Use the general pipeline for these dispatches.
+  if (reductionDims.size() > 1) {
+    return failure();
+  }
+
   // Make sure reduction dimensions are static and innermost ones.
   int64_t numDynamicReductionDims = 0;
   for (unsigned dim : reductionDims) {
@@ -1799,7 +1807,7 @@ static LogicalResult setReductionConfig(IREE::GPU::TargetAttr target,
       return failure();
     }
     SmallVector<int64_t> reductionTileSizes(op.getNumLoops(), 0);
-    reductionTileSizes[reductionDims[0]] = subgroupSize;
+    reductionTileSizes[reductionDims.back()] = subgroupSize;
     TileSizesListType tileSizes;
     tileSizes.emplace_back(std::move(workgroupTileSizes)); // Workgroup level
     tileSizes.emplace_back(std::move(reductionTileSizes)); // Reduction level

@@ -406,3 +406,54 @@ func.func @broadcast_vjp_reduce_b577(%input: tensor<577x128xf32>) -> tensor<128x
 // CHECK-SAME:     translation_info = #[[SUBGROUP_TRANSLATION]]
 //      CHECK:   linalg.generic
 // CHECK-SAME:       lowering_config = #[[SUBGROUP_CONFIG]]
+
+// -----
+
+// A multi-dimensional root reduction can share its innermost reduction
+// dimension with fused row reductions. The subgroup pipeline cannot lower the
+// resulting rank-2 vectors, so use the general pipeline.
+#executable_target_vulkan_spirv_fb = #hal.executable.target<"vulkan-spirv", "vulkan-spirv-fb", {
+  iree_codegen.target_info = #iree_gpu.target<arch = "", features = "spirv:v1.6,cap:Shader", wgp = <
+    compute = fp32|int32, storage = b32, subgroup = shuffle,
+    subgroup_size_choices = [32], max_workgroup_sizes = [512, 512, 512],
+    max_thread_count_per_workgroup = 512, max_workgroup_memory_bytes = 16384,
+    max_workgroup_counts = [65535, 65535, 65535]>>
+}>
+
+func.func @multidim_reduction_chain(%input: tensor<3x32xf32>) -> tensor<f32>
+    attributes {hal.executable.target = #executable_target_vulkan_spirv_fb} {
+  %zero = arith.constant 0.000000e+00 : f32
+  %row_empty = tensor.empty() : tensor<3xf32>
+  %row_init = linalg.fill ins(%zero : f32) outs(%row_empty : tensor<3xf32>) -> tensor<3xf32>
+  %row = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>,
+                       affine_map<(d0, d1) -> (d0)>],
+      iterator_types = ["parallel", "reduction"]}
+      ins(%input : tensor<3x32xf32>) outs(%row_init : tensor<3xf32>) {
+  ^bb0(%in: f32, %acc: f32):
+    %sum = arith.addf %acc, %in : f32
+    linalg.yield %sum : f32
+  } -> tensor<3xf32>
+  %scalar_empty = tensor.empty() : tensor<f32>
+  %scalar_init = linalg.fill ins(%zero : f32) outs(%scalar_empty : tensor<f32>) -> tensor<f32>
+  %total = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>,
+                       affine_map<(d0, d1) -> (d0)>,
+                       affine_map<(d0, d1) -> ()>],
+      iterator_types = ["reduction", "reduction"]}
+      ins(%input, %row : tensor<3x32xf32>, tensor<3xf32>)
+      outs(%scalar_init : tensor<f32>) {
+  ^bb0(%in: f32, %row_value: f32, %acc: f32):
+    %value = arith.addf %in, %row_value : f32
+    %sum = arith.addf %acc, %value : f32
+    linalg.yield %sum : f32
+  } -> tensor<f32>
+  return %total : tensor<f32>
+}
+
+//  CHECK-DAG: #[[CHAIN_CONFIG:.+]] = #iree_codegen.lowering_config<tile_sizes = []>
+//  CHECK-DAG: #[[CHAIN_TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = SPIRVBaseDistribute workgroup_size = [1, 1, 1]>
+//      CHECK: func.func @multidim_reduction_chain(
+// CHECK-SAME:     translation_info = #[[CHAIN_TRANSLATION]]
+//      CHECK:   linalg.generic {{.*}} iterator_types = ["reduction", "reduction"]
+// CHECK-SAME:       lowering_config = #[[CHAIN_CONFIG]]
