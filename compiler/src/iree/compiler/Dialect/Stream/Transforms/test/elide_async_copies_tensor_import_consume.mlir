@@ -266,3 +266,25 @@ util.func public @mixed_consume_no_consume(%arg0: !util.buffer, %arg1: !util.buf
   // CHECK: util.return %[[FILL0]], %[[FILL1]], %[[IMPORT1]]
   util.return %fill0, %fill1, %import1 : !stream.resource<external>, !stream.resource<external>, !stream.resource<external>
 }
+
+// -----
+
+// A non-consuming import remains borrowed even when the imported SSA value has
+// no uses after the clone. The clone protects caller-owned storage from the
+// tied fill mutation and must not be elided by one-use reasoning.
+
+// CHECK-LABEL: @borrowed_import_single_use_preserves_mutating_clone
+// CHECK-SAME: (%[[BUFFER:[^:]+]]: !util.buffer)
+util.func public @borrowed_import_single_use_preserves_mutating_clone(%arg0: !util.buffer) -> !stream.resource<external> {
+  %c0 = arith.constant 0 : index
+  %c100 = arith.constant 100 : index
+  %c123_i32 = arith.constant 123 : i32
+  // CHECK: %[[IMPORT:.+]] = stream.tensor.import %[[BUFFER]]
+  %import = stream.tensor.import %arg0 : !util.buffer -> tensor<f32> in !stream.resource<external>{%c100}
+  // CHECK: %[[CLONE:.+]] = stream.async.clone %[[IMPORT]]
+  %clone = stream.async.clone %import : !stream.resource<external>{%c100} -> !stream.resource<external>{%c100}
+  // CHECK: %[[FILL:.+]] = stream.async.fill %c123_i32, %[[CLONE]]
+  %fill = stream.async.fill %c123_i32, %clone[%c0 to %c100 for %c100] : i32 -> %clone as !stream.resource<external>{%c100}
+  // CHECK: util.return %[[FILL]]
+  util.return %fill : !stream.resource<external>
+}

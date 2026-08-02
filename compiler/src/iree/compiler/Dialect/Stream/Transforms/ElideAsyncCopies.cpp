@@ -714,6 +714,15 @@ public:
     return mutationSemantics.isAssumedNotMutated();
   }
 
+  // Returns true if |value| may alias storage imported without consuming it.
+  // Such storage is caller-owned even when this SSA value is its last local
+  // use, so eliding a protective copy is only valid when the copy result is
+  // read-only.
+  bool containsBorrowedStorage(Value value) {
+    llvm::SmallPtrSet<Value, 8> visited;
+    return containsBorrowedStorage(value, visited);
+  }
+
   // Attempts to infer the affinity of |value| by walking up its defining ops
   // and checking for explicit affinity annotations or default affinities.
   // Returns nullptr if no affinity can be determined.
@@ -770,6 +779,55 @@ public:
   }
 
 private:
+  bool containsBorrowedStorage(Value value,
+                               llvm::SmallPtrSetImpl<Value> &visited) {
+    if (!visited.insert(value).second) {
+      return true;
+    }
+
+    bool foundBorrowedStorage = false;
+    auto traversalResult = explorer.walkDefiningOps(
+        value,
+        [&](OpResult result) {
+          Operation *op = result.getOwner();
+
+          // A non-consuming import borrows externally-owned storage. A
+          // consuming import transfers ownership to the stream program.
+          if (auto importOp = dyn_cast<IREE::Stream::TensorImportOp>(op)) {
+            foundBorrowedStorage = !importOp.getConsume();
+            return WalkResult::interrupt();
+          }
+
+          // Same-lifetime transfers are usage/affinity refinements and may be
+          // elided later, so preserve the source storage ownership. A
+          // lifetime-changing transfer materializes storage with distinct
+          // ownership semantics and stops the borrowed-storage chain.
+          if (auto transferOp = dyn_cast<IREE::Stream::AsyncTransferOp>(op)) {
+            auto sourceType = cast<IREE::Stream::ResourceType>(
+                transferOp.getSource().getType());
+            auto resultType =
+                cast<IREE::Stream::ResourceType>(result.getType());
+            if (sourceType.getLifetime() == resultType.getLifetime()) {
+              foundBorrowedStorage =
+                  containsBorrowedStorage(transferOp.getSource(), visited);
+            }
+            return foundBorrowedStorage ? WalkResult::interrupt()
+                                        : WalkResult::skip();
+          }
+
+          // Clones produce independent storage. If this clone remains, uses of
+          // its result do not mutate the original borrowed storage.
+          if (isa<IREE::Stream::AsyncCloneOp>(op)) {
+            return WalkResult::skip();
+          }
+
+          return WalkResult::advance();
+        },
+        TraversalBehavior::DEFAULT);
+    return foundBorrowedStorage ||
+           traversalResult == TraversalResult::INCOMPLETE;
+  }
+
   Explorer explorer;
   llvm::BumpPtrAllocator allocator;
   DFX::Solver solver;
@@ -779,6 +837,95 @@ private:
 //===----------------------------------------------------------------------===//
 // IREE::Stream::AsyncCloneOp elision
 //===----------------------------------------------------------------------===//
+
+// Returns true when |cloneOp| is one arm of a fanout used only to export the
+// same immutable result more than once. Stream tensor exports retain their
+// resource and do not mutate it, so each exported buffer view may safely alias
+// the same storage. Keeping one clone per duplicate export otherwise forces an
+// extra external allocation, copy, and command submission.
+static bool isReadOnlyExportCloneFanout(IREE::Stream::AsyncCloneOp cloneOp) {
+  Value source = cloneOp.getSource();
+  unsigned exportCount = 0;
+  for (Operation *sourceUser : source.getUsers()) {
+    if (isa<IREE::Stream::TensorExportOp>(sourceUser)) {
+      ++exportCount;
+      continue;
+    }
+    auto siblingClone = dyn_cast<IREE::Stream::AsyncCloneOp>(sourceUser);
+    if (!siblingClone || siblingClone.getSource() != source ||
+        siblingClone.getResult().use_empty()) {
+      return false;
+    }
+    if (!llvm::all_of(siblingClone.getResult().getUsers(),
+                      llvm::IsaPred<IREE::Stream::TensorExportOp>)) {
+      return false;
+    }
+    exportCount += siblingClone.getResult().getNumUses();
+  }
+  return exportCount >= 2;
+}
+
+// Retargets exports of an immutable constant directly to the constant storage.
+// Tensor exports retain and only read their source, so materializing a distinct
+// external-lifetime allocation is unnecessary.
+static bool
+tryElideReadOnlyConstantExportClone(IREE::Stream::AsyncCloneOp cloneOp) {
+  auto sourceType =
+      cast<IREE::Stream::ResourceType>(cloneOp.getSource().getType());
+  auto resultType =
+      cast<IREE::Stream::ResourceType>(cloneOp.getResult().getType());
+  if (sourceType.getLifetime() != IREE::Stream::Lifetime::Constant ||
+      resultType.getLifetime() != IREE::Stream::Lifetime::External ||
+      cloneOp.getResult().use_empty() ||
+      !llvm::all_of(cloneOp.getResult().getUsers(),
+                    llvm::IsaPred<IREE::Stream::TensorExportOp>)) {
+    return false;
+  }
+  SmallVector<IREE::Stream::TensorExportOp> exportOps;
+  for (Operation *user : cloneOp.getResult().getUsers()) {
+    exportOps.push_back(cast<IREE::Stream::TensorExportOp>(user));
+  }
+  for (IREE::Stream::TensorExportOp exportOp : exportOps) {
+    exportOp.getSourceMutable().set(cloneOp.getSource());
+  }
+  cloneOp.erase();
+  return true;
+}
+
+// Returns true when every resource use in a constant clone's tied chain is a
+// barrier, another clone, or a terminal tensor export, and at least one path
+// reaches an export. Such a chain cannot mutate the constant storage.
+static bool hasOnlyReadOnlyConstantExportUses(Value value, bool &sawExport) {
+  for (Operation *user : value.getUsers()) {
+    if (isa<IREE::Stream::TensorExportOp>(user)) {
+      sawExport = true;
+      continue;
+    }
+    if (auto barrierOp = dyn_cast<IREE::Stream::TimepointBarrierOp>(user)) {
+      if (barrierOp.getResource() != value ||
+          !hasOnlyReadOnlyConstantExportUses(barrierOp.getResult(),
+                                             sawExport)) {
+        return false;
+      }
+      continue;
+    }
+    if (auto nestedClone = dyn_cast<IREE::Stream::AsyncCloneOp>(user)) {
+      if (nestedClone.getSource() != value ||
+          !hasOnlyReadOnlyConstantExportUses(nestedClone.getResult(),
+                                             sawExport)) {
+        return false;
+      }
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+static bool hasOnlyReadOnlyConstantExportUses(Value value) {
+  bool sawExport = false;
+  return hasOnlyReadOnlyConstantExportUses(value, sawExport) && sawExport;
+}
 
 // Returns true if the given |operand| value does not need a copy on write.
 // This is a conservative check and will return false ("not safe to elide") in
@@ -823,12 +970,26 @@ static bool isSafeToElideCloneOp(IREE::Stream::AsyncCloneOp cloneOp,
     return false;
   }
 
+  if (isReadOnlyExportCloneFanout(cloneOp)) {
+    LLVM_DEBUG(
+        llvm::dbgs()
+        << "  + clone is part of a read-only export fanout; can elide\n");
+    return true;
+  }
+
   // Constant-to-constant clones can be elided only if both source and result
   // are never mutated anywhere in the program (interprocedural analysis).
   // Constants are immutable after initialization, but during initialization
   // they may be mutated.
   if (sourceType.getLifetime() == IREE::Stream::Lifetime::Constant &&
       targetType.getLifetime() == IREE::Stream::Lifetime::Constant) {
+
+    if (hasOnlyReadOnlyConstantExportUses(cloneOp.getResult())) {
+      LLVM_DEBUG(llvm::dbgs()
+                 << "  + constant clone only feeds read-only exports; can "
+                    "elide\n");
+      return true;
+    }
 
     // Check if source constant is ever mutated anywhere (whole program).
     bool sourceSafe = analysis.isNeverMutated(cloneOp.getSource());
@@ -866,12 +1027,23 @@ static bool isSafeToElideCloneOp(IREE::Stream::AsyncCloneOp cloneOp,
                << "  ? clone source is a by-value arg; may elide\n");
   }
 
+  // A non-consuming import borrows caller-owned storage. If a clone of that
+  // storage is later mutated then the clone is semantically required even when
+  // the imported SSA value has no remaining local uses: without the clone, the
+  // mutation would be performed in-place on the caller's buffer.
+  bool resultSafe = analysis.isNeverMutated(cloneOp.getResult());
+  if (analysis.containsBorrowedStorage(cloneOp.getSource()) && !resultSafe) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "  - clone protects borrowed storage from mutation; cannot "
+                  "elide\n");
+    return false;
+  }
+
   // If neither source nor result is ever mutated anywhere in the program,
   // we can safely elide the clone because sharing the underlying buffer has no
   // observable effect. This extends the constant-to-constant analysis above to
   // all lifetime types - if no writes occur, reads can safely share buffers.
   bool sourceSafe = analysis.isNeverMutated(cloneOp.getSource());
-  bool resultSafe = analysis.isNeverMutated(cloneOp.getResult());
   if (sourceSafe && resultSafe) {
     LLVM_DEBUG(llvm::dbgs()
                << "  + source and result never mutated; can elide\n");
@@ -1541,7 +1713,9 @@ static ElisionResults tryElideAsyncCopiesInRegion(
     block.walk([&](Operation *op) {
       return TypeSwitch<Operation *, WalkResult>(op)
           .Case([&](IREE::Stream::AsyncCloneOp cloneOp) {
-            if (isSafeToElideCloneOp(cloneOp, analysis)) {
+            if (tryElideReadOnlyConstantExportClone(cloneOp)) {
+              ++results.clonesElided;
+            } else if (isSafeToElideCloneOp(cloneOp, analysis)) {
               elideCloneOp(cloneOp);
               ++results.clonesElided;
             }

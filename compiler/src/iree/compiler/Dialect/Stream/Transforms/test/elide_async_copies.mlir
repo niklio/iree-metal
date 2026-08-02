@@ -52,6 +52,58 @@ util.func public @multiUseTiedOperand(%size: index) -> (!stream.resource<*>, !st
 
 // -----
 
+// Duplicate immutable results may share storage across tensor exports. This
+// avoids materializing a second external buffer and copy for equal outputs.
+
+// CHECK-LABEL: @duplicateReadOnlyExports
+// CHECK-SAME: (%[[SOURCE:.+]]: !stream.resource<external>)
+util.func public @duplicateReadOnlyExports(
+    %source: !stream.resource<external>)
+    -> (!hal.buffer_view, !hal.buffer_view) {
+  %c16 = arith.constant 16 : index
+  // CHECK-NOT: stream.async.clone
+  %clone0 = stream.async.clone %source
+      : !stream.resource<external>{%c16} -> !stream.resource<external>{%c16}
+  %clone1 = stream.async.clone %source
+      : !stream.resource<external>{%c16} -> !stream.resource<external>{%c16}
+  // CHECK: %[[EXPORT0:.+]] = stream.tensor.export %[[SOURCE]]
+  %export0 = stream.tensor.export %clone0
+      : tensor<4xi32> in !stream.resource<external>{%c16} -> !hal.buffer_view
+  // CSE may merge the two now-identical export ops.
+  %export1 = stream.tensor.export %clone1
+      : tensor<4xi32> in !stream.resource<external>{%c16} -> !hal.buffer_view
+  // CHECK: util.return %[[EXPORT0]], %[[EXPORT0]]
+  util.return %export0, %export1 : !hal.buffer_view, !hal.buffer_view
+}
+
+// -----
+
+// Immutable constants can be exported without per-invocation copies to
+// constant and external allocations.
+
+// CHECK-LABEL: @constantReadOnlyExport
+// CHECK-SAME: (%[[SOURCE:.+]]: !stream.resource<constant>)
+util.func public @constantReadOnlyExport(
+    %source: !stream.resource<constant>)
+    -> (!hal.buffer_view, !stream.timepoint) {
+  %c16 = arith.constant 16 : index
+  // CHECK-NOT: stream.async.clone
+  %constant_clone = stream.async.clone %source
+      : !stream.resource<constant>{%c16} -> !stream.resource<constant>{%c16}
+  // CHECK: %[[READY:.+]], %[[TIMEPOINT:.+]] = stream.timepoint.barrier %[[SOURCE]]
+  %ready, %timepoint = stream.timepoint.barrier %constant_clone
+      : !stream.resource<constant>{%c16} => !stream.timepoint
+  %external_clone = stream.async.clone %ready
+      : !stream.resource<constant>{%c16} -> !stream.resource<external>{%c16}
+  // CHECK: %[[EXPORT:.+]] = stream.tensor.export %[[READY]]
+  %export = stream.tensor.export %external_clone
+      : tensor<4xi32> in !stream.resource<external>{%c16} -> !hal.buffer_view
+  // CHECK: util.return %[[EXPORT]], %[[TIMEPOINT]]
+  util.return %export, %timepoint : !hal.buffer_view, !stream.timepoint
+}
+
+// -----
+
 // Tests a copy of a by-value function argument gets elided.
 // Since the caller passes in the last live reference the callee is allowed to
 // mutate the memory in-place.
