@@ -159,15 +159,21 @@ static iree_status_t iree_hal_metal_shared_event_wait(iree_hal_semaphore_t* base
 
   IREE_TRACE_ZONE_BEGIN(z0);
 
-  // Quick path for impatient waiting to avoid all the overhead of dispatch queues and semaphores.
-  if (timeout_ns == 0) {
-    uint64_t current_value = 0;
-    iree_status_t status = iree_hal_metal_shared_event_query(base_semaphore, &current_value);
-    if (iree_status_is_ok(status) && current_value < value) {
-      status = iree_status_from_code(IREE_STATUS_DEADLINE_EXCEEDED);
-    }
+  // Query before installing a listener. Short-running command buffers often
+  // complete before their waiter thread is scheduled; in that case routing an
+  // already-satisfied event through a dispatch queue and semaphore adds more
+  // latency than the device work itself.
+  uint64_t current_value = 0;
+  iree_status_t status = iree_hal_metal_shared_event_query(base_semaphore, &current_value);
+  if (!iree_status_is_ok(status) || current_value >= value) {
     IREE_TRACE_ZONE_END(z0);
     return status;
+  }
+
+  // Quick path for impatient waiting to avoid all the overhead of dispatch queues and semaphores.
+  if (timeout_ns == 0) {
+    IREE_TRACE_ZONE_END(z0);
+    return iree_status_from_code(IREE_STATUS_DEADLINE_EXCEEDED);
   }
 
   // Theoretically we don't really need to mark the semaphore handle as __block given that the
