@@ -175,8 +175,8 @@ while IFS= read -r native_library; do
     echo "error: otool could not inspect ${native_library}" >&2
     exit 2
   fi
-  if otool -l "${native_library}" | grep -q 'LC_UUID'; then
-    echo "error: nondeterministic Mach-O UUID found in ${native_library}" >&2
+  if ! otool -l "${native_library}" | grep -q 'LC_UUID'; then
+    echo "error: required Mach-O UUID missing from ${native_library}" >&2
     exit 2
   fi
   while IFS= read -r dependency; do

@@ -159,7 +159,7 @@ export IREE_METAL_PYTHON=python3.12
 
 The build rejects dirty or mismatched submodules, verifies and applies the
 repository's locked third-party source overlays, embeds no private checkout
-paths, pins and hashes runtime dependencies, normalizes wheel archives, records
-provenance, and produces an SPDX SBOM. It reverses the overlays only if their
-trees remain unchanged. Release tags are built again in GitHub Actions;
+paths, pins and hashes build/runtime dependencies, normalizes wheel archives,
+records provenance, and produces an SPDX SBOM. It reverses the overlays only if
+their trees remain unchanged. Release tags are built again in GitHub Actions;
 execution and autodiff are gated separately on a physical M4.

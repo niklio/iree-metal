@@ -17,6 +17,7 @@ REQUIRED_PATTERNS = (
     "INSTALL.md",
     "RELEASE_NOTES.md",
     "requirements-macos-arm64-py312.txt",
+    "requirements-build-macos-arm64-py312.txt",
     "*.manifest.txt",
     "*.spdx.json",
 )

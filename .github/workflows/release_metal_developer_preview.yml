@@ -47,7 +47,6 @@ jobs:
         run: |
           brew install ccache
           ccache --max-size "${CCACHE_MAXSIZE}"
-          python3 -m pip install --upgrade pip wheel ninja cmake packaging
 
       - uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
         with:
@@ -121,6 +120,7 @@ jobs:
             wheelhouse/INSTALL.md \
             wheelhouse/RELEASE_NOTES.md \
             wheelhouse/requirements-macos-arm64-py312.txt \
+            wheelhouse/requirements-build-macos-arm64-py312.txt \
             wheelhouse/*.manifest.txt \
             wheelhouse/*.spdx.json \
             wheelhouse/iree-metal-preview-*-macos-arm64.tar.gz \

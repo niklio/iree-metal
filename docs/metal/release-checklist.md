@@ -16,8 +16,8 @@ regenerated after the performance campaign lands.
 - [x] Add a preview-specific issue template.
 - [x] Reject strong credential patterns, unexpected top-level wheel contents,
       and non-system dylib dependencies.
-- [x] Reject private build paths, normalize wheel archives, and suppress
-      nondeterministic Mach-O UUIDs.
+- [x] Reject private build paths, normalize wheel archives, lock build tools,
+      and require valid Mach-O UUID load commands.
 - [x] Generate a source license inventory beside release assets.
 - [x] Verify the fork marker and reject an environment containing stock IREE.
 - [ ] Test an offline install from only the final GitHub release bundle.

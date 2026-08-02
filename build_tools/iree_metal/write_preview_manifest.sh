@@ -38,6 +38,8 @@ fi
   echo "host: $(uname -s) $(uname -r) $(uname -m)"
   echo "product: $(sw_vers -productName) $(sw_vers -productVersion)"
   echo "xcode: $(xcodebuild -version | tr '\n' ' ')"
+  echo "cmake: $(cmake --version | head -n 1)"
+  echo "ninja: $(ninja --version)"
   echo "python: ${python_version}"
   echo "deployment-target: ${MACOSX_DEPLOYMENT_TARGET:-13.0}"
   echo "validated-host: Apple M4; product version above; CPython 3.12"
@@ -47,6 +49,7 @@ fi
   echo "compiler-options: --iree-metal-compile-to-metallib=false --iree-dispatch-creation-fuse-multi-use=false --iree-dispatch-creation-enable-aggressive-fusion=true"
   echo "numeric-contract: optimized causal attention assumes finite model inputs; use IREE_METAL_PROFILE=baseline for strict non-finite propagation diagnostics"
   echo "dependency-lock: requirements-macos-arm64-py312.txt"
+  echo "build-dependency-lock: requirements-build-macos-arm64-py312.txt"
   echo "sbom: iree-metal-preview-${preview_version}.spdx.json"
 } > "${manifest}"
 
