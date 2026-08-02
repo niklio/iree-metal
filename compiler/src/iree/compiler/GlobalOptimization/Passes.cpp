@@ -108,6 +108,12 @@ void buildGlobalOptimizationPassPipeline(
         importParametersOptions));
   }
 
+  // Metal command submission makes host-controlled loops of GPU dispatches
+  // disproportionately expensive. Expand small static tensor loops before
+  // fusion and dispatch formation so their dispatches can be scheduled as one
+  // command sequence.
+  mainPassManager.addPass(createUnrollSmallStaticTensorLoopsForMetalPass());
+
   // Preprocessing passes to get the program into a canonical state.
   FunctionLikeNest(mainPassManager)
       .addPredicatedPass(clWarnOnUninitializedValues,

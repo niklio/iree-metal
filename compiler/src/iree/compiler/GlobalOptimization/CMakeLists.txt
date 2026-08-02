@@ -64,6 +64,7 @@ iree_cc_library(
     "RemoveZeroExtentTensors.cpp"
     "SimplifyPackUnpack.cpp"
     "SplitAttentionBackwardForMetal.cpp"
+    "UnrollSmallStaticTensorLoopsForMetal.cpp"
     "Utils.cpp"
     "WarnOnUninitializedValues.cpp"
   DEPS
@@ -75,6 +76,7 @@ iree_cc_library(
     MLIRAffineDialect
     MLIRArithDialect
     MLIRArithUtils
+    MLIRBufferizationDialect
     MLIRControlFlowDialect
     MLIRFunctionInterfaces
     MLIRIR

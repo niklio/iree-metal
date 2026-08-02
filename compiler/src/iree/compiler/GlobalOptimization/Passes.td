@@ -175,6 +175,24 @@ def SplitAttentionBackwardForMetalPass :
   ];
 }
 
+def UnrollSmallStaticTensorLoopsForMetalPass :
+    Pass<"iree-global-opt-unroll-small-static-tensor-loops-for-metal", "mlir::ModuleOp"> {
+  let summary = "Forms device dispatches for small static tensor loops targeting Metal";
+  let description = [{
+    Wraps bounded scf.for loops that carry tensors in single-invocation device
+    dispatches when all executable targets in the module use the metal-spirv
+    backend. Static tensor loops are otherwise lowered to host-controlled
+    dispatch loops, which is especially expensive for short scans. Eligibility
+    is limited by both trip count and operation count. Setting
+    IREE_METAL_NO_STATIC_TENSOR_LOOPS_IN_DISPATCH restores full unrolling.
+  }];
+  let dependentDialects = [
+    "::mlir::arith::ArithDialect",
+    "::mlir::bufferization::BufferizationDialect",
+    "IREE::Flow::FlowDialect",
+  ];
+}
+
 def GlobalLoopInvariantCodeMotionPass : InterfacePass<"iree-global-opt-loop-invariant-code-motion", "mlir::FunctionOpInterface"> {
   let summary = "Hoist loop invariants out of loops with zero-trip-check.";
 }
