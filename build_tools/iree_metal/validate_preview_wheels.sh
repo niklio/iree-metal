@@ -27,7 +27,7 @@ if len(wheels) != 2:
 
 expected = {
     "iree_base_compiler_iree_metal": "compiler",
-    "iree_pjrt_plugin_metal": "plugin",
+    "iree_pjrt_plugin_metal_iree_metal": "plugin",
 }
 seen = set()
 for wheel in wheels:
@@ -36,6 +36,8 @@ for wheel in wheels:
         raise SystemExit(f"unexpected wheel name: {wheel.name}")
     if "arm64" not in wheel.name:
         raise SystemExit(f"wheel is not tagged for arm64: {wheel.name}")
+    if "macosx_13_0_arm64" not in wheel.name:
+        raise SystemExit(f"wheel does not carry the preview platform tag: {wheel.name}")
     if kind == "compiler" and "cp312-abi3" not in wheel.name:
         raise SystemExit(f"compiler wheel is not cp312-abi3: {wheel.name}")
     if kind == "plugin" and "py3-none" not in wheel.name:
@@ -64,10 +66,19 @@ for wheel in wheels:
             re.compile(rb"AKIA[0-9A-Z]{16}"),
             re.compile(rb"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
         )
+        private_path_patterns = (
+            re.compile(rb"/Users/[^/\x00]+/"),
+            re.compile(rb"/home/[^/\x00]+/"),
+            re.compile(rb"/private/tmp/[^/\x00]+/"),
+        )
         for name in names:
             payload = archive.read(name)
             if any(pattern.search(payload) for pattern in secret_patterns):
                 raise SystemExit(f"possible credential material in {wheel.name}:{name}")
+            if any(pattern.search(payload) for pattern in private_path_patterns):
+                raise SystemExit(
+                    f"private build path embedded in {wheel.name}:{name}"
+                )
 
         metadata_names = [n for n in names if n.endswith(".dist-info/METADATA")]
         if len(metadata_names) != 1:
@@ -76,6 +87,16 @@ for wheel in wheels:
         if metadata["Version"] != version:
             raise SystemExit(
                 f"version mismatch in {wheel.name}: {metadata['Version']} != {version}"
+            )
+        expected_name = (
+            "iree-base-compiler-iree-metal"
+            if kind == "compiler"
+            else "iree-pjrt-plugin-metal-iree-metal"
+        )
+        if metadata["Name"] != expected_name:
+            raise SystemExit(
+                f"distribution mismatch in {wheel.name}: "
+                f"{metadata['Name']} != {expected_name}"
             )
 
         if kind == "compiler":
@@ -104,11 +125,36 @@ for wheel in wheels:
                 raise SystemExit(
                     f"expected one Metal PJRT native library, found {native}"
                 )
+            plugin_module = archive.read(
+                "jax_plugins/iree_metal/__init__.py"
+            ).decode()
+            required_profile_fragments = (
+                'PREVIEW_PROFILE = "preview-20260802"',
+                '"--iree-metal-compile-to-metallib=false"',
+                '"--iree-dispatch-creation-fuse-multi-use=false"',
+                '"--iree-dispatch-creation-enable-aggressive-fusion=true"',
+                'requested == "baseline"',
+            )
+            for fragment in required_profile_fragments:
+                if fragment not in plugin_module:
+                    raise SystemExit(
+                        f"plugin is missing packaged preview default: {fragment}"
+                    )
 
 if seen != {"compiler", "plugin"}:
     raise SystemExit(f"incomplete wheel set: {seen}")
 print("wheel structure and metadata validation passed")
 PY
+
+if [[ ! -f "${wheelhouse}/requirements-macos-arm64-py312.txt" ]]; then
+  echo "error: locked dependency requirements are missing" >&2
+  exit 2
+fi
+dependency_count="$(find "${wheelhouse}/dependencies" -maxdepth 1 -type f -name '*.whl' | wc -l | tr -d ' ')"
+if [[ "${dependency_count}" -ne 6 ]]; then
+  echo "error: expected six locked dependency wheels, found ${dependency_count}" >&2
+  exit 2
+fi
 
 temporary_dir="$(mktemp -d "${TMPDIR:-/tmp}/iree-metal-wheel-audit.XXXXXX")"
 cleanup() {
@@ -129,6 +175,10 @@ while IFS= read -r native_library; do
     echo "error: otool could not inspect ${native_library}" >&2
     exit 2
   fi
+  if otool -l "${native_library}" | grep -q 'LC_UUID'; then
+    echo "error: nondeterministic Mach-O UUID found in ${native_library}" >&2
+    exit 2
+  fi
   while IFS= read -r dependency; do
     case "${dependency}" in
       /System/Library/*|/usr/lib/*|@rpath/*|@loader_path/*|@executable_path/*) ;;
@@ -144,3 +194,5 @@ if [[ "${native_count}" -eq 0 ]]; then
   echo "error: no native libraries found in preview wheels" >&2
   exit 2
 fi
+
+echo "native dependency, path, and reproducibility validation passed"

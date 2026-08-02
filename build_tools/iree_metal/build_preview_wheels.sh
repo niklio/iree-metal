@@ -9,6 +9,8 @@ wheelhouse="${IREE_METAL_WHEELHOUSE:-${repo_root}/wheelhouse}"
 python_bin="${IREE_METAL_PYTHON:-python3}"
 preview_version="${IREE_METAL_VERSION:-}"
 jax_version="0.6.1"
+build_root="${IREE_METAL_BUILD_ROOT:-${repo_root}/.iree-metal-build}"
+requirements_file="${script_dir}/requirements-preview-macos-arm64-py312.txt"
 
 if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
   echo "error: preview wheels must be built natively on macOS arm64" >&2
@@ -51,6 +53,9 @@ fi
 
 cleanup() {
   rm -f "${compiler_version_file}" "${pjrt_version_file}"
+  if [[ "${patches_applied:-0}" == "1" ]]; then
+    "${repo_root}/submodule-patches/unapply.sh"
+  fi
 }
 trap cleanup EXIT
 
@@ -60,9 +65,35 @@ if compgen -G "${wheelhouse}/*.whl" > /dev/null; then
   exit 2
 fi
 
+if [[ ! -f "${requirements_file}" ]]; then
+  echo "error: missing locked preview dependencies: ${requirements_file}" >&2
+  exit 2
+fi
+
+mkdir -p "${build_root}"
+export IREE_COMPILER_API_CMAKE_BUILD_DIR="${build_root}/compiler"
+export IREE_PJRT_CMAKE_BUILD_DIR="${build_root}/pjrt-metal"
+
+# Make source references independent of the maintainer's checkout path and
+# suppress nondeterministic Mach-O UUIDs. SOURCE_DATE_EPOCH also gives wheel
+# metadata and archives a stable timestamp.
+prefix_maps="-ffile-prefix-map=${repo_root}=iree-metal -fdebug-prefix-map=${repo_root}=iree-metal -fmacro-prefix-map=${repo_root}=iree-metal"
+export CFLAGS="${CFLAGS:-} ${prefix_maps}"
+export CXXFLAGS="${CXXFLAGS:-} ${prefix_maps}"
+export OBJCFLAGS="${OBJCFLAGS:-} ${prefix_maps}"
+export OBJCXXFLAGS="${OBJCXXFLAGS:-} ${prefix_maps}"
+export LDFLAGS="${LDFLAGS:-} -Wl,-no_uuid"
+export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "${repo_root}" show -s --format=%ct HEAD)}"
+export ZERO_AR_DATE=1
+export PYTHONHASHSEED=0
+
+patches_applied=0
+"${repo_root}/submodule-patches/apply.sh"
+patches_applied=1
+
 printf '{\n  "package-version": "%s",\n  "package-suffix": "-iree-metal"\n}\n' \
   "${preview_version}" > "${compiler_version_file}"
-printf '{\n  "package-version": "%s",\n  "compiler-package-name": "iree-base-compiler-iree-metal",\n  "compiler-package-version": "%s",\n  "jax-version": "%s",\n  "jaxlib-version": "%s",\n  "python-requires": ">=3.12,<3.13",\n  "project-url": "https://github.com/niklio/iree-metal"\n}\n' \
+printf '{\n  "package-version": "%s",\n  "package-suffix": "-iree-metal",\n  "compiler-package-name": "iree-base-compiler-iree-metal",\n  "compiler-package-version": "%s",\n  "jax-version": "%s",\n  "jaxlib-version": "%s",\n  "python-requires": ">=3.12,<3.13",\n  "project-url": "https://github.com/niklio/iree-metal"\n}\n' \
   "${preview_version}" "${preview_version}" "${jax_version}" "${jax_version}" \
   > "${pjrt_version_file}"
 
@@ -79,14 +110,35 @@ IREE_COMPILER_CUSTOM_REPOSITORY_URL="https://github.com/niklio/iree-metal" \
   "${python_bin}" -m pip wheel --no-deps -v \
   --wheel-dir "${wheelhouse}" "${repo_root}/compiler"
 
-echo "Building iree-pjrt-plugin-metal ${preview_version}"
+echo "Building iree-pjrt-plugin-metal-iree-metal ${preview_version}"
 "${python_bin}" -m pip wheel --no-deps -v \
   --wheel-dir "${wheelhouse}" \
   "${repo_root}/integrations/pjrt/python_packages/iree_metal_plugin"
 
+"${python_bin}" "${script_dir}/normalize_preview_wheels.py" \
+  --source-date-epoch "${SOURCE_DATE_EPOCH}" "${wheelhouse}"/*.whl
+
+mkdir -p "${wheelhouse}/dependencies"
+cp "${requirements_file}" \
+  "${wheelhouse}/requirements-macos-arm64-py312.txt"
+"${python_bin}" -m pip download \
+  --dest "${wheelhouse}/dependencies" \
+  --require-hashes \
+  --only-binary=:all: \
+  --platform macosx_13_0_arm64 \
+  --python-version 3.12 \
+  --implementation cp \
+  --abi cp312 \
+  -r "${requirements_file}"
+
 IREE_METAL_PYTHON="${python_bin}" \
   "${script_dir}/validate_preview_wheels.sh" "${wheelhouse}" "${preview_version}"
 "${script_dir}/collect_preview_licenses.sh" "${wheelhouse}"
+cp "${repo_root}/docs/metal/developer-preview.md" "${wheelhouse}/INSTALL.md"
+cp "${repo_root}/docs/metal/releases/${preview_version}.md" \
+  "${wheelhouse}/RELEASE_NOTES.md"
+"${python_bin}" "${script_dir}/write_preview_sbom.py" \
+  "${wheelhouse}" "${preview_version}"
 IREE_METAL_PYTHON="${python_bin}" \
   "${script_dir}/write_preview_manifest.sh" "${wheelhouse}" "${preview_version}"
 

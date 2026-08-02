@@ -72,6 +72,8 @@ tablegen_compile_commands.yml
 # Python deployment artifacts
 *.whl
 *.egg-info
+/wheelhouse/
+/.iree-metal-build/
 
 # Android Studio / Gradle files
 .cxx

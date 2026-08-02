@@ -1,0 +1,14 @@
+# Complete, hashed runtime dependency set for the first iree-metal preview.
+# Resolved for CPython 3.12 on macOS 13+ arm64.
+jax==0.6.1 \
+    --hash=sha256:69a4e4506caa5466702bdfd0d7a13d1f9b7281d473885721100a3087fcabf8f9
+jaxlib==0.6.1 \
+    --hash=sha256:e14195c23eecd559a61c31027b4172e912e5a50f630320918ffdfae83090ca5a
+ml_dtypes==0.5.4 \
+    --hash=sha256:a174837a64f5b16cab6f368171a1a03a27936b31699d167684073ff1c4237dac
+numpy==2.5.1 \
+    --hash=sha256:ab451b59c5643c570974c43aef780703ef1d3b4965d2be07afd530615a9358d1
+opt_einsum==3.4.0 \
+    --hash=sha256:69bb92469f86a1565195ece4ac0323943e83477171b91d24c35afe028a90d7cd
+scipy==1.18.0 \
+    --hash=sha256:265915e79107de9f946b855e50d7470d5893ec3f54b342e1aa6201cbdcd8bb6b

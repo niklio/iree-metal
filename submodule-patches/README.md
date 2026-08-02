@@ -1,24 +1,38 @@
-# IREE-Metal submodule patches
+# In-repository third-party source overlays
 
-This fork (`iree-metal`) carries changes to three vendored submodules that can't be
-committed into this superproject directly (they live in their own git repos). They are
-preserved here as diffs so **all** code changes are captured in one place.
+iree-metal keeps its LLVM/MLIR, SPIRV-Cross, and StableHLO modifications in
+this repository. The upstream projects remain ordinary submodules pinned to
+public base commits; the files in this directory are the complete binary-safe
+diffs applied on top of those bases.
 
-| submodule | pinned commit | what the patch adds |
-|---|---|---|
-| `third_party/llvm-project` | `66395ad94` | First-class f16/bf16 subgroup MMA types, GPU→SPIR-V cooperative-matrix conversion, capability inference, and fail-closed NVVM handling |
-| `third_party/spirv_cross` | `7affe74` | Hardened SPIR-V→MSL cooperative-matrix lowering to native Apple `simdgroup_matrix`, including f16/bf16 8×8 and logical 16×16 fixtures |
-| `third_party/stablehlo` | `46af9d3` | StableHLO preprocessing tweak |
+`LOCK` records five values for every overlay:
 
-## Apply
+1. submodule path;
+2. public upstream base revision;
+3. expected Git tree after applying the patch;
+4. patch path; and
+5. patch SHA-256.
 
-```bash
-./submodule-patches/apply.sh      # from the repo root, after `git submodule update --init`
-```
+This makes the release source self-contained without requiring separately
+maintained GitHub forks. A clean recursive clone plus this superproject commit
+contains every source modification used to build the wheels.
 
-The submodule pointers in this superproject are left at their upstream commits; applying
-these patches reproduces the exact tree that produced the benchmarked numbers.
+## Release build behavior
 
-`./submodule-patches/refresh.sh` regenerates the LLVM and SPIRV-Cross snapshots,
-including untracked new test fixtures. It deliberately leaves the independently
-maintained StableHLO snapshot untouched.
+`build_tools/iree_metal/build_preview_wheels.sh` starts by requiring a clean,
+base-pinned recursive checkout. It calls `apply.sh`, which verifies patch
+checksums, applies each overlay to the submodule index, and compares the exact
+resulting Git tree with `LOCK`. The build cleanup trap calls `unapply.sh`, which
+will reverse an overlay only when both the index tree and worktree still match
+the locked state. Unexpected developer changes are therefore left in place
+instead of being overwritten.
+
+The same lock and patch hashes are copied into the release provenance manifest.
+
+## Maintainer workflow
+
+To update an overlay, make and commit the third-party change on a local
+submodule branch, then run `refresh.sh SUBMODULE BRANCH`. Review the regenerated
+patch and lock entry in the superproject, run `apply.sh` and `unapply.sh`, and
+commit both files together. Release tags must never rely on untracked changes
+inside a submodule.
