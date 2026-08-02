@@ -97,6 +97,7 @@ export OBJCXXFLAGS="${OBJCXXFLAGS:-} ${prefix_maps}"
 export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "${repo_root}" show -s --format=%ct HEAD)}"
 export ZERO_AR_DATE=1
 export PYTHONHASHSEED=0
+export PYTHONDONTWRITEBYTECODE=1
 
 patches_applied=0
 "${repo_root}/submodule-patches/apply.sh"
@@ -122,9 +123,17 @@ IREE_COMPILER_CUSTOM_REPOSITORY_URL="https://github.com/niklio/iree-metal" \
   --wheel-dir "${wheelhouse}" "${repo_root}/compiler"
 
 echo "Building iree-pjrt-plugin-metal-iree-metal ${preview_version}"
+# setuptools builds local projects in place. Remove this package's generated
+# staging tree so an earlier developer build can never leak a stale native
+# library or bytecode into the release wheel. The CMake object cache lives in
+# ${build_root} and is intentionally preserved.
+plugin_package_dir="${repo_root}/integrations/pjrt/python_packages/iree_metal_plugin"
+rm -rf \
+  "${plugin_package_dir}/build" \
+  "${plugin_package_dir}/iree_pjrt_plugin_metal_iree_metal.egg-info"
 "${build_python}" -m pip wheel --no-build-isolation --no-deps -v \
   --wheel-dir "${wheelhouse}" \
-  "${repo_root}/integrations/pjrt/python_packages/iree_metal_plugin"
+  "${plugin_package_dir}"
 
 "${build_python}" "${script_dir}/normalize_preview_wheels.py" \
   --source-date-epoch "${SOURCE_DATE_EPOCH}" "${wheelhouse}"/*.whl

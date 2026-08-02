@@ -27,6 +27,13 @@ published at https://github.com/niklio/iree-metal/releases.
 CMAKE_BUILD_DIR_ABS = os.environ.get(
     "IREE_PJRT_CMAKE_BUILD_DIR", os.path.join(THIS_DIR, "build", "cmake")
 )
+METAL_NATIVE_PACKAGE_DIR = os.path.join(
+    CMAKE_BUILD_DIR_ABS,
+    "python",
+    "iree",
+    "_pjrt_libs",
+    "metal",
+)
 
 
 class CMakeBuildPy(iree_pjrt_setup.BaseCMakeBuildPy):
@@ -48,15 +55,7 @@ class CMakeBuildPy(iree_pjrt_setup.BaseCMakeBuildPy):
         print("Target populated.", file=sys.stderr)
 
 
-iree_pjrt_setup.populate_built_package(
-    os.path.join(
-        CMAKE_BUILD_DIR_ABS,
-        "python",
-        "iree",
-        "_pjrt_libs",
-        "metal",
-    )
-)
+iree_pjrt_setup.populate_built_package(METAL_NATIVE_PACKAGE_DIR)
 
 
 setup(
@@ -82,7 +81,7 @@ setup(
     ],
     package_dir={
         "jax_plugins.iree_metal": "jax_plugins/iree_metal",
-        "iree._pjrt_libs.metal": "build/cmake/python/iree/_pjrt_libs/metal",
+        "iree._pjrt_libs.metal": METAL_NATIVE_PACKAGE_DIR,
     },
     package_data={
         "iree._pjrt_libs.metal": ["pjrt_plugin_iree_metal.*"],
