@@ -4,11 +4,11 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-// RUN: env -u IREE_METAL_COOP_NO_PAD -u IREE_METAL_FFN_PAD_M64 iree-opt --iree-global-opt-raise-contraction-accumulator-to-f32 %s | FileCheck %s --check-prefix=DEFAULT
-// RUN: env -u IREE_METAL_COOP_NO_PAD IREE_METAL_FFN_PAD_M64=0 iree-opt --iree-global-opt-raise-contraction-accumulator-to-f32 %s | FileCheck %s --check-prefix=DEFAULT
-// RUN: env -u IREE_METAL_COOP_NO_PAD IREE_METAL_FFN_PAD_M64=invalid iree-opt --iree-global-opt-raise-contraction-accumulator-to-f32 %s | FileCheck %s --check-prefix=DEFAULT
-// RUN: env -u IREE_METAL_COOP_NO_PAD IREE_METAL_FFN_PAD_M64=1 iree-opt --iree-global-opt-raise-contraction-accumulator-to-f32 %s | FileCheck %s --check-prefix=PAD64
-// RUN: env -u IREE_METAL_COOP_NO_PAD IREE_METAL_FFN_PAD_M64=1 iree-opt --pass-pipeline="builtin.module(func.func(iree-global-opt-raise-contraction-accumulator-to-f32,iree-global-opt-raise-contraction-accumulator-to-f32))" %s | FileCheck %s --check-prefix=PAD64
+// RUN: env -u IREE_METAL_COOP_NO_PAD -u IREE_METAL_COOP_NO_ATTN_ISOLATE -u IREE_METAL_COOP_NO_ATTN_ISOLATE_BF16 -u IREE_METAL_FFN_PAD_M64 iree-opt --iree-global-opt-raise-contraction-accumulator-to-f32 %s | FileCheck %s --check-prefix=DEFAULT
+// RUN: env -u IREE_METAL_COOP_NO_PAD -u IREE_METAL_COOP_NO_ATTN_ISOLATE -u IREE_METAL_COOP_NO_ATTN_ISOLATE_BF16 IREE_METAL_FFN_PAD_M64=0 iree-opt --iree-global-opt-raise-contraction-accumulator-to-f32 %s | FileCheck %s --check-prefix=DEFAULT
+// RUN: env -u IREE_METAL_COOP_NO_PAD -u IREE_METAL_COOP_NO_ATTN_ISOLATE -u IREE_METAL_COOP_NO_ATTN_ISOLATE_BF16 IREE_METAL_FFN_PAD_M64=invalid iree-opt --iree-global-opt-raise-contraction-accumulator-to-f32 %s | FileCheck %s --check-prefix=DEFAULT
+// RUN: env -u IREE_METAL_COOP_NO_PAD -u IREE_METAL_COOP_NO_ATTN_ISOLATE -u IREE_METAL_COOP_NO_ATTN_ISOLATE_BF16 IREE_METAL_FFN_PAD_M64=1 iree-opt --iree-global-opt-raise-contraction-accumulator-to-f32 %s | FileCheck %s --check-prefix=PAD64
+// RUN: env -u IREE_METAL_COOP_NO_PAD -u IREE_METAL_COOP_NO_ATTN_ISOLATE -u IREE_METAL_COOP_NO_ATTN_ISOLATE_BF16 IREE_METAL_FFN_PAD_M64=1 iree-opt --pass-pipeline="builtin.module(func.func(iree-global-opt-raise-contraction-accumulator-to-f32,iree-global-opt-raise-contraction-accumulator-to-f32))" %s | FileCheck %s --check-prefix=PAD64
 
 // DEFAULT-LABEL: func.func @m_major(
 // DEFAULT: tensor<4624x768xbf16>
@@ -116,4 +116,34 @@ func.func @already_aligned(
   %result = linalg.matmul ins(%lhs, %rhs : tensor<4608x768xbf16>, tensor<768x3072xbf16>)
       outs(%init : tensor<4608x3072xbf16>) -> tensor<4608x3072xbf16>
   return %result : tensor<4608x3072xbf16>
+}
+
+// DEFAULT-LABEL: func.func @native_f32_batch_matmul(
+// DEFAULT: %[[BMM:.+]] = linalg.batch_matmul
+// DEFAULT-NOT: util.optimization_barrier
+// DEFAULT: return %[[BMM]]
+func.func @native_f32_batch_matmul(
+    %lhs: tensor<3x64x64xf32>,
+    %rhs: tensor<3x64x64xf32>) -> tensor<3x64x64xf32> {
+  %zero = arith.constant 0.0 : f32
+  %empty = tensor.empty() : tensor<3x64x64xf32>
+  %init = linalg.fill ins(%zero : f32) outs(%empty : tensor<3x64x64xf32>) -> tensor<3x64x64xf32>
+  %result = linalg.batch_matmul ins(%lhs, %rhs : tensor<3x64x64xf32>, tensor<3x64x64xf32>)
+      outs(%init : tensor<3x64x64xf32>) -> tensor<3x64x64xf32>
+  return %result : tensor<3x64x64xf32>
+}
+
+// DEFAULT-LABEL: func.func @tiny_bf16_batch_matmul(
+// DEFAULT: %[[TINY_BMM:.+]] = linalg.batch_matmul
+// DEFAULT-NOT: util.optimization_barrier
+// DEFAULT: return %[[TINY_BMM]]
+func.func @tiny_bf16_batch_matmul(
+    %lhs: tensor<3x8x16xbf16>,
+    %rhs: tensor<3x16x17xbf16>) -> tensor<3x8x17xbf16> {
+  %zero = arith.constant 0.0 : bf16
+  %empty = tensor.empty() : tensor<3x8x17xbf16>
+  %init = linalg.fill ins(%zero : bf16) outs(%empty : tensor<3x8x17xbf16>) -> tensor<3x8x17xbf16>
+  %result = linalg.batch_matmul ins(%lhs, %rhs : tensor<3x8x16xbf16>, tensor<3x16x17xbf16>)
+      outs(%init : tensor<3x8x17xbf16>) -> tensor<3x8x17xbf16>
+  return %result : tensor<3x8x17xbf16>
 }

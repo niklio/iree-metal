@@ -308,7 +308,16 @@ struct IsolateBatchMatmulPattern : OpRewritePattern<linalg::BatchMatmulOp> {
     static const bool isolateBf16 =
         ::getenv("IREE_METAL_COOP_NO_ATTN_ISOLATE_BF16") == nullptr;
     Type et = cast<ShapedType>(result.getType()).getElementType();
-    if (!et.isF32() && !(isolateBf16 && et.isBF16()))
+    // A promoted attention batch matmul has low-precision multiplicands and an
+    // f32 accumulator/result. Native f32 batch matmuls have f32 inputs and do
+    // not need isolation; splitting them adds command-buffer round trips.
+    bool hasLowPrecisionInput = llvm::any_of(
+        bmm.getDpsInputs(), [](Value input) {
+          Type inputType = cast<ShapedType>(input.getType()).getElementType();
+          return inputType.isBF16() || inputType.isF16();
+        });
+    bool isPromotedF32 = et.isF32() && hasLowPrecisionInput;
+    if (!isPromotedF32 && !(isolateBf16 && et.isBF16()))
       return failure();
     if (result.hasOneUse() &&
         isa<IREE::Util::OptimizationBarrierOp>(*result.getUsers().begin()))
@@ -325,7 +334,15 @@ struct IsolateBatchMatmulPattern : OpRewritePattern<linalg::BatchMatmulOp> {
       int64_t rank = rTy.getRank();
       if (rank >= 2 && !rTy.isDynamicDim(rank - 1) &&
           !rTy.isDynamicDim(rank - 2)) {
-        int64_t mn = rTy.getDimSize(rank - 1) * rTy.getDimSize(rank - 2);
+        int64_t m = rTy.getDimSize(rank - 2);
+        int64_t n = rTy.getDimSize(rank - 1);
+        // The BF16 isolation workaround targets attention batch matmuls. Tiny
+        // generic batch matmuls do not exhibit the attention NaN and are much
+        // faster when their forward/backward dispatches share one command
+        // buffer. Supported attention heads have both output dimensions >=64.
+        if (et.isBF16() && (m < 64 || n < 64))
+          return failure();
+        int64_t mn = m * n;
         int64_t maxMN = 600000;
         if (const char *e = ::getenv("IREE_METAL_COOP_ATTN_ISOLATE_MAXMN"))
           maxMN = std::strtoll(e, nullptr, 10);
