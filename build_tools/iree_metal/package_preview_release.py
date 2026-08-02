@@ -60,8 +60,8 @@ def main() -> None:
 
     files = [one_match(wheelhouse, pattern) for pattern in REQUIRED_PATTERNS]
     dependencies = sorted((wheelhouse / "dependencies").glob("*.whl"))
-    if len(dependencies) != 6:
-        raise SystemExit(f"expected six dependency wheels, found {len(dependencies)}")
+    if len(dependencies) != 8:
+        raise SystemExit(f"expected eight dependency wheels, found {len(dependencies)}")
     files.extend(dependencies)
     files.extend(sorted(wheelhouse.glob("*verifier-evidence*.tar.gz")))
 

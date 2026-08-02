@@ -151,8 +151,8 @@ if [[ ! -f "${wheelhouse}/requirements-macos-arm64-py312.txt" ]]; then
   exit 2
 fi
 dependency_count="$(find "${wheelhouse}/dependencies" -maxdepth 1 -type f -name '*.whl' | wc -l | tr -d ' ')"
-if [[ "${dependency_count}" -ne 6 ]]; then
-  echo "error: expected six locked dependency wheels, found ${dependency_count}" >&2
+if [[ "${dependency_count}" -ne 8 ]]; then
+  echo "error: expected eight locked dependency wheels, found ${dependency_count}" >&2
   exit 2
 fi
 
@@ -161,6 +161,17 @@ cleanup() {
   rm -rf "${temporary_dir}"
 }
 trap cleanup EXIT
+
+audit_venv="${temporary_dir}/venv"
+"${python_bin}" -m venv "${audit_venv}"
+PIP_DISABLE_PIP_VERSION_CHECK=1 \
+  "${audit_venv}/bin/python" -m pip install \
+  --no-index \
+  --find-links "${wheelhouse}" \
+  --find-links "${wheelhouse}/dependencies" \
+  "${wheelhouse}"/*.whl
+"${audit_venv}/bin/python" -m pip check
+echo "offline dependency closure validation passed"
 
 for wheel in "${wheelhouse}"/*.whl; do
   "${python_bin}" -m zipfile -e "${wheel}" "${temporary_dir}/$(basename "${wheel}")"

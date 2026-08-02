@@ -56,8 +56,10 @@ def wheel_records(wheelhouse: Path) -> dict[str, str]:
     wheels = sorted(wheelhouse.glob("*.whl")) + sorted(
         (wheelhouse / "dependencies").glob("*.whl")
     )
-    if len(wheels) != 8:
-        raise SystemExit(f"expected two project and six dependency wheels, found {len(wheels)}")
+    if len(wheels) != 10:
+        raise SystemExit(
+            f"expected two project and eight dependency wheels, found {len(wheels)}"
+        )
     return {wheel.name: file_sha256(wheel) for wheel in wheels}
 
 
