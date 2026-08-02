@@ -4,6 +4,30 @@
 // RUN: iree-opt --pass-pipeline="builtin.module(func.func(iree-codegen-generic-vectorization{vectorize-to-transfer-gather=true}))" --split-input-file %s | FileCheck %s --check-prefix=CHECK-GATHER
 // RUN: iree-opt --pass-pipeline="builtin.module(func.func(iree-codegen-generic-vectorization{vectorize-map-store=true}))" --split-input-file %s | FileCheck %s --check-prefix=CHECK-MAP-STORE
 
+// Reducing a loop-invariant scalar must retain the reduction iteration count.
+// The upstream vectorizer currently applies the scalar only once per vector
+// tile, so leave this form unvectorized.
+func.func @loop_invariant_reduction_value(%out: tensor<f32>) -> tensor<f32> {
+  %c1 = arith.constant 1.000000e+00 : f32
+  %empty = tensor.empty() : tensor<4xf32>
+  %input = linalg.fill ins(%c1 : f32) outs(%empty : tensor<4xf32>) -> tensor<4xf32>
+  %result = linalg.generic {
+      indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> ()>],
+      iterator_types = ["reduction"]}
+      ins(%input : tensor<4xf32>) outs(%out : tensor<f32>) {
+  ^bb0(%unused: f32, %acc: f32):
+    %sum = arith.addf %acc, %c1 : f32
+    linalg.yield %sum : f32
+  } -> tensor<f32>
+  return %result : tensor<f32>
+}
+// CHECK-LABEL: func.func @loop_invariant_reduction_value
+// CHECK:         linalg.generic
+// CHECK-MASK-LABEL: func.func @loop_invariant_reduction_value
+// CHECK-MASK:         linalg.generic
+
+// -----
+
 func.func @matmul(%lhs: tensor<3x4xf16>, %rhs: tensor<4x5xf16>, %acc: tensor<3x5xf32>) -> tensor<3x5xf32> {
   %result = linalg.matmul ins(%lhs, %rhs: tensor<3x4xf16>, tensor<4x5xf16>) outs(%acc: tensor<3x5xf32>) -> tensor<3x5xf32>
   return %result: tensor<3x5xf32>

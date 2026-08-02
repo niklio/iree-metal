@@ -12,6 +12,7 @@
 #include "iree/compiler/Codegen/Utils/Utils.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "llvm/Support/DebugLog.h"
+#include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/Affine/LoopUtils.h"
 #include "mlir/Dialect/Linalg/Transforms/Hoisting.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
@@ -146,6 +147,31 @@ static LogicalResult isWithinVectorSizeLimit(linalg::LinalgOp linalgOp,
   return success(maxFlatVecSize < maxVectorSize);
 }
 
+// Upstream linalg vectorization currently assumes that the value combined with
+// a reduction accumulator is defined in the linalg region. If canonicalization
+// replaces that value with a loop-invariant scalar (for example, reducing a
+// splat), vectorization only applies the scalar once per vector tile instead of
+// once per reduction iteration. Keep those uncommon reductions scalar until
+// the vectorizer can preserve their iteration multiplicity.
+static bool hasLoopInvariantReductionValue(linalg::LinalgOp linalgOp) {
+  if (llvm::none_of(linalgOp.getIteratorTypesArray(), [](auto iteratorType) {
+        return iteratorType == utils::IteratorType::reduction;
+      })) {
+    return false;
+  }
+
+  for (unsigned index = 0; index < linalgOp.getNumDpsInits(); ++index) {
+    SmallVector<Operation *> combinerOps;
+    Value reductionValue = matchReduction(linalgOp.getRegionOutputArgs(),
+                                           index, combinerOps);
+    if (reductionValue &&
+        reductionValue.getParentRegion() != &linalgOp->getRegion(0)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 class GenericVectorizationPass final
     : public impl::GenericVectorizationPassBase<GenericVectorizationPass> {
 public:
@@ -213,6 +239,9 @@ void GenericVectorizationPass::runOnOperation() {
 
     // Driver-level vector size limit check for linalg ops.
     if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
+      if (hasLoopInvariantReductionValue(linalgOp)) {
+        continue;
+      }
       // Do not vectorize the op if the vector size is greater than or equal
       // to limit.
       if (enableVectorMasking) {
