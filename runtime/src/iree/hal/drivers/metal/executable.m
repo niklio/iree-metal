@@ -118,10 +118,10 @@ static iree_status_t iree_hal_metal_executable_flatbuffer_verify(
       // iree-metal (task#28): allow up to MSL 4.0 so Metal 4 cooperative-tensor (matmul2d)
       // kernels compile at runtime. macOS 26 / M4 supports 4.0; the actual per-platform
       // support is still verified when Metal compiles the source below.
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wunguarded-availability-new"
-      if (version > MTLLanguageVersion4_0) {
-#pragma clang diagnostic pop
+      // Use the serialized enum value instead of the SDK declaration so the
+      // runtime can be built with pre-macOS 26 headers and still accept MSL
+      // 4.0 modules when it later runs on a supporting OS.
+      if (version > 262144u) {  // MTLLanguageVersion4_0
         return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
                                 "libraries[%" PRIhsz
                                 "] MSL language version %u is unsupported by the compiled runtime",

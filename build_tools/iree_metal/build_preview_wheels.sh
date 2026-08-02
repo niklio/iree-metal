@@ -28,8 +28,8 @@ if ! "${python_bin}" -c 'import sys; raise SystemExit(sys.version_info[:2] != (3
   exit 2
 fi
 
-if ! "${python_bin}" -c 'import re, sys; raise SystemExit(not re.fullmatch(r"3\.11\.0\.dev[0-9]{8}", sys.argv[1]))' "${preview_version}"; then
-  echo "error: IREE_METAL_VERSION must match 3.11.0.devYYYYMMDD" >&2
+if ! "${python_bin}" -c 'import re, sys; raise SystemExit(not re.fullmatch(r"3\.11\.0\.dev[0-9]{8}(?:[0-9]{2})?", sys.argv[1]))' "${preview_version}"; then
+  echo "error: IREE_METAL_VERSION must match 3.11.0.devYYYYMMDD or 3.11.0.devYYYYMMDDNN" >&2
   exit 2
 fi
 
