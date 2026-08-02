@@ -27,8 +27,8 @@ if ! "${python_bin}" -c 'import sys; raise SystemExit(sys.version_info[:2] != (3
   exit 2
 fi
 
-if ! "${python_bin}" -c 'import sys; from packaging.version import Version, InvalidVersion; Version(sys.argv[1])' "${preview_version}"; then
-  echo "error: IREE_METAL_VERSION is not a valid PEP 440 version" >&2
+if ! "${python_bin}" -c 'import re, sys; raise SystemExit(not re.fullmatch(r"3\.11\.0\.dev[0-9]{8}", sys.argv[1]))' "${preview_version}"; then
+  echo "error: IREE_METAL_VERSION must match 3.11.0.devYYYYMMDD" >&2
   exit 2
 fi
 
