@@ -173,8 +173,11 @@ PIP_DISABLE_PIP_VERSION_CHECK=1 \
 "${audit_venv}/bin/python" -m pip check
 echo "offline dependency closure validation passed"
 
+wheel_extract_dir="${temporary_dir}/project-wheels"
+mkdir -p "${wheel_extract_dir}"
 for wheel in "${wheelhouse}"/*.whl; do
-  "${python_bin}" -m zipfile -e "${wheel}" "${temporary_dir}/$(basename "${wheel}")"
+  "${python_bin}" -m zipfile -e \
+    "${wheel}" "${wheel_extract_dir}/$(basename "${wheel}")"
 done
 
 native_count=0
@@ -199,7 +202,7 @@ while IFS= read -r native_library; do
         ;;
     esac
   done < <(tail -n +2 "${dependency_file}" | awk '{print $1}')
-done < <(find "${temporary_dir}" -type f \( -name '*.dylib' -o -name '*.so' \) -print)
+done < <(find "${wheel_extract_dir}" -type f \( -name '*.dylib' -o -name '*.so' \) -print)
 
 if [[ "${native_count}" -eq 0 ]]; then
   echo "error: no native libraries found in preview wheels" >&2
