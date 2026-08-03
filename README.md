@@ -12,32 +12,45 @@ release manifest names the newer macOS version actually validated.
 
 ## Install the developer preview
 
-Download the preview bundle from
-[GitHub Releases](https://github.com/niklio/iree-metal/releases). It includes
-the two project wheels, a complete hashed dependency wheelhouse, checksums,
-license inventory, provenance manifest, and SBOM. Exact-wheel verifier evidence
-is attached alongside the bundle.
+Use a fresh Python 3.12 virtual environment. Do not install the stock
+`iree-base-compiler` package in the same environment because it shares the
+`iree.compiler` import namespace with this preview.
 
 ```bash
-tar -xzf iree-metal-preview-3.11.0.dev2026080202-macos-arm64.tar.gz
-cd iree-metal-preview-3.11.0.dev2026080202
 python3.12 -m venv .venv
 source .venv/bin/activate
-python -m pip install --no-index \
-  --find-links . --find-links dependencies \
-  ./iree_base_compiler_iree_metal-*.whl \
-  ./iree_pjrt_plugin_metal_iree_metal-*.whl
+python -m pip install \
+  https://github.com/niklio/iree-metal/releases/download/iree-metal-v3.11.0.dev2026080202/iree_base_compiler_iree_metal-3.11.0.dev2026080202-cp312-abi3-macosx_13_0_arm64.whl \
+  https://github.com/niklio/iree-metal/releases/download/iree-metal-v3.11.0.dev2026080202/iree_pjrt_plugin_metal_iree_metal-3.11.0.dev2026080202-py3-none-macosx_13_0_arm64.whl
+```
+
+The wheels install their dependencies, including the required JAX and JAXLIB
+0.6.1 versions. To manage iree-metal in a `requirements.txt`, add these two
+lines instead:
+
+```text
+iree-base-compiler-iree-metal @ https://github.com/niklio/iree-metal/releases/download/iree-metal-v3.11.0.dev2026080202/iree_base_compiler_iree_metal-3.11.0.dev2026080202-cp312-abi3-macosx_13_0_arm64.whl
+iree-pjrt-plugin-metal-iree-metal @ https://github.com/niklio/iree-metal/releases/download/iree-metal-v3.11.0.dev2026080202/iree_pjrt_plugin_metal_iree_metal-3.11.0.dev2026080202-py3-none-macosx_13_0_arm64.whl
+```
+
+Then select the backend when running your program:
+
+```bash
 JAX_PLATFORMS=iree_metal python -c \
   'import jax; print(jax.devices())'
 ```
 
-No performance campaign flags are required. The wheels select the tested
-`preview-20260802` profile internally. For diagnosis, the one supported
-rollback is `IREE_METAL_PROFILE=baseline`.
+That is the only required runtime setting. The wheels select the tested
+`preview-20260802` profile automatically; no tuning flags are needed. For
+diagnosis, the one supported rollback is `IREE_METAL_PROFILE=baseline`.
 
-Read the [developer preview guide](docs/metal/developer-preview.md) before using
-the backend. It documents the numeric contract, support boundary, verification
-method, and known limitations.
+Advanced users who need an offline installation, exact dependency locking,
+checksums, or GitHub provenance verification can download the self-contained
+bundle from the
+[Developer Preview 1 release](https://github.com/niklio/iree-metal/releases/tag/iree-metal-v3.11.0.dev2026080202)
+and follow the [developer preview guide](docs/metal/developer-preview.md). The
+guide also documents the numeric contract, support boundary, and known
+limitations.
 
 ## Project status
 
