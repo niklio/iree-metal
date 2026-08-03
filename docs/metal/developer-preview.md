@@ -24,7 +24,7 @@ profile.
 
 ## Install the offline bundle
 
-Download `iree-metal-preview-3.11.0.dev20260803-macos-arm64.tar.gz` from the
+Download `iree-metal-preview-3.11.0.dev2026080301-macos-arm64.tar.gz` from the
 GitHub prerelease. The bundle contains the two project wheels and all locked
 runtime dependencies needed for an offline installation. Do not mix wheels
 from different releases and do not install stock `iree-base-compiler` in the
@@ -33,9 +33,9 @@ import namespace.
 
 ```bash
 shasum -a 256 -c \
-  iree-metal-preview-3.11.0.dev20260803-macos-arm64.tar.gz.sha256
-tar -xzf iree-metal-preview-3.11.0.dev20260803-macos-arm64.tar.gz
-cd iree-metal-preview-3.11.0.dev20260803
+  iree-metal-preview-3.11.0.dev2026080301-macos-arm64.tar.gz.sha256
+tar -xzf iree-metal-preview-3.11.0.dev2026080301-macos-arm64.tar.gz
+cd iree-metal-preview-3.11.0.dev2026080301
 shasum -a 256 -c SHA256SUMS
 
 python3.12 -m venv .venv
@@ -118,15 +118,22 @@ environments installed from the exact release wheelhouse:
   Each validates loss, gradient norm, persistent per-leaf gradient signatures,
   replay determinism, and synchronized throughput.
 
-The model performance gate uses a frozen `jax-metal` baseline collected as a
-standalone board on the disclosed Apple M4 configuration. The verifier holds the
-GPU idle for five minutes between the semantic and model lanes, then preserves
-the baseline's original continuous model order. Each candidate model runs 16
-synchronized steps, discards three warmups and the slowest remaining sample,
-then averages the rest. The release requires all 231 checks to pass and the
-geometric mean of the 10 per-model throughput ratios to be strictly greater than
-1.00x. This is a bounded board comparison, not a claim of universal API or
-hardware parity.
+The model performance gate compares the release wheels with a live, artifact-keyed
+`jax-metal` 0.4.34 reference on the same disclosed Apple M4. For each model, one
+GPU lock covers a balanced candidate/reference/reference/candidate crossover.
+Every fresh worker runs 16 synchronized steps, discards three warmups and the
+slowest remaining sample, then averages the rest. The per-model ratio divides the
+geometric mean of the two candidate throughputs by the geometric mean of the two
+reference throughputs. Reversing the order controls for monotonic thermal and
+GPU-frequency drift without assuming a fixed idle state. The exact reference
+binaries and package metadata are hashed into the evidence. The release requires
+all 231 checks to pass and the geometric mean of the 10 per-model ratios to be
+strictly greater than 1.00x. This is a bounded board comparison, not a claim of
+universal API or hardware parity.
+
+Because JAX Metal is the harness reference, a process that fails during backend
+startup may be retried once; the failed attempt remains in the evidence. Candidate
+failures, numerical failures, and post-startup reference failures are not retried.
 
 Release evidence is sanitized to remove credentials and private filesystem
 paths. Benchmark claims are valid only for the disclosed hardware, software,
@@ -171,8 +178,8 @@ and Xcode:
 ```bash
 git clone --recursive https://github.com/niklio/iree-metal.git
 cd iree-metal
-git checkout iree-metal-v3.11.0.dev20260803
-export IREE_METAL_VERSION=3.11.0.dev20260803
+git checkout iree-metal-v3.11.0.dev2026080301
+export IREE_METAL_VERSION=3.11.0.dev2026080301
 export IREE_METAL_PYTHON=python3.12
 ./build_tools/iree_metal/build_preview_wheels.sh
 ./build_tools/iree_metal/smoke_test_wheels.sh ./wheelhouse

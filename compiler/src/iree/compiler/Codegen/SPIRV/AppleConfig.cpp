@@ -98,35 +98,73 @@ static LogicalResult setAppleMatmulConfig(linalg::LinalgOp op,
   // DEFAULT-ON (opt-out IREE_METAL_COOP_NO_APPLE_TUNE): Apple's 32-wide simdgroups favor
   // MORE subgroups + SMALLER MN tiles + software-pipelining than the NVIDIA-copied
   // (4,4,PD0) default. Sweep-validated bit-identical (config-only) and up to +39%
-  // (M=8192 wide-N), +54% ([4736x768x768]), +9% wide-N. RESTRICT to rank-2 large 2D
-  // matmuls whose EVERY dim (M,N and the contraction K on the inputs) is MULT-32: with
-  // 8 subgroups a mult-16-but-not-32 dim (e.g. ViT M=B*577 padded to 4624=16*289, or
-  // its backward K=4624) makes a partial tile that REGRESSES hard (-31..-78%). All-
-  // mult-32 shapes (gpt2/bert M=B*512, FFN N=3072, K=768) get the win; ViT is excluded.
+  // (M=8192 wide-N), +54% ([4736x768x768]), +9% wide-N. Restrict the tuned
+  // schedule to rank-2 large 2D matmuls whose every dimension (M, N, and the
+  // contraction K on the inputs) is a multiple of 128. The 8-subgroup schedule
+  // forms 128-element macro-tiles; on smaller alignment its 256-thread
+  // workgroups can trigger a sustained frequency drop in long Apple workloads.
+  // GPT/BERT (M=4096), DeiT (M=4608), and the validated M=4736 shape remain
+  // eligible, while ViT's padded M=4672 keeps the lower-power default schedule.
   if (!getenv("IREE_METAL_COOP_NO_APPLE_TUNE")) {
     auto outTy = dyn_cast<ShapedType>(op.getDpsInitOperand(0)->get().getType());
     bool ok = outTy && outTy.getRank() == 2 && outTy.getDimSize(0) >= 2048 &&
-              outTy.getDimSize(1) >= 512 && outTy.getDimSize(0) % 32 == 0 &&
-              outTy.getDimSize(1) % 32 == 0;
+              outTy.getDimSize(1) >= 512 && outTy.getDimSize(0) % 128 == 0 &&
+              outTy.getDimSize(1) % 128 == 0;
     if (ok) {
       for (OpOperand *in : op.getDpsInputOperands()) {
         auto t = dyn_cast<ShapedType>(in->get().getType());
         if (!t) { ok = false; break; }
         for (int64_t d : t.getShape())
-          if (d % 32 != 0) { ok = false; break; }
+          if (d % 128 != 0) { ok = false; break; }
         if (!ok) break;
       }
     }
     // iree-metal (2026-07-23): MNT=4 (was 2) — direct isolated matmul measurement showed the fork's
     // coop FFN matmul was only 80% of jax-metal (3.02 vs 3.78 TFLOP/s); an (SG=8,MNT=4,KT=4)
-    // sweep recovered it to 3.27 and gave +2.0-2.8% end-to-end on all 9 mult-32 models (correct).
-    // vit is excluded by the mult-32 gate (its 768x3072x4624 matmul is mult-16-not-32) so it keeps
-    // the safe default and does NOT hit the MNT=4 threadgroup overflow (38912>32768) seen when the
-    // knob was forced globally.
+    // sweep recovered it to 3.27 and gave +2.0-2.8% end-to-end on aligned models (correct).
+    // ViT's padded 4672 dimension is excluded; naturally 128-aligned transformer
+    // and DeiT shapes retain the eight-subgroup win.
     // KT=4 (not the default 2) is REQUIRED with MNT=4: MNT=4 alone overflows the 32768-byte
     // threadgroup cap (57344 B on 4096x768x768); KT=4 bounds the staged A/B tiles so it fits and
     // hits 3.27 TFLOP/s (vs 3.02 default). Both together = the measured +2-2.8% end-to-end.
-    if (ok) { sgD = 8; mntD = 4; pdD = 1; ktD = 4; }
+    if (ok) {
+      sgD = 8;
+      mntD = 4;
+      pdD = 1;
+      ktD = 4;
+    }
+
+    // Narrow 384-wide rank-2 contractions benefit from smaller per-subgroup MN
+    // tiles even when the surrounding large-shape tune is active. This covers
+    // forward, projection, and weight-gradient forms without changing batched
+    // attention. Balanced and reversed 16-step controls measured MNT=1 about
+    // 1.0% faster than MNT=2 and about 2.4% faster end-to-end than MNT=4; the
+    // resulting configuration change is limited to 13 rank-2 dispatches in the
+    // representative training graph.
+    bool isNarrow384Matmul = outTy && outTy.getRank() == 2;
+    bool has384Dimension = false;
+    int64_t largestDimension = 0;
+    auto inspectNarrow384Type = [&](ShapedType type) {
+      if (!type || type.getRank() != 2) {
+        isNarrow384Matmul = false;
+        return;
+      }
+      for (int64_t d : type.getShape()) {
+        if (d <= 0) {
+          isNarrow384Matmul = false;
+          return;
+        }
+        has384Dimension |= d == 384;
+        if (d > largestDimension) largestDimension = d;
+      }
+    };
+    inspectNarrow384Type(outTy);
+    for (OpOperand *in : op.getDpsInputOperands()) {
+      inspectNarrow384Type(dyn_cast<ShapedType>(in->get().getType()));
+    }
+    if (isNarrow384Matmul && has384Dimension && largestDimension >= 1536) {
+      mntD = 1;
+    }
   }
   if (succeeded(setCooperativeMatrixConfig(target, op,
                                            /*numSubgroupsPerWorkgroup=*/envU("IREE_METAL_COOP_SG", sgD),

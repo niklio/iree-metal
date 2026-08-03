@@ -8,6 +8,7 @@ from copy import deepcopy
 import gzip
 from hashlib import sha256
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -36,6 +37,23 @@ SECRET_PATTERNS = (
     re.compile(rb"AKIA[0-9A-Z]{16}"),
     re.compile(rb"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
 )
+MODEL_TIMING_PROTOCOL = {
+    "name": "paired-crossover-abba-v1",
+    "order": ["candidate", "reference", "reference", "candidate"],
+    "repetitions_per_backend": 2,
+    "reference_startup_max_attempts": 2,
+    "retry_policy": "reference-process-startup-failures-only",
+    "worker_aggregation": "discard-slowest-then-arithmetic-mean",
+    "model_aggregation": "ratio-of-throughput-geometric-means",
+    "board_aggregation": "geometric-mean-of-model-ratios",
+}
+JAX_METAL_REFERENCE_ARTIFACTS = {
+    "pjrt_plugin_metal_14.dylib",
+    "xla_extension.so",
+    "jax_metal-0.1.1.dist-info/METADATA",
+    "jax-0.4.34.dist-info/METADATA",
+    "jaxlib-0.4.34.dist-info/METADATA",
+}
 
 
 def file_sha256(path: Path) -> str:
@@ -190,7 +208,12 @@ def validate_model_summary(
             "performance_cases": 10,
             "models_passed": 10,
             "models_total": 10,
+            "correctness_gate_passed": True,
+            "performance_gate_passed": True,
             "gate_passed": True,
+            "release_ready": True,
+            "jaxmetal_jax_version": "0.4.34",
+            "timing_protocol": MODEL_TIMING_PROTOCOL["name"],
             "status_counts": {"PASS": 10},
         },
         "model verifier summary",
@@ -206,6 +229,32 @@ def artifact_records(manifest: dict[str, Any], label: str) -> dict[str, str]:
         digest = artifact.get("sha256")
         if not name or not digest or name in observed:
             raise SystemExit(f"malformed or duplicate {label} artifact: {artifact}")
+        observed[name] = digest
+    return observed
+
+
+def reference_artifact_name(raw: str) -> str:
+    path = Path(raw)
+    if path.name == "METADATA" and path.parent.name.endswith(".dist-info"):
+        return f"{path.parent.name}/{path.name}"
+    return path.name
+
+
+def reference_artifact_records(manifest: dict[str, Any]) -> dict[str, str]:
+    observed: dict[str, str] = {}
+    for artifact in manifest.get("performance_reference_artifacts", []):
+        name = reference_artifact_name(artifact.get("path", ""))
+        digest = artifact.get("sha256")
+        size = artifact.get("size")
+        if (
+            not name
+            or name in observed
+            or not isinstance(size, int)
+            or size <= 0
+            or not isinstance(digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        ):
+            raise SystemExit(f"malformed or duplicate jax-metal artifact: {artifact}")
         observed[name] = digest
     return observed
 
@@ -255,7 +304,8 @@ def validate_model_protocol(manifest: dict[str, Any]) -> None:
         {
             "steps": 16,
             "warmups": 3,
-            "suite_settle_seconds": 300,
+            "suite_settle_seconds": 0,
+            "timing_protocol": MODEL_TIMING_PROTOCOL,
         },
         "model verifier protocol",
     )
@@ -267,6 +317,33 @@ def validate_model_protocol(manifest: dict[str, Any]) -> None:
             raise SystemExit("model verifier manifest contains malformed verifier source")
         if not artifact["path"] or not re.fullmatch(r"[0-9a-f]{64}", artifact["sha256"]):
             raise SystemExit("model verifier manifest contains malformed verifier source")
+    reference = manifest.get("performance_reference")
+    if not isinstance(reference, dict):
+        raise SystemExit("model verifier manifest is missing its live jax-metal reference")
+    require_values(
+        reference,
+        {
+            "id": "jax-metal-0.4.34",
+            "platform": "METAL",
+            "environment": {"ENABLE_PJRT_COMPATIBILITY": "1"},
+            "install_artifacts": [],
+        },
+        "model verifier jax-metal reference",
+    )
+    expected_paths = {
+        reference_artifact_name(path) for path in reference.get("artifacts", [])
+    }
+    if expected_paths != JAX_METAL_REFERENCE_ARTIFACTS:
+        raise SystemExit(
+            "model verifier jax-metal reference does not identify the exact supported "
+            f"software stack: {sorted(expected_paths)}"
+        )
+    reference_artifacts = reference_artifact_records(manifest)
+    if set(reference_artifacts) != JAX_METAL_REFERENCE_ARTIFACTS:
+        raise SystemExit(
+            "model verifier manifest does not hash the complete jax-metal reference: "
+            f"{sorted(reference_artifacts)}"
+        )
 
 
 def validate_database(path: Path, run_id: str, expected: int, label: str) -> None:
@@ -308,17 +385,112 @@ def validate_case_records(
 
 def validate_model_record_protocol(path: Path) -> None:
     records = [json.loads(line) for line in path.read_text().splitlines() if line]
-    mismatched = [
-        record.get("model", record.get("case_id", "<unknown>"))
-        for record in records
-        if record.get("metadata", {}).get("steps") != 16
-        or record.get("metadata", {}).get("warmups") != 3
-    ]
-    if mismatched:
-        raise SystemExit(
-            "model verifier records do not use the release timing protocol: "
-            f"{mismatched}"
+    expected_roles = MODEL_TIMING_PROTOCOL["order"]
+    for record in records:
+        model = record.get("model", record.get("case_id", "<unknown>"))
+        metadata = record.get("metadata", {})
+        measurements = record.get("measurements", [])
+        mismatch = (
+            metadata.get("steps") != 16
+            or metadata.get("warmups") != 3
+            or metadata.get("timing_protocol") != MODEL_TIMING_PROTOCOL["name"]
+            or metadata.get("crossover_order") != expected_roles
+            or metadata.get("candidate_repetitions") != 2
+            or metadata.get("reference_repetitions") != 2
+            or len(measurements) != 4
+            or [measurement.get("role") for measurement in measurements] != expected_roles
+            or [measurement.get("sequence") for measurement in measurements] != [1, 2, 3, 4]
+            or [measurement.get("repetition") for measurement in measurements] != [1, 1, 2, 2]
         )
+        if mismatch:
+            raise SystemExit(
+                f"model verifier record {model} does not use the release crossover protocol"
+            )
+        if any(
+            measurement.get("status") != "PASS"
+            or measurement.get("classification_status") != "PASS"
+            or measurement.get("metadata", {}).get("steps") != 16
+            or measurement.get("metadata", {}).get("warmups") != 3
+            for measurement in measurements
+        ):
+            raise SystemExit(
+                f"model verifier record {model} contains a failed or malformed repetition"
+            )
+        for measurement in measurements:
+            worker = measurement.get("metadata", {})
+            step_times = worker.get("step_times_ms")
+            steady_times = worker.get("steady_times_ms")
+            retained_times = worker.get("retained_times_ms")
+            if (
+                not isinstance(step_times, list)
+                or len(step_times) != 16
+                or not isinstance(steady_times, list)
+                or steady_times != step_times[3:]
+                or not isinstance(retained_times, list)
+                or retained_times != sorted(steady_times)[:-1]
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, (float, int))
+                    or not math.isfinite(float(value))
+                    or value <= 0
+                    for value in step_times
+                )
+                or not math.isclose(
+                    float(measurement.get("execute_ms", 0.0)),
+                    sum(retained_times) / len(retained_times),
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                )
+            ):
+                raise SystemExit(
+                    f"model verifier record {model} does not retain auditable step timings"
+                )
+        for measurement in measurements:
+            attempts = measurement.get("attempts")
+            max_attempts = 2 if measurement["role"] == "reference" else 1
+            if (
+                not isinstance(attempts, list)
+                or not 1 <= len(attempts) <= max_attempts
+                or attempts[-1].get("status") != "PASS"
+                or any(
+                    attempt.get("attempt") != index
+                    for index, attempt in enumerate(attempts, 1)
+                )
+                or any(
+                    attempt.get("status") != "RUNTIME_FAIL"
+                    or attempt.get("phase") not in (None, "import", "initialize")
+                    for attempt in attempts[:-1]
+                )
+            ):
+                raise SystemExit(
+                    f"model verifier record {model} contains an invalid retry history"
+                )
+        candidate = [
+            float(measurement.get("tflops", 0.0))
+            for measurement in measurements if measurement["role"] == "candidate"
+        ]
+        reference = [
+            float(measurement.get("tflops", 0.0))
+            for measurement in measurements if measurement["role"] == "reference"
+        ]
+        if any(not math.isfinite(value) or value <= 0 for value in candidate + reference):
+            raise SystemExit(f"model verifier record {model} contains an invalid throughput")
+        candidate_mean = math.exp(sum(math.log(value) for value in candidate) / len(candidate))
+        reference_mean = math.exp(sum(math.log(value) for value in reference) / len(reference))
+        expected_ratio = candidate_mean / reference_mean
+        for actual, expected, label in (
+            (record.get("tflops"), candidate_mean, "candidate throughput"),
+            (record.get("jaxmetal_tflops"), reference_mean, "reference throughput"),
+            (record.get("perf_vs_jaxmetal"), expected_ratio, "performance ratio"),
+        ):
+            if (
+                isinstance(actual, bool)
+                or not isinstance(actual, (float, int))
+                or not math.isclose(float(actual), expected, rel_tol=1e-12, abs_tol=1e-12)
+            ):
+                raise SystemExit(
+                    f"model verifier record {model} has inconsistent {label}: {actual!r}"
+                )
 
 
 def resolve_evidence_dir(raw: Any, combined_dir: Path, label: str) -> Path:
@@ -342,13 +514,18 @@ def sanitize_backend(backend: dict[str, Any] | None, label: str) -> None:
     backend["python"] = f"<sanitized:{label}-python>"
     for key in ("artifacts", "install_artifacts"):
         if key in backend:
-            backend[key] = [Path(path).name for path in backend[key]]
+            backend[key] = [
+                reference_artifact_name(path) if label == "reference" else Path(path).name
+                for path in backend[key]
+            ]
 
 
 def sanitized_manifest(manifest: dict[str, Any], kind: str) -> dict[str, Any]:
     clean = deepcopy(manifest)
     for artifact in clean.get("artifacts", []):
         artifact["path"] = Path(artifact["path"]).name
+    for artifact in clean.get("performance_reference_artifacts", []):
+        artifact["path"] = reference_artifact_name(artifact["path"])
     sanitize_backend(clean.get("candidate"), "candidate")
     sanitize_backend(clean.get("oracle"), "oracle")
     sanitize_backend(clean.get("performance_reference"), "reference")
@@ -503,9 +680,10 @@ def main() -> None:
             "Semantic result: 221/221 PASS\n"
             "Application result: 10/10 PASS\n"
             f"Model geometric mean: {combined_summary['perf_vs_jaxmetal']:.6f}x "
-            "versus the frozen jax-metal baseline\n"
+            "versus the paired live, artifact-keyed jax-metal reference\n"
             "The candidate was installed from the ten hashed wheels listed in each "
-            "manifest and used no candidate environment overrides. The semantic and "
+            "manifest and used no candidate environment overrides. Each model used a "
+            "balanced candidate/reference/reference/candidate crossover. The semantic and "
             "models directories contain case-level JSONL records, reports, summaries, "
             "and integrity-checked SQLite evidence stores.\n"
         )
