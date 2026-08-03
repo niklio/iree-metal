@@ -142,3 +142,16 @@ func.func @outerproduct_bf16(%arg0 : vector<1xbf16>, %arg1 : vector<1xbf16>, %ar
 // CHECK: %[[PROD:.+]] = vector.outerproduct %[[EXT0]], %[[EXT1]], %[[EXT2]] {kind = #vector.kind<add>} : vector<1xf32>, vector<1xf32>
 // CHECK: %[[TRUNC:.+]] = arith.truncf %[[PROD]] : vector<1x1xf32> to vector<1x1xbf16>
 // CHECK: return %[[TRUNC]] : vector<1x1xbf16>
+
+// -----
+
+func.func @subgroup_reduce_bf16(%arg0 : bf16) -> bf16 {
+  %0 = gpu.subgroup_reduce add %arg0 : (bf16) -> bf16
+  return %0 : bf16
+}
+
+// CHECK-LABEL: func.func @subgroup_reduce_bf16
+// CHECK: %[[EXT:.+]] = arith.extf %arg0 : bf16 to f32
+// CHECK: %[[REDUCE:.+]] = gpu.subgroup_reduce add %[[EXT]] : (f32) -> f32
+// CHECK: %[[TRUNC:.+]] = arith.truncf %[[REDUCE]] : f32 to bf16
+// CHECK: return %[[TRUNC]] : bf16

@@ -22,6 +22,7 @@
 #include "llvm/Support/FormatVariadic.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Transforms/Passes.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -289,6 +290,12 @@ struct ConvertBf16ArithToF32Pass final
                                  vector::MultiDimReductionOp, vector::MaskOp,
                                  vector::OuterProductOp, vector::YieldOp>(
         checkOp);
+
+    // SPIR-V subgroup arithmetic does not support bf16. Subgroup reductions
+    // are introduced after vector lowering, so make them participate in this
+    // conversion just like vector reductions instead of allowing bf16 to reach
+    // the SPIR-V verifier.
+    target.addDynamicallyLegalOp<gpu::SubgroupReduceOp>(checkOp);
 
     // Some ops are always legal.
     target.addLegalOp<arith::BitcastOp>();
