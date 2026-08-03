@@ -27,6 +27,15 @@ from jax_plugins import iree_metal
 
 
 class PreviewProfileTest(unittest.TestCase):
+    def test_preview_includes_shipped_physical_apple_attention_gates(self):
+        self.assertTrue(
+            {
+                "IREE_METAL_APPLE_PHYSICAL_BACKWARD_COMPACT_SMEM",
+                "IREE_METAL_APPLE_PHYSICAL_FRAGMENTS",
+                "IREE_METAL_APPLE_PHYSICAL_SCORE_WG64",
+            }.issubset(iree_metal._PREVIEW_FEATURE_GATES)
+        )
+
     def test_preview_is_the_default(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             profile, options = iree_metal._configure_preview_profile()
