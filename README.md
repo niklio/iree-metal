@@ -25,13 +25,7 @@ python -m pip install \
 ```
 
 The wheels install their dependencies, including the required JAX and JAXLIB
-0.6.1 versions. To manage iree-metal in a `requirements.txt`, add these two
-lines instead:
-
-```text
-iree-base-compiler-iree-metal @ https://github.com/niklio/iree-metal/releases/download/iree-metal-v3.11.0.dev2026080202/iree_base_compiler_iree_metal-3.11.0.dev2026080202-cp312-abi3-macosx_13_0_arm64.whl
-iree-pjrt-plugin-metal-iree-metal @ https://github.com/niklio/iree-metal/releases/download/iree-metal-v3.11.0.dev2026080202/iree_pjrt_plugin_metal_iree_metal-3.11.0.dev2026080202-py3-none-macosx_13_0_arm64.whl
-```
+0.6.1 versions.
 
 Then select the backend when running your program:
 
