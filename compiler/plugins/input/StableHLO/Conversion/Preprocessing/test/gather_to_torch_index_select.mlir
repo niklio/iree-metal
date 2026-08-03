@@ -3,7 +3,10 @@
 
 // CHECK-LABEL: @gather_to_index_select
 func.func @gather_to_index_select(%arg0 : tensor<5x4xf32>, %arg1 : tensor<1x3x1xi32>) -> tensor<1x3x4xf32> {
-  // CHECK: [[TIS:%.+]] = "stablehlo.torch_index_select"(%arg0, %arg1)
+  // StableHLO gather clamps out-of-bounds start indices. Preserve that
+  // behavior in the torch_index_select fast path.
+  // CHECK: [[CLAMP:%.+]] = stablehlo.clamp {{.*}}, %arg1, {{.*}}
+  // CHECK: [[TIS:%.+]] = "stablehlo.torch_index_select"(%arg0, [[CLAMP]])
   // CHECK-SAME:   batch_dims = 0 : i64,
   // CHECK-SAME:   dim = 0 : i64
   // CHECK-SAME: : (tensor<5x4xf32>, tensor<1x3x1xi32>) -> tensor<1x3x1x4xf32>

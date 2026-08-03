@@ -106,10 +106,34 @@ struct GatherIsTorchIndexSelectPattern final
       return rewriter.notifyMatchFailure(gather, "collapsed_slice_dims != [0]");
     }
 
+    // StableHLO gather clamps each start index to the largest valid start for
+    // its slice. torch_index_select has no corresponding bounds semantics, so
+    // preserve gather behavior explicitly before taking the optimized path.
+    // This pattern only accepts a unit slice along operand dimension 0, making
+    // operand_size - 1 the largest valid index.
+    int64_t indexedDimSize = operandTy.getDimSize(0);
+    if (ShapedType::isDynamic(indexedDimSize) || indexedDimSize <= 0) {
+      return rewriter.notifyMatchFailure(
+          gather, "indexed operand dimension is not statically positive");
+    }
+    auto indexTy = cast<RankedTensorType>(startIndices.getType());
+    auto indexElementTy = cast<IntegerType>(indexTy.getElementType());
+    auto scalarIndexTy = RankedTensorType::get({}, indexElementTy);
+    auto indexConstant = [&](int64_t value) -> Value {
+      return mlir::stablehlo::ConstantOp::create(
+          rewriter, gather.getLoc(),
+          DenseElementsAttr::get(
+              scalarIndexTy,
+              rewriter.getIntegerAttr(indexElementTy, value)));
+    };
+    Value clampedIndices = mlir::stablehlo::ClampOp::create(
+        rewriter, gather.getLoc(), indexTy, indexConstant(0), startIndices,
+        indexConstant(indexedDimSize - 1));
+
     auto torchIndexSelect = mlir::stablehlo::TorchIndexSelectOp::create(
         rewriter, gather.getLoc(),
         RankedTensorType::get(indexSelectShape, operandTy.getElementType()),
-        operand, gather.getStartIndices(), rewriter.getI64IntegerAttr(0),
+        operand, clampedIndices, rewriter.getI64IntegerAttr(0),
         rewriter.getI64IntegerAttr(0));
 
     rewriter.replaceOpWithNewOp<mlir::stablehlo::ReshapeOp>(
