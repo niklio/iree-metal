@@ -118,12 +118,15 @@ environments installed from the exact release wheelhouse:
   Each validates loss, gradient norm, persistent per-leaf gradient signatures,
   replay determinism, and synchronized throughput.
 
-The model performance gate uses a frozen `jax-metal` baseline collected on the
-disclosed Apple M4 configuration. Each candidate model runs 12 synchronized
-steps, discards two warmups and the slowest remaining sample, then averages the
-rest. The release requires all 231 checks to pass and the geometric mean of the
-10 per-model throughput ratios to be strictly greater than 1.00x. This is a
-bounded board comparison, not a claim of universal API or hardware parity.
+The model performance gate uses a frozen `jax-metal` baseline collected as a
+standalone board on the disclosed Apple M4 configuration. The verifier holds the
+GPU idle for five minutes between the semantic and model lanes, then preserves
+the baseline's original continuous model order. Each candidate model runs 16
+synchronized steps, discards three warmups and the slowest remaining sample,
+then averages the rest. The release requires all 231 checks to pass and the
+geometric mean of the 10 per-model throughput ratios to be strictly greater than
+1.00x. This is a bounded board comparison, not a claim of universal API or
+hardware parity.
 
 Release evidence is sanitized to remove credentials and private filesystem
 paths. Benchmark claims are valid only for the disclosed hardware, software,

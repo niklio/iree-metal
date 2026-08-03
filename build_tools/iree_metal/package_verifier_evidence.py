@@ -249,6 +249,26 @@ def validate_run_manifest(
         )
 
 
+def validate_model_protocol(manifest: dict[str, Any]) -> None:
+    require_values(
+        manifest,
+        {
+            "steps": 16,
+            "warmups": 3,
+            "suite_settle_seconds": 300,
+        },
+        "model verifier protocol",
+    )
+    verifier = manifest.get("verifier")
+    if not isinstance(verifier, list) or not verifier:
+        raise SystemExit("model verifier manifest does not identify the verifier source")
+    for artifact in verifier:
+        if not isinstance(artifact, dict) or set(artifact) != {"path", "sha256"}:
+            raise SystemExit("model verifier manifest contains malformed verifier source")
+        if not artifact["path"] or not re.fullmatch(r"[0-9a-f]{64}", artifact["sha256"]):
+            raise SystemExit("model verifier manifest contains malformed verifier source")
+
+
 def validate_database(path: Path, run_id: str, expected: int, label: str) -> None:
     uri = f"file:{path}?mode=ro"
     with sqlite3.connect(uri, uri=True) as database:
@@ -284,6 +304,21 @@ def validate_case_records(
         raise SystemExit(f"{label} cases.jsonl contains records from another run")
     if any(record.get("status") != "PASS" for record in records):
         raise SystemExit(f"{label} cases.jsonl contains a non-passing record")
+
+
+def validate_model_record_protocol(path: Path) -> None:
+    records = [json.loads(line) for line in path.read_text().splitlines() if line]
+    mismatched = [
+        record.get("model", record.get("case_id", "<unknown>"))
+        for record in records
+        if record.get("metadata", {}).get("steps") != 16
+        or record.get("metadata", {}).get("warmups") != 3
+    ]
+    if mismatched:
+        raise SystemExit(
+            "model verifier records do not use the release timing protocol: "
+            f"{mismatched}"
+        )
 
 
 def resolve_evidence_dir(raw: Any, combined_dir: Path, label: str) -> Path:
@@ -401,6 +436,7 @@ def main() -> None:
         semantic_manifest, semantic_summary, wheels, "semantic run"
     )
     validate_run_manifest(model_manifest, model_summary, wheels, "model run")
+    validate_model_protocol(model_manifest)
     validate_database(
         semantic_dir / "evidence.sqlite3", semantic_summary["run_id"], 221, "semantic"
     )
@@ -413,6 +449,7 @@ def main() -> None:
     validate_case_records(
         model_dir / "cases.jsonl", model_summary["run_id"], 10, "model"
     )
+    validate_model_record_protocol(model_dir / "cases.jsonl")
 
     epoch = args.source_date_epoch
     if epoch is None:
