@@ -113,12 +113,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           version="${GITHUB_REF_NAME#iree-metal-v}"
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} already exists; preserving its verified assets."
+            exit 0
+          fi
           gh release create "${GITHUB_REF_NAME}" \
             --repo "${GITHUB_REPOSITORY}" \
             --verify-tag \
             --draft \
             --prerelease \
-            --title "iree-metal ${version} — Developer Preview 1" \
+            --title "iree-metal ${version} — Developer Preview 2" \
             --notes-file wheelhouse/RELEASE_NOTES.md \
             wheelhouse/*.whl \
             wheelhouse/SHA256SUMS \

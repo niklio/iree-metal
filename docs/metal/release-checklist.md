@@ -35,8 +35,9 @@ regenerated after the performance campaign lands.
 - [ ] Build from a fresh recursive clone, not the campaign checkout.
 - [ ] Run the full correctness board against the exact wheels being released.
 - [ ] Package the passing run with `package_verifier_evidence.py`; require an
-      empty candidate environment, exact hashes for all eight installed wheels,
-      database integrity, and no private paths or credential patterns.
+      empty candidate environment, exact hashes for all ten installed wheels,
+      221/221 semantic and 10/10 model checks, model geometric-mean parity above
+      1.00x, database integrity, and no private paths or credential patterns.
 - [ ] Rerun baselines on the disclosed hardware and store hardware metadata.
 - [ ] Generate final performance tables and release claims from those results.
 - [ ] Test at least two fresh M4 machines or runner environments.

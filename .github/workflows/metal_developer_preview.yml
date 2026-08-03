@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: PEP 440 preview version (for example 3.11.0.dev20260802)
+        description: PEP 440 preview version (for example 3.11.0.dev20260803)
         required: true
         type: string
 

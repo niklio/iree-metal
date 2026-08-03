@@ -12,6 +12,12 @@ script_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "${script_dir}/../.." && pwd)"
 wheelhouse="$1"
 preview_version="$2"
+if [[ "${preview_version}" =~ \.dev([0-9]{8})([0-9]{2})?$ ]]; then
+  preview_profile="preview-${BASH_REMATCH[1]}"
+else
+  echo "error: version must end in .devYYYYMMDD or .devYYYYMMDDNN" >&2
+  exit 2
+fi
 python_bin="${IREE_METAL_PYTHON:-python3}"
 python_version="$("${python_bin}" --version 2>&1)"
 manifest="${wheelhouse}/iree-metal-preview-${preview_version}.manifest.txt"
@@ -44,7 +50,7 @@ fi
   echo "deployment-target: ${MACOSX_DEPLOYMENT_TARGET:-13.0}"
   echo "validated-host: Apple M4; product version above; CPython 3.12"
   echo "jax-version: 0.6.1"
-  echo "default-profile: preview-20260802"
+  echo "default-profile: ${preview_profile}"
   echo "rollback-profile: baseline"
   echo "compiler-options: --iree-metal-compile-to-metallib=false --iree-dispatch-creation-fuse-multi-use=false --iree-dispatch-creation-enable-aggressive-fusion=true"
   echo "numeric-contract: optimized causal attention assumes finite model inputs; use IREE_METAL_PROFILE=baseline for strict non-finite propagation diagnostics"

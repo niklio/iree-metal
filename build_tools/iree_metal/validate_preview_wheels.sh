@@ -21,6 +21,10 @@ import zipfile
 
 wheelhouse = Path(sys.argv[1])
 version = sys.argv[2]
+version_match = re.fullmatch(r"\d+\.\d+\.\d+\.dev(\d{8})(?:\d{2})?", version)
+if not version_match:
+    raise SystemExit("version must end in .devYYYYMMDD or .devYYYYMMDDNN")
+preview_profile = f"preview-{version_match.group(1)}"
 wheels = sorted(wheelhouse.glob("*.whl"))
 if len(wheels) != 2:
     raise SystemExit(f"expected two wheels, found {len(wheels)}")
@@ -147,7 +151,10 @@ for wheel in wheels:
                 "jax_plugins/iree_metal/__init__.py"
             ).decode()
             required_profile_fragments = (
-                'PREVIEW_PROFILE = "preview-20260802"',
+                f'PREVIEW_PROFILE = "{preview_profile}"',
+                '"IREE_METAL_APPLE_PHYSICAL_BACKWARD_COMPACT_SMEM"',
+                '"IREE_METAL_APPLE_PHYSICAL_FRAGMENTS"',
+                '"IREE_METAL_APPLE_PHYSICAL_SCORE_WG64"',
                 '"--iree-metal-compile-to-metallib=false"',
                 '"--iree-dispatch-creation-fuse-multi-use=false"',
                 '"--iree-dispatch-creation-enable-aggressive-fusion=true"',

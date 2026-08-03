@@ -7,7 +7,7 @@ Apple-supported framework.
 
 ## Support boundary
 
-The first preview deliberately has a narrow validation envelope:
+The preview deliberately has a narrow validation envelope:
 
 - Apple M4 hardware. Other Apple GPU generations are not yet claimed.
 - The exact macOS and Xcode build versions in the attached manifest. Wheels use
@@ -24,7 +24,7 @@ profile.
 
 ## Install the offline bundle
 
-Download `iree-metal-preview-3.11.0.dev2026080202-macos-arm64.tar.gz` from the
+Download `iree-metal-preview-3.11.0.dev20260803-macos-arm64.tar.gz` from the
 GitHub prerelease. The bundle contains the two project wheels and all locked
 runtime dependencies needed for an offline installation. Do not mix wheels
 from different releases and do not install stock `iree-base-compiler` in the
@@ -33,9 +33,9 @@ import namespace.
 
 ```bash
 shasum -a 256 -c \
-  iree-metal-preview-3.11.0.dev2026080202-macos-arm64.tar.gz.sha256
-tar -xzf iree-metal-preview-3.11.0.dev2026080202-macos-arm64.tar.gz
-cd iree-metal-preview-3.11.0.dev2026080202
+  iree-metal-preview-3.11.0.dev20260803-macos-arm64.tar.gz.sha256
+tar -xzf iree-metal-preview-3.11.0.dev20260803-macos-arm64.tar.gz
+cd iree-metal-preview-3.11.0.dev20260803
 shasum -a 256 -c SHA256SUMS
 
 python3.12 -m venv .venv
@@ -77,7 +77,7 @@ PY
 ```
 
 No campaign environment flags are required. The preview wheel selects the
-versioned `preview-20260802` profile, uses runtime MSL compilation so Xcode's
+versioned `preview-20260803` profile, uses runtime MSL compilation so Xcode's
 optional Metal Toolchain is not needed, and applies the tested fusion and
 optimization settings internally. The first execution includes compilation
 and is not representative of steady-state performance.
@@ -89,7 +89,7 @@ IREE_METAL_PROFILE=baseline JAX_PLATFORMS=iree_metal python app.py
 ```
 
 The baseline profile keeps the safe Metal compilation/fusion settings but
-turns off the fork's seven preview optimization gates. Individual legacy gates
+turns off the fork's preview optimization gates. Individual legacy gates
 remain implementation details for compiler developers and are not part of the
 public compatibility interface.
 
@@ -107,12 +107,23 @@ correctness.
 
 ## What the verifier measures
 
-The independent release verifier runs 166 operation/shape/dtype cases through
-the exact installed wheels. For each case it records compilation, execution,
-timeouts, output comparison, and synchronized execution timing against the
-disclosed `jax-metal` baseline. Its geometric execution-time ratio is a
-diagnostic comparison across that case board, not an end-to-end model, API
-coverage, or universal performance-parity claim.
+The independent `iree-metal-verifier` runs two gates through disposable
+environments installed from the exact release wheelhouse:
+
+- 221 BF16/F32 semantic cases spanning JIT, reverse-mode autodiff, vectorization,
+  reductions, gathers, scatters, transformer primitives, shapes, and index
+  patterns. Each records compilation, execution, determinism, timeout, and
+  output comparison against the JAX 0.6.1 CPU oracle.
+- 10 deterministic BF16 forward-and-backward transformer and vision workloads.
+  Each validates loss, gradient norm, persistent per-leaf gradient signatures,
+  replay determinism, and synchronized throughput.
+
+The model performance gate uses a frozen `jax-metal` baseline collected on the
+disclosed Apple M4 configuration. Each candidate model runs 12 synchronized
+steps, discards two warmups and the slowest remaining sample, then averages the
+rest. The release requires all 231 checks to pass and the geometric mean of the
+10 per-model throughput ratios to be strictly greater than 1.00x. This is a
+bounded board comparison, not a claim of universal API or hardware parity.
 
 Release evidence is sanitized to remove credentials and private filesystem
 paths. Benchmark claims are valid only for the disclosed hardware, software,
@@ -121,8 +132,9 @@ inputs, tolerances, synchronization, and aggregation method.
 Maintainers package a passing run with
 `build_tools/iree_metal/package_verifier_evidence.py`. The command rejects a
 candidate manifest with runtime overrides, wheel hashes that differ from the
-release wheelhouse, an incomplete or failing 166-case board, a corrupt evidence
-database, private filesystem paths, or common credential patterns.
+release wheelhouse, any failure among the 221 semantic or 10 model checks,
+model geometric-mean parity at or below 1.00x, a corrupt evidence database,
+private filesystem paths, or common credential patterns.
 
 ## Known limitations
 
@@ -156,8 +168,8 @@ and Xcode:
 ```bash
 git clone --recursive https://github.com/niklio/iree-metal.git
 cd iree-metal
-git checkout iree-metal-v3.11.0.dev2026080202
-export IREE_METAL_VERSION=3.11.0.dev2026080202
+git checkout iree-metal-v3.11.0.dev20260803
+export IREE_METAL_VERSION=3.11.0.dev20260803
 export IREE_METAL_PYTHON=python3.12
 ./build_tools/iree_metal/build_preview_wheels.sh
 ./build_tools/iree_metal/smoke_test_wheels.sh ./wheelhouse

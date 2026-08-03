@@ -24,7 +24,7 @@ if [[ -z "${preview_version}" ]]; then
 fi
 
 if ! "${python_bin}" -c 'import sys; raise SystemExit(sys.version_info[:2] != (3, 12))'; then
-  echo "error: the first preview is built and tested with Python 3.12 exactly" >&2
+  echo "error: the preview is built and tested with Python 3.12 exactly" >&2
   exit 2
 fi
 

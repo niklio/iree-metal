@@ -14,7 +14,7 @@ import jax._src.xla_bridge as xb
 
 logger = logging.getLogger(__name__)
 
-PREVIEW_PROFILE = "preview-20260802"
+PREVIEW_PROFILE = "preview-20260803"
 _PREVIEW_PROFILE_ALIASES = {"preview", PREVIEW_PROFILE}
 _PREVIEW_FEATURE_GATES = (
     "IREE_METAL_APPLE_PHYSICAL_BACKWARD_COMPACT_SMEM",
