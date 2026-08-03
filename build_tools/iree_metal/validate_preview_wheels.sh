@@ -99,6 +99,24 @@ for wheel in wheels:
                 f"{metadata['Name']} != {expected_name}"
             )
 
+        wheel_metadata_names = [n for n in names if n.endswith(".dist-info/WHEEL")]
+        if len(wheel_metadata_names) != 1:
+            raise SystemExit(f"expected one WHEEL metadata file in {wheel.name}")
+        wheel_metadata = Parser().parsestr(
+            archive.read(wheel_metadata_names[0]).decode()
+        )
+        expected_tag = (
+            "cp312-abi3-macosx_13_0_arm64"
+            if kind == "compiler"
+            else "py3-none-macosx_13_0_arm64"
+        )
+        tags = wheel_metadata.get_all("Tag", [])
+        if tags != [expected_tag]:
+            raise SystemExit(
+                f"wheel metadata tag mismatch in {wheel.name}: "
+                f"{tags} != {[expected_tag]}"
+            )
+
         if kind == "compiler":
             version_modules = [n for n in names if n == "iree/compiler/version.py"]
             if len(version_modules) != 1:
@@ -185,6 +203,11 @@ dependency_file="${temporary_dir}/otool-dependencies.txt"
 while IFS= read -r native_library; do
   native_count=$((native_count + 1))
   echo "Inspecting native dependencies: ${native_library}"
+  architectures="$(lipo -archs "${native_library}")"
+  if [[ "${architectures}" != "arm64" ]]; then
+    echo "error: ${native_library} has architectures '${architectures}', expected arm64" >&2
+    exit 2
+  fi
   if ! otool -L "${native_library}" > "${dependency_file}"; then
     echo "error: otool could not inspect ${native_library}" >&2
     exit 2

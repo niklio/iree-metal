@@ -98,6 +98,18 @@ export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "${repo_root}" show -s -
 export ZERO_AR_DATE=1
 export PYTHONHASHSEED=0
 export PYTHONDONTWRITEBYTECODE=1
+export CMAKE_OSX_ARCHITECTURES=arm64
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-13.0}"
+export ARCHFLAGS="-arch arm64"
+# GitHub's arm64 Python distribution can report itself as universal2. Force
+# setuptools to describe the arm64-only native payload truthfully.
+export _PYTHON_HOST_PLATFORM="macosx-${MACOSX_DEPLOYMENT_TARGET}-arm64"
+wheel_platform="$("${build_python}" -c \
+  'from setuptools.command.bdist_wheel import get_platform; print(get_platform(None).lower().replace("-", "_").replace(".", "_").replace(" ", "_"))')"
+if [[ "${wheel_platform}" != "macosx_13_0_arm64" ]]; then
+  echo "error: wheel platform resolved to ${wheel_platform}, expected macosx_13_0_arm64" >&2
+  exit 2
+fi
 
 patches_applied=0
 "${repo_root}/submodule-patches/apply.sh"
@@ -109,8 +121,6 @@ printf '{\n  "package-version": "%s",\n  "package-suffix": "-iree-metal",\n  "co
   "${preview_version}" "${preview_version}" "${jax_version}" "${jax_version}" \
   > "${pjrt_version_file}"
 
-export CMAKE_OSX_ARCHITECTURES=arm64
-export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-13.0}"
 export IREE_CMAKE_BUILD_TYPE=Release
 export LLVM_PARALLEL_LINK_JOBS="${LLVM_PARALLEL_LINK_JOBS:-1}"
 export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-3}"

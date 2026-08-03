@@ -71,6 +71,13 @@ jobs:
           python3 build_tools/iree_metal/package_preview_release.py \
             wheelhouse "${IREE_METAL_VERSION}"
 
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: ~/Library/Caches/ccache
+          key: iree-metal-release-ccache-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+
       - name: Attest release assets
         uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
         with:

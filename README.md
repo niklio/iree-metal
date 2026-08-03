@@ -19,8 +19,8 @@ license inventory, provenance manifest, and SBOM. Exact-wheel verifier evidence
 is attached alongside the bundle.
 
 ```bash
-tar -xzf iree-metal-preview-3.11.0.dev2026080201-macos-arm64.tar.gz
-cd iree-metal-preview-3.11.0.dev2026080201
+tar -xzf iree-metal-preview-3.11.0.dev2026080202-macos-arm64.tar.gz
+cd iree-metal-preview-3.11.0.dev2026080202
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --no-index \
