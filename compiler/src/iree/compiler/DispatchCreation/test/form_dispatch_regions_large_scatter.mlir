@@ -40,6 +40,104 @@ util.func public @large_nonunique_scatter_update(
 
 // -----
 
+// A gather-like producer lowered to tensor.extract has no tileable dimension
+// when consumed by an all-reduction scalar loss. Fusing the 257x256 F32
+// producer would require over 256 KiB of workgroup memory.
+util.func public @large_extract_scalar_reduction(
+    %indices: tensor<257xi32>,
+    %table: tensor<4096x256xf32>,
+    %weights: tensor<257x256xf32>) -> tensor<f32> {
+  %producerEmpty = tensor.empty() : tensor<257x256xf32>
+  %producer = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1) -> (d0)>,
+                       affine_map<(d0, d1) -> (d0, d1)>],
+      iterator_types = ["parallel", "parallel"]}
+      ins(%indices : tensor<257xi32>)
+      outs(%producerEmpty : tensor<257x256xf32>) {
+  ^bb0(%index: i32, %out: f32):
+    %row = arith.index_cast %index : i32 to index
+    %column = linalg.index 1 : index
+    %value = tensor.extract %table[%row, %column] : tensor<4096x256xf32>
+    linalg.yield %value : f32
+  } -> tensor<257x256xf32>
+  %zero = arith.constant 0.0 : f32
+  %resultEmpty = tensor.empty() : tensor<f32>
+  %filled = linalg.fill ins(%zero : f32) outs(%resultEmpty : tensor<f32>) -> tensor<f32>
+  %result = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>,
+                       affine_map<(d0, d1) -> (d0, d1)>,
+                       affine_map<(d0, d1) -> ()>],
+      iterator_types = ["reduction", "reduction"]}
+      ins(%producer, %weights : tensor<257x256xf32>, tensor<257x256xf32>)
+      outs(%filled : tensor<f32>) {
+  ^bb0(%value: f32, %weight: f32, %acc: f32):
+    %scaled = arith.mulf %value, %weight : f32
+    %sum = arith.addf %acc, %scaled : f32
+    linalg.yield %sum : f32
+  } -> tensor<f32>
+  util.return %result : tensor<f32>
+}
+
+// CHECK-LABEL: util.func public @large_extract_scalar_reduction
+//       CHECK: %[[PRODUCER:.+]] = flow.dispatch.region
+//       CHECK:   %[[GATHER:.+]] = linalg.generic
+//       CHECK:     tensor.extract
+//       CHECK:   flow.return %[[GATHER]]
+//       CHECK: %[[REDUCTION:.+]] = flow.dispatch.region
+//       CHECK:   linalg.generic
+//  CHECK-SAME:     ins(%[[PRODUCER]],
+//       CHECK:   flow.return
+//       CHECK: util.return %[[REDUCTION]]
+
+// -----
+
+// Small gather-like scalar reductions remain fused.
+util.func public @small_extract_scalar_reduction(
+    %indices: tensor<4xi32>,
+    %table: tensor<256x128xf32>,
+    %weights: tensor<4x128xf32>) -> tensor<f32> {
+  %producerEmpty = tensor.empty() : tensor<4x128xf32>
+  %producer = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1) -> (d0)>,
+                       affine_map<(d0, d1) -> (d0, d1)>],
+      iterator_types = ["parallel", "parallel"]}
+      ins(%indices : tensor<4xi32>)
+      outs(%producerEmpty : tensor<4x128xf32>) {
+  ^bb0(%index: i32, %out: f32):
+    %row = arith.index_cast %index : i32 to index
+    %column = linalg.index 1 : index
+    %value = tensor.extract %table[%row, %column] : tensor<256x128xf32>
+    linalg.yield %value : f32
+  } -> tensor<4x128xf32>
+  %zero = arith.constant 0.0 : f32
+  %resultEmpty = tensor.empty() : tensor<f32>
+  %filled = linalg.fill ins(%zero : f32) outs(%resultEmpty : tensor<f32>) -> tensor<f32>
+  %result = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>,
+                       affine_map<(d0, d1) -> (d0, d1)>,
+                       affine_map<(d0, d1) -> ()>],
+      iterator_types = ["reduction", "reduction"]}
+      ins(%producer, %weights : tensor<4x128xf32>, tensor<4x128xf32>)
+      outs(%filled : tensor<f32>) {
+  ^bb0(%value: f32, %weight: f32, %acc: f32):
+    %scaled = arith.mulf %value, %weight : f32
+    %sum = arith.addf %acc, %scaled : f32
+    linalg.yield %sum : f32
+  } -> tensor<f32>
+  util.return %result : tensor<f32>
+}
+
+// CHECK-LABEL: util.func public @small_extract_scalar_reduction
+//       CHECK: %[[FUSED:.+]] = flow.dispatch.region
+//       CHECK:   %[[GATHER:.+]] = linalg.generic
+//       CHECK:     tensor.extract
+//       CHECK:   linalg.generic
+//  CHECK-SAME:     ins(%[[GATHER]],
+//       CHECK:   flow.return
+//       CHECK: util.return %[[FUSED]]
+
+// -----
+
 // Small non-unique scatter updates stay fused so the resource guard does not
 // turn into a blanket performance restriction.
 util.func public @small_nonunique_scatter_update(

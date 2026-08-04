@@ -792,9 +792,44 @@ static bool isFusableWithProducer(OpOperand &operand,
     }
   }
 
+  // An all-reduction root has no parallel loop that can tile a fused producer.
+  // Indirect reads lowered through tensor.extract (for example embedding
+  // gathers) consequently materialize the producer's entire result in
+  // workgroup memory. Preserve a dispatch boundary when that static result
+  // alone exceeds Metal's 32 KiB limit. Elementwise and partially-parallel
+  // reductions keep their normal aggressive-fusion behavior.
+  bool oversizedUntiledExtractReduction = false;
+  if (linalgConsumer && linalgConsumer.getNumReductionLoops() != 0 &&
+      linalgConsumer.getNumParallelLoops() == 0) {
+    bool hasTensorExtract = false;
+    producer->walk([&](tensor::ExtractOp) {
+      hasTensorExtract = true;
+      return WalkResult::interrupt();
+    });
+    if (hasTensorExtract) {
+      constexpr int64_t kMetalWorkgroupMemoryLimitBits = 32 * 1024 * 8;
+      auto operandType = dyn_cast<ShapedType>(operand.get().getType());
+      if (!operandType || !operandType.hasStaticShape()) {
+        oversizedUntiledExtractReduction = true;
+      } else {
+        int64_t elementBitWidth = operandType.getElementTypeBitWidth();
+        int64_t maxElements =
+            kMetalWorkgroupMemoryLimitBits / elementBitWidth;
+        int64_t elementCount = 1;
+        for (int64_t dim : operandType.getShape()) {
+          if (dim != 0 && elementCount > maxElements / dim) {
+            oversizedUntiledExtractReduction = true;
+            break;
+          }
+          elementCount *= dim;
+        }
+      }
+    }
+  }
+
   // IREE_METAL_NONINIT_GUARD remains available as a broad diagnostic control.
   if (!options.aggressiveFusion || oversizedNonUniqueScatterUpdate ||
-      getenv("IREE_METAL_NONINIT_GUARD")) {
+      oversizedUntiledExtractReduction || getenv("IREE_METAL_NONINIT_GUARD")) {
     auto consumerFusionOp = dyn_cast<DestinationStyleOpInterface>(consumer);
     if (consumerFusionOp && !consumerFusionOp.isDpsInit(&operand)) {
       return false;
