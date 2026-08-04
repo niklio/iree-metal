@@ -20,8 +20,8 @@ Use a fresh Python 3.12 virtual environment. Do not install the stock
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install \
-  https://github.com/niklio/iree-metal/releases/download/iree-metal-v3.11.0.dev2026080301/iree_base_compiler_iree_metal-3.11.0.dev2026080301-cp312-abi3-macosx_13_0_arm64.whl \
-  https://github.com/niklio/iree-metal/releases/download/iree-metal-v3.11.0.dev2026080301/iree_pjrt_plugin_metal_iree_metal-3.11.0.dev2026080301-py3-none-macosx_13_0_arm64.whl
+  https://github.com/niklio/iree-metal/releases/download/iree-metal-v3.11.0.dev2026080302/iree_base_compiler_iree_metal-3.11.0.dev2026080302-cp312-abi3-macosx_13_0_arm64.whl \
+  https://github.com/niklio/iree-metal/releases/download/iree-metal-v3.11.0.dev2026080302/iree_pjrt_plugin_metal_iree_metal-3.11.0.dev2026080302-py3-none-macosx_13_0_arm64.whl
 ```
 
 The wheels install their dependencies, including the required JAX and JAXLIB
@@ -41,7 +41,7 @@ diagnosis, the one supported rollback is `IREE_METAL_PROFILE=baseline`.
 Advanced users who need an offline installation, exact dependency locking,
 checksums, or GitHub provenance verification can download the self-contained
 bundle from the
-[Developer Preview 2 release](https://github.com/niklio/iree-metal/releases/tag/iree-metal-v3.11.0.dev2026080301)
+[Developer Preview 2 release](https://github.com/niklio/iree-metal/releases/tag/iree-metal-v3.11.0.dev2026080302)
 and follow the [developer preview guide](docs/metal/developer-preview.md). The
 guide also documents the numeric contract, support boundary, and known
 limitations.

@@ -24,7 +24,7 @@ profile.
 
 ## Install the offline bundle
 
-Download `iree-metal-preview-3.11.0.dev2026080301-macos-arm64.tar.gz` from the
+Download `iree-metal-preview-3.11.0.dev2026080302-macos-arm64.tar.gz` from the
 GitHub prerelease. The bundle contains the two project wheels and all locked
 runtime dependencies needed for an offline installation. Do not mix wheels
 from different releases and do not install stock `iree-base-compiler` in the
@@ -33,9 +33,9 @@ import namespace.
 
 ```bash
 shasum -a 256 -c \
-  iree-metal-preview-3.11.0.dev2026080301-macos-arm64.tar.gz.sha256
-tar -xzf iree-metal-preview-3.11.0.dev2026080301-macos-arm64.tar.gz
-cd iree-metal-preview-3.11.0.dev2026080301
+  iree-metal-preview-3.11.0.dev2026080302-macos-arm64.tar.gz.sha256
+tar -xzf iree-metal-preview-3.11.0.dev2026080302-macos-arm64.tar.gz
+cd iree-metal-preview-3.11.0.dev2026080302
 shasum -a 256 -c SHA256SUMS
 
 python3.12 -m venv .venv
@@ -110,7 +110,7 @@ correctness.
 The independent `iree-metal-verifier` runs two gates through disposable
 environments installed from the exact release wheelhouse:
 
-- 221 BF16/F32 semantic cases spanning JIT, reverse-mode autodiff, vectorization,
+- 233 BF16/F32 semantic cases spanning JIT, reverse-mode autodiff, vectorization,
   reductions, gathers, scatters, transformer primitives, shapes, and index
   patterns. Each records compilation, execution, determinism, timeout, and
   output comparison against the JAX 0.6.1 CPU oracle.
@@ -127,7 +127,7 @@ geometric mean of the two candidate throughputs by the geometric mean of the two
 reference throughputs. Reversing the order controls for monotonic thermal and
 GPU-frequency drift without assuming a fixed idle state. The exact reference
 binaries and package metadata are hashed into the evidence. The release requires
-all 231 checks to pass and the geometric mean of the 10 per-model ratios to be
+all 243 checks to pass and the geometric mean of the 10 per-model ratios to be
 strictly greater than 1.00x. This is a bounded board comparison, not a claim of
 universal API or hardware parity.
 
@@ -142,7 +142,7 @@ inputs, tolerances, synchronization, and aggregation method.
 Maintainers package a passing run with
 `build_tools/iree_metal/package_verifier_evidence.py`. The command rejects a
 candidate manifest with runtime overrides, wheel hashes that differ from the
-release wheelhouse, any failure among the 221 semantic or 10 model checks,
+release wheelhouse, any failure among the 233 semantic or 10 model checks,
 model geometric-mean parity at or below 1.00x, a corrupt evidence database,
 private filesystem paths, or common credential patterns.
 
@@ -178,8 +178,8 @@ and Xcode:
 ```bash
 git clone --recursive https://github.com/niklio/iree-metal.git
 cd iree-metal
-git checkout iree-metal-v3.11.0.dev2026080301
-export IREE_METAL_VERSION=3.11.0.dev2026080301
+git checkout iree-metal-v3.11.0.dev2026080302
+export IREE_METAL_VERSION=3.11.0.dev2026080302
 export IREE_METAL_PYTHON=python3.12
 ./build_tools/iree_metal/build_preview_wheels.sh
 ./build_tools/iree_metal/smoke_test_wheels.sh ./wheelhouse

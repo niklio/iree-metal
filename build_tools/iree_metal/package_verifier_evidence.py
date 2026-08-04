@@ -121,9 +121,9 @@ def validate_combined_summary(summary: dict[str, Any], version: str) -> None:
         {
             "candidate": f"iree-metal-preview-{version}",
             "suite": "candidate",
-            "total_cases": 231,
-            "cases_completed": 231,
-            "passed": 231,
+            "total_cases": 243,
+            "cases_completed": 243,
+            "passed": 243,
             "pass_rate": 1.0,
             "wrong_results": 0,
             "execution_failures": 0,
@@ -156,9 +156,9 @@ def validate_semantic_summary(
             "run_id": run_id,
             "candidate": candidate,
             "suite": "release",
-            "total_cases": 221,
-            "cases_completed": 221,
-            "passed": 221,
+            "total_cases": 233,
+            "cases_completed": 233,
+            "passed": 233,
             "pass_rate": 1.0,
             "wrong_results": 0,
             "compile_failures": 0,
@@ -172,10 +172,10 @@ def validate_semantic_summary(
             "performance_cases": 0,
             "gate_passed": True,
             "release_ready": True,
-            "status_counts": {"PASS": 221},
+            "status_counts": {"PASS": 233},
             "tiers": {
-                "A": {"cases": 186, "passed": 186, "pass_rate": 1.0},
-                "B": {"cases": 35, "passed": 35, "pass_rate": 1.0},
+                "A": {"cases": 187, "passed": 187, "pass_rate": 1.0},
+                "B": {"cases": 46, "passed": 46, "pass_rate": 1.0},
             },
         },
         "semantic verifier summary",
@@ -615,13 +615,13 @@ def main() -> None:
     validate_run_manifest(model_manifest, model_summary, wheels, "model run")
     validate_model_protocol(model_manifest)
     validate_database(
-        semantic_dir / "evidence.sqlite3", semantic_summary["run_id"], 221, "semantic"
+        semantic_dir / "evidence.sqlite3", semantic_summary["run_id"], 233, "semantic"
     )
     validate_database(
         model_dir / "evidence.sqlite3", model_summary["run_id"], 10, "model"
     )
     validate_case_records(
-        semantic_dir / "cases.jsonl", semantic_summary["run_id"], 221, "semantic"
+        semantic_dir / "cases.jsonl", semantic_summary["run_id"], 233, "semantic"
     )
     validate_case_records(
         model_dir / "cases.jsonl", model_summary["run_id"], 10, "model"
@@ -651,7 +651,7 @@ def main() -> None:
         (staging / "combined" / "report.md").write_text(
             "# Combined candidate verification report\n\n"
             f"- Candidate: `{candidate_id}`\n"
-            "- Semantic gate: **PASS** (221/221)\n"
+            "- Semantic gate: **PASS** (233/233)\n"
             "- Application gate: **PASS** (10/10)\n"
             f"- Model geometric mean: **{combined_summary['perf_vs_jaxmetal']:.6f}x "
             "vs jax-metal**\n"
@@ -677,7 +677,7 @@ def main() -> None:
         (staging / "README.txt").write_text(
             "iree-metal independent verifier evidence\n\n"
             f"Combined run: {combined_summary['run_id']}\n"
-            "Semantic result: 221/221 PASS\n"
+            "Semantic result: 233/233 PASS\n"
             "Application result: 10/10 PASS\n"
             f"Model geometric mean: {combined_summary['perf_vs_jaxmetal']:.6f}x "
             "versus the paired live, artifact-keyed jax-metal reference\n"

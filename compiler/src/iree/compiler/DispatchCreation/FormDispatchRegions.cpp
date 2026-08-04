@@ -757,9 +757,44 @@ static bool isFusableWithProducer(OpOperand &operand,
     return false;
   }
 
-  // iree-metal bisect: IREE_METAL_NONINIT_GUARD restores the "only fuse into DPS-init operand"
-  // restriction under aggressive fusion (isolates fusing a producer into a non-init input).
-  if (!options.aggressiveFusion || getenv("IREE_METAL_NONINIT_GUARD")) {
+  // Non-unique scatter batch loops are reductions and remain untiled when the
+  // trailing update window is distributed across a Metal workgroup. Fusing a
+  // producer into a large update operand can therefore materialize the entire
+  // batch for each 32-wide window tile in workgroup memory. Keep that producer
+  // in a separate dispatch when even this lower-bound estimate exceeds Metal's
+  // 32 KiB threadgroup-memory limit. Dynamic batch dimensions are unbounded and
+  // must retain the dispatch boundary as well.
+  bool oversizedNonUniqueScatterUpdate = false;
+  if (auto scatterOp = dyn_cast<IREE::LinalgExt::ScatterOp>(consumer);
+      scatterOp && !scatterOp.getUniqueIndices() &&
+      operand.getOperandNumber() ==
+          scatterOp.getUpdatesMutable().getOperandNumber()) {
+    constexpr int64_t kMetalWorkgroupWidth = 32;
+    constexpr int64_t kMetalWorkgroupMemoryLimitBits = 32 * 1024 * 8;
+    int64_t bitsPerBatchElement =
+        kMetalWorkgroupWidth *
+            scatterOp.getUpdateType().getElementTypeBitWidth() +
+        scatterOp.getIndexDepth() *
+            scatterOp.getIndicesType().getElementTypeBitWidth();
+    int64_t maxBatchElements =
+        kMetalWorkgroupMemoryLimitBits / bitsPerBatchElement;
+    int64_t batchElementCount = 1;
+    for (int64_t dim : scatterOp.getBatchShape()) {
+      if (ShapedType::isDynamic(dim)) {
+        oversizedNonUniqueScatterUpdate = true;
+        break;
+      }
+      if (dim != 0 && batchElementCount > maxBatchElements / dim) {
+        oversizedNonUniqueScatterUpdate = true;
+        break;
+      }
+      batchElementCount *= dim;
+    }
+  }
+
+  // IREE_METAL_NONINIT_GUARD remains available as a broad diagnostic control.
+  if (!options.aggressiveFusion || oversizedNonUniqueScatterUpdate ||
+      getenv("IREE_METAL_NONINIT_GUARD")) {
     auto consumerFusionOp = dyn_cast<DestinationStyleOpInterface>(consumer);
     if (consumerFusionOp && !consumerFusionOp.isDpsInit(&operand)) {
       return false;
