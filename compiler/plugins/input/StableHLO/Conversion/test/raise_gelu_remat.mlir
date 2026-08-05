@@ -8,6 +8,7 @@
 // RUN: env IREE_METAL_GELU_REMAT=0 iree-opt --split-input-file --pass-pipeline="builtin.module(iree-stablehlo-convert-flash-attention-dispatch,func.func(canonicalize,cse))" %s | FileCheck %s --check-prefixes=OFF,NEGATIVE
 // RUN: env IREE_METAL_GELU_REMAT=1 iree-opt --split-input-file --pass-pipeline="builtin.module(iree-stablehlo-convert-flash-attention-dispatch,func.func(canonicalize,cse))" %s | FileCheck %s --check-prefixes=ON,NEGATIVE
 // RUN: env IREE_METAL_GELU_REMAT=1 iree-opt --split-input-file --pass-pipeline="builtin.module(iree-stablehlo-convert-flash-attention-dispatch,func.func(canonicalize,cse),iree-stablehlo-convert-flash-attention-dispatch,func.func(canonicalize,cse))" %s | FileCheck %s --check-prefixes=ON,NEGATIVE
+// RUN: sed 's/tensor<2x3x4xbf16>/tensor<8x577x3072xbf16>/g' %s | env IREE_METAL_GELU_REMAT=1 iree-opt --split-input-file --pass-pipeline="builtin.module(iree-stablehlo-convert-flash-attention-dispatch,func.func(canonicalize,cse))" | FileCheck %s --check-prefix=VIT-GUARD
 
 // ON-LABEL: func.func @paired_tanh_gelu(
 // ON-SAME: %[[X:[^:]+]]: tensor<2x3x4xbf16>
@@ -51,6 +52,12 @@
 // OFF: stablehlo.tanh
 // OFF-NOT: stablehlo.tanh
 // OFF: return
+
+// VIT-GUARD-LABEL: func.func @paired_tanh_gelu(
+// VIT-GUARD-SAME: tensor<8x577x3072xbf16>
+// VIT-GUARD-NOT: stablehlo.optimization_barrier
+// VIT-GUARD: stablehlo.tanh
+// VIT-GUARD: return
 
 func.func @paired_tanh_gelu(%x: tensor<2x3x4xbf16>, %incoming_grad: tensor<2x3x4xbf16>) -> (tensor<2x3x4xbf16>, tensor<2x3x4xbf16>) {
   %one = stablehlo.constant dense<1.000000e+00> : tensor<2x3x4xbf16>

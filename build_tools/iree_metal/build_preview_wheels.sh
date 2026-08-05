@@ -33,8 +33,30 @@ if ! "${python_bin}" -c 'import re, sys; raise SystemExit(not re.fullmatch(r"3\.
   exit 2
 fi
 
-if git -C "${repo_root}" submodule status --recursive | grep -q '^[+-U]'; then
-  echo "error: submodules are uninitialized or do not match the recorded revisions" >&2
+verify_submodules() {
+  local superproject="$1"
+  local modules_file="${superproject}/.gitmodules"
+  [[ -f "${modules_file}" ]] || return 0
+  git -C "${superproject}" config --file "${modules_file}" --get-regexp path |
+    while read -r _ relative_path; do
+      local submodule="${superproject}/${relative_path}"
+      if [[ ! -e "${submodule}/.git" ]]; then
+        echo "error: submodule is not initialized: ${submodule}" >&2
+        return 1
+      fi
+      local expected_revision
+      expected_revision="$(git -C "${superproject}" ls-tree HEAD -- "${relative_path}" | awk '{print $3}')"
+      local actual_revision
+      actual_revision="$(git -C "${submodule}" rev-parse HEAD)"
+      if [[ -z "${expected_revision}" || "${actual_revision}" != "${expected_revision}" ]]; then
+        echo "error: submodule does not match the recorded revision: ${submodule}" >&2
+        return 1
+      fi
+      verify_submodules "${submodule}" || return 1
+    done
+}
+
+if ! verify_submodules "${repo_root}"; then
   exit 2
 fi
 

@@ -28,6 +28,7 @@
 
 #include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenOps.h"
+#include "iree/compiler/Codegen/Interfaces/ProcessorOpInterfaces.h"
 #include "iree/compiler/Codegen/Transforms/Transforms.h"
 #include "iree/compiler/Dialect/HAL/IR/HALTraits.h"
 #include "iree/compiler/Dialect/TensorExt/IR/TensorExtOps.h"
@@ -156,6 +157,7 @@ static LogicalResult getBackwardOrdinalSliceImpl(
         // In such cases we will ignore those conditionals. If a hint op
         // directly depends on an illegal op that is a hard error however.
         if (!isMemoryEffectFree(definingOp) ||
+            isa<ProcessorIDInterface>(definingOp) ||
             definingOp->hasTrait<OpTrait::IREE::HAL::ExecutableInterfaceOp>()) {
           return failure();
         }

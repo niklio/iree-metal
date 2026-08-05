@@ -16,6 +16,7 @@
 #include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "iree/compiler/Codegen/Utils/LinalgOpInfo.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtDialect.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/IndexingUtils.h"
 #include "iree/compiler/Dialect/TensorExt/IR/TensorExtOps.h"
@@ -911,6 +912,14 @@ setCooperativeMatrixConfig(IREE::GPU::TargetAttr target, linalg::LinalgOp op,
   if (op.hasDynamicShape()) {
     return failure();
   }
+  // Split-reduction matmuls carry an additional partial-result dimension and
+  // workgroup mapping that VectorToGPU cannot represent as one cooperative
+  // matrix operation. Route them through the scalar/vector pipeline; otherwise
+  // the cooperative pipeline leaves illegal vector<16x16> accumulators after a
+  // failed conversion.
+  if (IREE::LinalgExt::getSplitReductionSizes(op).has_value()) {
+    return failure();
+  }
 
   Value lhs = op.getDpsInputOperand(0)->get();
   Value rhs = op.getDpsInputOperand(1)->get();
@@ -983,7 +992,6 @@ setCooperativeMatrixConfig(IREE::GPU::TargetAttr target, linalg::LinalgOp op,
       llvm::any_of(target.getWgp().getMma(), [&](IREE::GPU::MMAAttr mma) {
         return !isAppleSimdgroupMma(mma.getIntrinsic());
       });
-
   SmallVector<GPUIntrinsicType> intrinsics;
   intrinsics.reserve(target.getWgp().getMma().size());
   for (IREE::GPU::MMAAttr mma : target.getWgp().getMma()) {
@@ -1475,6 +1483,54 @@ static LogicalResult setScatterOpConfig(IREE::GPU::TargetAttr target,
     windowWorkgroups = false;
     atomicParallel = false;
   }
+
+  // A non-unique scatter tile stages both its indices and update window in
+  // workgroup memory. Using one full subgroup-width window is excellent for
+  // small gathers, but a language-model embedding gradient can have thousands
+  // of indices: [4096, 32]xf32 updates plus [4096]xi32 indices require 540 KiB
+  // on a device with a 32 KiB limit. Bound the window by the exact static
+  // staging footprint. Dynamic shapes conservatively use one window element.
+  int64_t windowTile = subgroupSize;
+  if (windowWorkgroups && target.isApple() && !op.getUniqueIndices()) {
+    int64_t batchElements = 1;
+    bool hasDynamicBatch = false;
+    ArrayRef<int64_t> updateShape = op.getUpdateType().getShape();
+    for (int64_t dim : updateShape.take_front(op.getBatchRank())) {
+      if (ShapedType::isDynamic(dim)) {
+        hasDynamicBatch = true;
+        break;
+      }
+      if (batchElements > target.getWgp().getMaxWorkgroupMemoryBytes() /
+                              std::max<int64_t>(dim, 1)) {
+        batchElements = target.getWgp().getMaxWorkgroupMemoryBytes() + 1;
+        break;
+      }
+      batchElements *= dim;
+    }
+
+    int64_t indexDepth = op.getIndexDepth();
+    int64_t indexBytes = llvm::divideCeil(
+        static_cast<int64_t>(IREE::Util::getTypeBitWidth(
+            op.getIndicesType().getElementType())),
+        int64_t{8});
+    int64_t updateBytes = llvm::divideCeil(
+        static_cast<int64_t>(IREE::Util::getTypeBitWidth(
+            op.getUpdateType().getElementType())),
+        int64_t{8});
+    int64_t memoryLimit = target.getWgp().getMaxWorkgroupMemoryBytes();
+    int64_t fixedBytes = batchElements * indexDepth * indexBytes;
+    int64_t bytesPerWindowElement = batchElements * updateBytes;
+    if (hasDynamicBatch || fixedBytes >= memoryLimit ||
+        bytesPerWindowElement <= 0) {
+      windowTile = 1;
+    } else {
+      windowTile = std::clamp<int64_t>(
+          (memoryLimit - fixedBytes) / bytesPerWindowElement, 1,
+          subgroupSize);
+      // Preserve power-of-two thread tiles for subgroup distribution.
+      windowTile = llvm::bit_floor(static_cast<uint64_t>(windowTile));
+    }
+  }
   for (auto [i, it] : llvm::enumerate(its)) {
     if (it == utils::IteratorType::parallel) {
       wgTile[i] = 1;
@@ -1491,7 +1547,7 @@ static LogicalResult setScatterOpConfig(IREE::GPU::TargetAttr target,
         pipeline, std::array<int64_t, 3>{1, 1, 1});
   }
   // Distribute the innermost parallel loop across the subgroup's threads.
-  wgTile[lastParallel] = subgroupSize;
+  wgTile[lastParallel] = windowTile;
   threadTile[lastParallel] = 1;
   TileSizesListType tileSizes = {wgTile, threadTile};
   if (failed(setOpConfigAndEntryPointFnTranslation(
@@ -1806,12 +1862,39 @@ static LogicalResult setReductionConfig(IREE::GPU::TargetAttr target,
     if (getenv("IREE_METAL_COOP_NO_REDUCE_NONMULT")) {
       return failure();
     }
+    // A single subgroup is adequate for short tails, but leaves large masked
+    // reductions almost entirely serial (for example, a 50,257-wide language
+    // model vocabulary). Use multiple subgroups on Apple for those reductions;
+    // the subgroup-reduce pipeline already combines one partial per subgroup
+    // and masks the final tile. Keep the workgroup small enough that the final
+    // subgroup can reduce all subgroup partials.
+    int64_t groupSize = subgroupSize;
+    if (target.isApple() && reductionSize >= 4096) {
+      groupSize = 512;
+    }
+    if (const char *value = getenv("IREE_METAL_RED_NONMULT_WG")) {
+      groupSize = std::max<int64_t>(subgroupSize, atoi(value));
+    }
+    const int64_t maxWorkgroupSize =
+        target.getWgp().getMaxThreadCountPerWorkgroup();
+    groupSize = std::min(groupSize, maxWorkgroupSize);
+    groupSize = (groupSize / subgroupSize) * subgroupSize;
+    groupSize = std::min<int64_t>(groupSize, subgroupSize * subgroupSize);
+
+    FailureOr<int64_t> maybeCompatibleGroupSize =
+        maybeFindConsumerCompatibleSize(op, reductionDims, groupSize,
+                                        subgroupSize);
+    if (failed(maybeCompatibleGroupSize)) {
+      return failure();
+    }
+    groupSize = maybeCompatibleGroupSize.value();
+
     SmallVector<int64_t> reductionTileSizes(op.getNumLoops(), 0);
-    reductionTileSizes[reductionDims.back()] = subgroupSize;
+    reductionTileSizes[reductionDims.back()] = groupSize;
     TileSizesListType tileSizes;
     tileSizes.emplace_back(std::move(workgroupTileSizes)); // Workgroup level
     tileSizes.emplace_back(std::move(reductionTileSizes)); // Reduction level
-    std::array<int64_t, 3> workgroupSize = {subgroupSize, 1, 1};
+    std::array<int64_t, 3> workgroupSize = {groupSize, 1, 1};
     if (failed(setOpConfigAndEntryPointFnTranslation(
             op->getParentOfType<mlir::FunctionOpInterface>(), op, tileSizes,
             CodeGenPipeline::SPIRVSubgroupReduce, workgroupSize))) {
@@ -1853,7 +1936,6 @@ static LogicalResult setReductionConfig(IREE::GPU::TargetAttr target,
                                       APInt(64, uint64_t(maxWorkgroupSize)))
                     .getZExtValue();
   }
-
   // Then we need to strike a balance--
   // 1) parallel dimensions are distributed to workgroups. If there are many
   //    workgroups dispatched, we'd want to have each GPU core hosting multiple

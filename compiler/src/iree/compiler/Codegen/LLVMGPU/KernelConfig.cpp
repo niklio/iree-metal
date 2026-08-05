@@ -753,9 +753,20 @@ LogicalResult setMatmulVectorDistributionConfig(
   // only inflates the promoted buffers for the known backward roles.
   const char *compactPhysicalFragments =
       std::getenv("IREE_METAL_APPLE_PHYSICAL_BACKWARD_COMPACT_SMEM");
+  if (const char *value = std::getenv("IREE_METAL_ATTN_PREFETCH_STAGES")) {
+    prefetchStages = std::max<int64_t>(0, atoi(value));
+  }
+  // ViT's odd 577-token attention repeatedly crosses the Apple M4 sustained
+  // power limit with the compact backward layout, producing late-run frequency
+  // cliffs despite an identical cool-state latency. The normal padded layout
+  // stays within a tight timing band for this exact sequence length. Keep the
+  // compact win for the aligned text and DeiT attention shapes.
+  bool isOddViTAttention =
+      llvm::is_contained(op.getStaticLoopRanges(), int64_t{577});
   bool keepPhysicalFragmentsCompact =
       useApplePhysicalLayout && isAttentionBackwardRole &&
-      compactPhysicalFragments && StringRef(compactPhysicalFragments) == "1";
+      compactPhysicalFragments && StringRef(compactPhysicalFragments) == "1" &&
+      !isOddViTAttention;
   auto pipelineOptions = IREE::GPU::GPUPipelineOptionsAttr::get(
       context, /*prefetch_num_stages=*/prefetchStages,
       /*no_reduce_shared_memory_bank_conflicts=*/

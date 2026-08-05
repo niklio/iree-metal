@@ -820,7 +820,7 @@ struct ScalarizeVectorTransferRead final
                                 PatternRewriter &rewriter) const override {
     VectorType vectorType = readOp.getType();
     auto map = readOp.getPermutationMap();
-    if (vectorType.getRank() > 1 || !map.isProjectedPermutation()) {
+    if (!map.isProjectedPermutation()) {
       return failure();
     }
 
@@ -850,6 +850,45 @@ struct ScalarizeVectorTransferRead final
     }
 
     MLIRContext *context = rewriter.getContext();
+    if (vectorType.getRank() > 1) {
+      if (maybeMask)
+        return failure();
+      Value newVector = arith::ConstantOp::create(
+          rewriter, loc, vectorType, rewriter.getZeroAttr(vectorType));
+      SmallVector<int64_t> position(vectorType.getRank());
+      for (int64_t linear = 0, e = vectorType.getNumElements(); linear < e;
+           ++linear) {
+        int64_t remainder = linear;
+        for (int64_t dim = vectorType.getRank() - 1; dim >= 0; --dim) {
+          position[dim] = remainder % vectorType.getDimSize(dim);
+          remainder /= vectorType.getDimSize(dim);
+        }
+        SmallVector<Value> indices(readOp.getIndices());
+        for (auto [vectorDim, expr] : llvm::enumerate(map.getResults())) {
+          auto dimExpr = dyn_cast<AffineDimExpr>(expr);
+          if (!dimExpr || position[vectorDim] == 0)
+            continue;
+          Value offset = arith::ConstantIndexOp::create(
+              rewriter, loc, position[vectorDim]);
+          indices[dimExpr.getPosition()] = arith::AddIOp::create(
+              rewriter, loc, indices[dimExpr.getPosition()], offset);
+        }
+        auto thenCond = [&](OpBuilder &b, Location nestedLoc) {
+          return memref::LoadOp::create(b, nestedLoc, readOp.getBase(), indices)
+              .getResult();
+        };
+        auto elseCond = [&](OpBuilder &b, Location nestedLoc) {
+          scf::YieldOp::create(b, nestedLoc, readOp.getPadding());
+        };
+        Value scalar = predicateMaybeMaskedScalarTransfer(
+            rewriter, loc, Value(), thenCond, elseCond);
+        newVector = vector::InsertOp::create(rewriter, loc, scalar, newVector,
+                                             position);
+      }
+      rewriter.replaceOp(readOp, newVector);
+      return success();
+    }
+
     AffineExpr sym0, sym1;
     bindSymbols(context, sym0, sym1);
     auto addMap = AffineMap::get(0, 2, {sym0 + sym1}, context);
@@ -947,7 +986,7 @@ struct ScalarizeVectorTransferWrite final
                                 PatternRewriter &rewriter) const override {
     VectorType vectorType = writeOp.getVectorType();
     auto map = writeOp.getPermutationMap();
-    if (vectorType.getRank() > 1 || !map.isProjectedPermutation()) {
+    if (!map.isProjectedPermutation()) {
       return failure();
     }
 
@@ -975,6 +1014,41 @@ struct ScalarizeVectorTransferWrite final
     }
 
     MLIRContext *context = rewriter.getContext();
+    if (vectorType.getRank() > 1) {
+      if (maybeMask)
+        return failure();
+      SmallVector<int64_t> position(vectorType.getRank());
+      for (int64_t linear = 0, e = vectorType.getNumElements(); linear < e;
+           ++linear) {
+        int64_t remainder = linear;
+        for (int64_t dim = vectorType.getRank() - 1; dim >= 0; --dim) {
+          position[dim] = remainder % vectorType.getDimSize(dim);
+          remainder /= vectorType.getDimSize(dim);
+        }
+        SmallVector<Value> indices(writeOp.getIndices());
+        for (auto [vectorDim, expr] : llvm::enumerate(map.getResults())) {
+          auto dimExpr = dyn_cast<AffineDimExpr>(expr);
+          if (!dimExpr || position[vectorDim] == 0)
+            continue;
+          Value offset = arith::ConstantIndexOp::create(
+              rewriter, loc, position[vectorDim]);
+          indices[dimExpr.getPosition()] = arith::AddIOp::create(
+              rewriter, loc, indices[dimExpr.getPosition()], offset);
+        }
+        Value scalar = vector::ExtractOp::create(
+            rewriter, loc, writeOp.getVector(), position);
+        auto thenCond = [&](OpBuilder &b, Location nestedLoc) {
+          memref::StoreOp::create(b, nestedLoc, scalar, writeOp.getBase(),
+                                  indices);
+          return Value();
+        };
+        (void)predicateMaybeMaskedScalarTransfer(rewriter, loc, Value(),
+                                                 thenCond);
+      }
+      rewriter.eraseOp(writeOp);
+      return success();
+    }
+
     AffineExpr sym0, sym1;
     bindSymbols(context, sym0, sym1);
     auto addMap = AffineMap::get(0, 2, {sym0 + sym1}, context);
@@ -1059,6 +1133,31 @@ struct ReifyExtractOfCreateMask final : OpRewritePattern<vector::ExtractOp> {
   }
 };
 
+// Rank-N transfer scalarization can expose a one-lane create_mask followed by
+// vector.to_elements. SPIR-V has no one-lane vector type, so materialize that
+// sole lane directly as the scalar bounds comparison.
+struct ReifyToElementsOfSingleCreateMask final
+    : OpRewritePattern<vector::ToElementsOp> {
+  using Base::Base;
+
+  LogicalResult matchAndRewrite(vector::ToElementsOp toElementsOp,
+                                PatternRewriter &rewriter) const override {
+    if (toElementsOp->getNumResults() != 1)
+      return failure();
+    auto maskOp =
+        toElementsOp.getSource().getDefiningOp<vector::CreateMaskOp>();
+    if (!maskOp || maskOp.getType().getNumElements() != 1 ||
+        maskOp.getOperands().size() != 1)
+      return failure();
+    Value zero = arith::ConstantIndexOp::create(rewriter, maskOp.getLoc(), 0);
+    Value active = arith::CmpIOp::create(
+        rewriter, maskOp.getLoc(), arith::CmpIPredicate::slt, zero,
+        maskOp.getOperands().front());
+    rewriter.replaceOp(toElementsOp, active);
+    return success();
+  }
+};
+
 //===----------------------------------------------------------------------===//
 // Pass
 //===----------------------------------------------------------------------===//
@@ -1082,19 +1181,6 @@ void SPIRVVectorizeLoadStorePass::runOnOperation() {
   // framework to implement the conversion.
   mlir::FunctionOpInterface funcOp = getOperation();
   MLIRContext *context = &getContext();
-
-  // Prior pass should have unrolled and broken down vectors with rank > 1.
-  auto result = funcOp.walk([](VectorTransferOpInterface transferOp) {
-    if (cast<VectorType>(transferOp.getVectorType()).getRank() > 1) {
-      transferOp.emitOpError(
-          "with rank > 1 should be broken down by prior passes");
-      return WalkResult::interrupt();
-    }
-    return WalkResult::advance();
-  });
-  if (result.wasInterrupted()) {
-    signalPassFailure();
-  }
 
   memrefUsageAnalysis = &getAnalysis<MemRefUsageAnalysis>();
 
@@ -1140,7 +1226,13 @@ void SPIRVVectorizeLoadStorePass::runOnOperation() {
   RewritePatternSet rewritingPatterns(context);
   rewritingPatterns.add<ScalarizeVectorTransferRead, ScalarizeVectorLoad,
                         ScalarizeVectorTransferWrite>(context);
-  rewritingPatterns.add<ReifyExtractOfCreateMask>(context);
+  rewritingPatterns.add<ReifyExtractOfCreateMask,
+                        ReifyToElementsOfSingleCreateMask>(context);
+  vector::CreateMaskOp::getCanonicalizationPatterns(rewritingPatterns,
+                                                     context);
+  vector::ShapeCastOp::getCanonicalizationPatterns(rewritingPatterns,
+                                                    context);
+  vector::ExtractOp::getCanonicalizationPatterns(rewritingPatterns, context);
 
   if (failed(applyPatternsGreedily(funcOp, std::move(rewritingPatterns)))) {
     return signalPassFailure();

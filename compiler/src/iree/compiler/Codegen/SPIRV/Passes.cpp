@@ -244,7 +244,13 @@ static void addMemRefLoweringPasses(OpPassManager &modulePassManager) {
         .addPass(createForOpCanonicalizationPass)
         .addPass(createCanonicalizerPass)
         .addPass(createCSEPass)
-        .addPass([&]() { return createOptimizeVectorTransferPass(); });
+        .addPass([&]() { return createOptimizeVectorTransferPass(); })
+        // Transfer optimization can rebuild a wide vector after the earlier
+        // breakdown (notably a vector<16xf32> zero in small-batch vocabulary
+        // gradients). Keep the final memref-level IR SPIR-V legal.
+        .addPass(createSPIRVBreakDownLargeVectorPass)
+        .addPass(createCanonicalizerPass)
+        .addPass(createCSEPass);
   }
 
   // Turn multi-dimension memref into one-dimension. This is needed for
@@ -1290,6 +1296,12 @@ void addSPIRVCooperativeMatrixVectorizePassPipeline(
   // before performing vector unrolling and hoisting.
   funcPassManager.addPass(memref::createFoldMemRefAliasOpsPass());
 
+  // BF16 contractions are vectorized through f32 extensions. Fold those
+  // extensions into the contraction so Apple subgroup MMA sees native BF16
+  // operands with an f32 accumulator. Without this, large-vocabulary backward
+  // contractions enter the cooperative pipeline but fail MMA conversion.
+  funcPassManager.addPass(std::make_unique<FoldContractExtPass>());
+
   // Vectorize to cooperative ops.
   funcPassManager.addPass(createSPIRVVectorizeToCooperativeOpsPass());
   funcPassManager.addPass(createCSEPass());
@@ -1321,7 +1333,18 @@ void addSPIRVCooperativeMatrixVectorizePassPipeline(
   // scalar-fallback path legalizes. For genuinely-converted coop dispatches this
   // is a no-op (their data lives in !gpu.mma_matrix, not large vectors).
   funcPassManager.addPass(createSPIRVBreakDownLargeVectorPass());
-  addSPIRVVectorLoweringPasses(funcPassManager);
+  // Producer/consumer fusion can leave cooperative-matrix epilogues with unit
+  // vector dimensions (for example vector<32x1xbf16>). SPIR-V transfer
+  // legalization only accepts rank-one transfers, so fold those unit
+  // dimensions before the scalar-fallback lowering.
+  addSPIRVVectorLoweringPasses(funcPassManager, /*dropUnitDims=*/true);
+  // Vector reduction lowering can create fresh wide accumulator constants
+  // after the first breakdown sweep (for example vector<16xf32> in a
+  // small-batch, full-vocabulary projection gradient). Split those late
+  // vectors before the final SPIR-V conversion.
+  funcPassManager.addPass(createSPIRVBreakDownLargeVectorPass());
+  funcPassManager.addPass(createCanonicalizerPass());
+  funcPassManager.addPass(createCSEPass());
 
   if (pipelineDepth > 0) {
     PipeliningSchedulingStrategy schedule =
@@ -1473,9 +1496,12 @@ void addSPIRVSubgroupReducePassPipeline(OpPassManager &funcPassManager) {
   VectorReductionToGPUPassOptions options;
   options.expandSubgroupReduction = false;
   funcPassManager.addPass(createVectorReductionToGPUPass(options));
+  funcPassManager.addPass(createDropVectorUnitDimsPass());
   // Perform normal vector unrolling and lowering transformations. This breaks
-  // vectors down to native machine size.
-  addSPIRVVectorLoweringPasses(funcPassManager);
+  // vectors down to native machine size. Aggressive producer fusion can leave
+  // unit dimensions on vector transfers (for example vector<32x1> in a fused
+  // cross-entropy gradient), so fold those before SPIR-V load/store lowering.
+  addSPIRVVectorLoweringPasses(funcPassManager, /*dropUnitDims=*/true);
   funcPassManager.addPass(createCanonicalizerPass());
   funcPassManager.addPass(createCSEPass());
 }
@@ -1515,6 +1541,12 @@ void buildSPIRVCodegenPassPipeline(OpPassManager &variantPassManager) {
         .addPredicatedPass(
             std::getenv("IREE_METAL_CAUSAL_SKIP") != nullptr,
             []() { return std::make_unique<CausalHoistTagPass>(); })
+        // Scalar-output split reductions do not create a nested workgroup
+        // forall during tiling. Resolve their split mapping before function
+        // codegen so subgroup reduction sees a real workgroup loop instead of
+        // serializing the whole split behind thread zero. The later reconcile
+        // pass still handles split loops that must be folded after tiling.
+        .addPass(createFoldSplitReductionAndWorkgroupMappingLoopsPass)
         .addPass(createSPIRVLowerExecutableTargetPass)
         .addPass(createVerifyWorkgroupDistributionPass);
     addMemRefLoweringPasses(modulePassManager);

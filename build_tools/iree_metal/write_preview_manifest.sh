@@ -23,6 +23,25 @@ python_version="$("${python_bin}" --version 2>&1)"
 manifest="${wheelhouse}/iree-metal-preview-${preview_version}.manifest.txt"
 checksums="${wheelhouse}/SHA256SUMS"
 
+write_submodule_revisions() {
+  local superproject="$1"
+  local path_prefix="$2"
+  local modules_file="${superproject}/.gitmodules"
+  [[ -f "${modules_file}" ]] || return 0
+  git -C "${superproject}" config --file "${modules_file}" --get-regexp path |
+    while read -r _ relative_path; do
+      local revision
+      revision="$(git -C "${superproject}" ls-tree HEAD -- "${relative_path}" | awk '{print $3}')"
+      [[ -n "${revision}" ]] || {
+        echo "error: cannot resolve submodule revision: ${path_prefix}${relative_path}" >&2
+        return 1
+      }
+      echo "submodule: ${revision} ${path_prefix}${relative_path}"
+      write_submodule_revisions "${superproject}/${relative_path}" \
+        "${path_prefix}${relative_path}/"
+    done
+}
+
 shopt -s nullglob
 wheels=("${wheelhouse}"/*.whl)
 if [[ ${#wheels[@]} -ne 2 ]]; then
@@ -35,7 +54,7 @@ fi
   echo "version: ${preview_version}"
   echo "tag: iree-metal-v${preview_version}"
   echo "iree-revision: $(git -C "${repo_root}" rev-parse HEAD)"
-  git -C "${repo_root}" submodule status --recursive | sed 's/^/submodule: /'
+  write_submodule_revisions "${repo_root}" ""
   while IFS= read -r overlay; do
     [[ "${overlay}" == \#* || -z "${overlay}" ]] && continue
     echo "source-overlay: ${overlay}"
@@ -52,7 +71,7 @@ fi
   echo "jax-version: 0.6.1"
   echo "default-profile: ${preview_profile}"
   echo "rollback-profile: baseline"
-  echo "compiler-options: --iree-metal-compile-to-metallib=false --iree-dispatch-creation-fuse-multi-use=false --iree-dispatch-creation-enable-aggressive-fusion=true"
+  echo "compiler-options: --iree-metal-compile-to-metallib=false --iree-dispatch-creation-fuse-multi-use=true --iree-dispatch-creation-enable-aggressive-fusion=true --iree-dispatch-creation-enable-split-reduction=true"
   echo "numeric-contract: optimized causal attention assumes finite model inputs; use IREE_METAL_PROFILE=baseline for strict non-finite propagation diagnostics"
   echo "dependency-lock: requirements-macos-arm64-py312.txt"
   echo "build-dependency-lock: requirements-build-macos-arm64-py312.txt"

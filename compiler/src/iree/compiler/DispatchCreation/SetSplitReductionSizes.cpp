@@ -4,6 +4,8 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+#include <cstdlib>
+
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtDialect.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtInterfaces.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
@@ -70,6 +72,20 @@ findSmallestFactorWithLowerBound(int64_t x, int64_t lowerBound) {
   return std::nullopt;
 };
 
+static std::optional<int64_t> findSmallestFactorWithLowerBoundAndMultiple(
+    int64_t x, int64_t lowerBound, int64_t multiple) {
+  assert(x > 0 && lowerBound > 0 && multiple > 0);
+  static constexpr int64_t kMaxIterations = 1 << 15;
+  int64_t upperBound = std::min(x, kMaxIterations);
+  int64_t candidate = llvm::alignTo(lowerBound, multiple);
+  for (; candidate <= upperBound; candidate += multiple) {
+    if (x % candidate == 0) {
+      return candidate;
+    }
+  }
+  return std::nullopt;
+}
+
 namespace {
 
 /// Determine split reduction sizes for outer-reduction ops. This is
@@ -91,6 +107,21 @@ getOuterReductionSizes(PartialReductionOpInterface op,
   }
   SmallVector<int64_t> opReductionSizes = std::move(*maybeSizes);
 
+  // iree-metal: the full split-reduction pipeline is required to keep fused
+  // awkward/large reductions within Apple's threadgroup-memory limit, but
+  // splitting ordinary scalar losses and norm reductions adds an extra
+  // partial-reduction dispatch to every training graph. In the preview
+  // profile, leave a single moderate reduction intact; multi-dimensional
+  // reductions (including the prime-shaped resource regressions) and true
+  // large reductions still take the split path.
+  const char *resourceOnly = std::getenv("IREE_METAL_SPLIT_RESOURCE_ONLY");
+  if (resourceOnly && StringRef(resourceOnly) != "0" &&
+      opReductionSizes.size() == 1 && opReductionSizes.front() < 32768) {
+    LDBG() << "skipping op; resource-only profile keeps moderate single "
+              "reduction intact";
+    return std::nullopt;
+  }
+
   int64_t currentSplitReductionSize = 1;
   SmallVector<int64_t> tileSizes(opReductionSizes.size());
   // Tile dimensions until we reach or exceed the target. Tile sizes must
@@ -104,8 +135,28 @@ getOuterReductionSizes(PartialReductionOpInterface op,
       LDBG() << "skipping op; has dynamic reduction dims";
       return std::nullopt;
     }
-    int64_t tileSize = findSmallestFactorWithLowerBound(dimSize, remainingSize)
-                           .value_or(dimSize);
+    // A large prime (or otherwise awkward) inner dimension has no divisor in
+    // [remainingSize, dimSize). Taking the whole dimension in that case can
+    // make a fused partial reduction materialize a tile larger than the
+    // target's workgroup-memory limit. Leave that dimension split at one and
+    // continue looking through outer dimensions. Small dimensions still use
+    // their full extent so ordinary multi-dimensional reductions reach the
+    // target tile size without creating needless partials.
+    std::optional<int64_t> factor =
+        findSmallestFactorWithLowerBound(dimSize, remainingSize);
+    int64_t tileSize = factor.value_or(dimSize);
+    if (dimSize > remainingSize) {
+      // The dimension itself is always a factor when it is within the bounded
+      // search range. It is not a useful split for a large prime dimension, or
+      // for an awkward dimension inside a multi-dimensional reduction where
+      // the complete tile can exceed threadgroup memory. A single small prime
+      // reduction remains complete; splitting it adds an unnecessary partial
+      // reduction and changes its summation topology.
+      if (tileSize == dimSize &&
+          (dimSize >= 4096 || opReductionSizes.size() > 1)) {
+        tileSize = 1;
+      }
+    }
     tileSizes[i] = tileSize;
     currentSplitReductionSize *= tileSize;
   }
@@ -356,7 +407,12 @@ getMatmulLikeReductionSizes(PartialReductionOpInterface op,
   int64_t ratio = kSize / std::sqrt(mSize * nSize) / batchSize;
 
   // The constants below are determined based on empirical data.
-  const int64_t largeOutputSize = 2048 * 4096;
+  // A million output elements already provides hundreds of cooperative-matrix
+  // workgroups. Splitting such a contraction can wrap the MMA in a partial
+  // reduction and defeat cooperative lowering (the LM-head dX case is
+  // 4096x768 with K=50272). Keep the unsplit, aligned MMA when the output alone
+  // supplies enough GPU parallelism.
+  const int64_t largeOutputSize = 1024 * 1024;
   const int64_t largeKSize = 18000;
   const int64_t ratioThreshold = 48;
 
@@ -403,6 +459,20 @@ getMatmulLikeReductionSizes(PartialReductionOpInterface op,
     if (!maybeTileSize) {
       LDBG() << "skipping op; failed to find a split factor";
       return std::nullopt;
+    }
+    // Preserve a matrix-intrinsic-compatible K tile for the common single-K
+    // contraction. For example, splitting K=50272 eight ways chooses 6284,
+    // which is not divisible by 16 and forces a large language-model dX
+    // matmul off cooperative matrix units. The smallest aligned divisor is
+    // 25136 (two partials), retaining useful parallelism and native MMA
+    // lowering without enabling unsafe unaligned cooperative tiles.
+    if (tileSizes.size() == 1 && tileSize % 16 == 0 &&
+        *maybeTileSize % 16 != 0) {
+      if (std::optional<int64_t> alignedTile =
+              findSmallestFactorWithLowerBoundAndMultiple(tileSize, lowerBound,
+                                                          16)) {
+        maybeTileSize = alignedTile;
+      }
     }
     limitParallelLoops /= (tileSize / maybeTileSize.value());
     tileSizes[i] = maybeTileSize.value();

@@ -65,6 +65,14 @@
 // RUN:   -u IREE_METAL_APPLE_PHYSICAL_BACKWARD_COMPACT_SMEM \
 // RUN:   -u IREE_METAL_APPLE_PHYSICAL_SCORE_WG64 \
 // RUN:   IREE_METAL_APPLE_PHYSICAL_FRAGMENTS=1 \
+// RUN:   IREE_METAL_ATTN_PREFETCH_STAGES=2 \
+// RUN:   iree-opt --iree-gpu-test-target=apple@metal \
+// RUN:   --pass-pipeline='builtin.module(iree-spirv-select-lowering-strategy-pass)' \
+// RUN:   %s | FileCheck %s --check-prefix=PREFETCH2
+// RUN: env -u IREE_METAL_DISABLE_NATIVE_ATTENTION \
+// RUN:   -u IREE_METAL_APPLE_PHYSICAL_BACKWARD_COMPACT_SMEM \
+// RUN:   -u IREE_METAL_APPLE_PHYSICAL_SCORE_WG64 \
+// RUN:   IREE_METAL_APPLE_PHYSICAL_FRAGMENTS=1 \
 // RUN:   iree-opt --iree-gpu-test-target=volta@vulkan \
 // RUN:   --pass-pipeline='builtin.module(iree-spirv-select-lowering-strategy-pass)' \
 // RUN:   %s | FileCheck %s --check-prefix=NONAPPLE
@@ -117,6 +125,25 @@ func.func @tagged(
       linalg.yield %add : f32
   } -> tensor<16x16xf32>
   return %result : tensor<16x16xf32>
+}
+
+func.func @tagged_vit_577(
+    %lhs: tensor<577x16x16xbf16>, %rhs: tensor<577x16x16xbf16>,
+    %acc: tensor<577x16x16xf32>) -> tensor<577x16x16xf32> {
+  %result = linalg.generic {
+      iree_codegen.apple_attention_backward_role = "dk_attrs",
+      indexing_maps = [#score_lhs, #score_rhs, #score_acc],
+      iterator_types = ["parallel", "parallel", "parallel", "reduction"]}
+      ins(%lhs, %rhs : tensor<577x16x16xbf16>, tensor<577x16x16xbf16>)
+      outs(%acc : tensor<577x16x16xf32>) {
+    ^bb0(%l: bf16, %r: bf16, %out: f32):
+      %lext = arith.extf %l : bf16 to f32
+      %rext = arith.extf %r : bf16 to f32
+      %mul = arith.mulf %lext, %rext : f32
+      %add = arith.addf %out, %mul : f32
+      linalg.yield %add : f32
+  } -> tensor<577x16x16xf32>
+  return %result : tensor<577x16x16xf32>
 }
 
 func.func @tagged_qk(
@@ -346,6 +373,9 @@ func.func @tagged_unsupported(
 // COMPACT-LABEL: func.func @tagged(
 // COMPACT-SAME: translation_info = #[[COMPACT_TRANSLATION]]
 // COMPACT: apple_physical_fragment_layout = true
+// COMPACT-LABEL: func.func @tagged_vit_577(
+// COMPACT-SAME: translation_info = #[[PADDED_TRANSLATION]]
+// COMPACT: apple_physical_fragment_layout = true
 // COMPACT-LABEL: func.func @tagged_qk(
 // COMPACT-SAME: translation_info = #[[COMPACT_TRANSLATION]]
 // COMPACT-LABEL: func.func @tagged_dp(
@@ -382,6 +412,10 @@ func.func @tagged_unsupported(
 // SCORE-INVALID-DAG: #[[SCORE_INVALID_TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = SPIRVAppleVectorDistributeAttention workgroup_size = [128, 1, 1]
 // SCORE-INVALID-LABEL: func.func @tagged_qk_score_32x32x64(
 // SCORE-INVALID-SAME: translation_info = #[[SCORE_INVALID_TRANSLATION]]
+
+// PREFETCH2-DAG: #[[PREFETCH2_TRANSLATION:.+]] = #iree_codegen.translation_info<{{.*}}gpu_pipeline_options = #iree_gpu.pipeline_options<prefetch_num_stages = 2
+// PREFETCH2-LABEL: func.func @tagged(
+// PREFETCH2-SAME: translation_info = #[[PREFETCH2_TRANSLATION]]
 // SCORE-INVALID: subgroup_basis = {{\[}}[1, 2, 2, 1], [0, 1, 2, 3]{{\]}}
 // SCORE-INVALID-LABEL: func.func @tagged_dp_score_32x32x64(
 // SCORE-INVALID-SAME: translation_info = #[[SCORE_INVALID_TRANSLATION]]

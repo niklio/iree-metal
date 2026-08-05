@@ -732,3 +732,27 @@ func.func @extract_vector_transfer_read_mask_bits(%arg: vector<3xf32>, %index: i
 //     CHECK: scf.if %[[MB2]] -> (f32) {
 //     CHECK:   memref.load %{{.*}}[%[[C5]]] : memref<20xf32>
 //     CHECK: vector.from_elements {{.+}} : vector<3xf32>
+
+// -----
+
+// Rank-2 transfers can survive vector unrolling when aggressive producer
+// fusion leaves a projected transfer in a large training dispatch. Scalarize
+// every lane instead of rejecting the dispatch late in SPIR-V lowering.
+func.func @scalarize_rank2_projected_transfer(
+    %source: memref<3x5xf32>, %target: memref<3x5xf32>)
+    -> vector<2x3xf32> {
+  %c0 = arith.constant 0 : index
+  %zero = arith.constant 0.0 : f32
+  %value = vector.transfer_read %source[%c0, %c0], %zero
+      {in_bounds = [true, true]} : memref<3x5xf32>, vector<2x3xf32>
+  vector.transfer_write %value, %target[%c0, %c0]
+      {in_bounds = [true, true]} : vector<2x3xf32>, memref<3x5xf32>
+  return %value : vector<2x3xf32>
+}
+
+// CHECK-LABEL: func.func @scalarize_rank2_projected_transfer
+// CHECK-NOT: vector.transfer_read
+// CHECK-NOT: vector.transfer_write
+// CHECK-COUNT-6: memref.load
+// CHECK-COUNT-6: memref.store
+// CHECK: return

@@ -38,6 +38,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Dominance.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/PatternMatch.h"
@@ -389,6 +390,369 @@ static bool isUnpackLikeOp(Operation *op) {
 //===----------------------------------------------------------------------===//
 // Heuristics for fusing dispatchble ops with root ops using tile + fuse.
 //===----------------------------------------------------------------------===//
+
+// Returns true for the canonical JAX one-hot expansion: an integer row label
+// is broadcast across the final output dimension and compared with
+// linalg.index. Fusing this cheap predicate into its earliest consumer avoids
+// a standalone full-vocabulary dispatch; the fused root can still return the
+// value when a later sibling needs it.
+static bool isSparseOneHotLike(Operation *op) {
+  auto genericOp = dyn_cast<linalg::GenericOp>(op);
+  if (!genericOp || genericOp.getNumDpsInputs() != 1 ||
+      genericOp.getNumDpsInits() != 1 ||
+      genericOp.getNumLoops() != genericOp.getNumParallelLoops()) {
+    return false;
+  }
+  auto inputType = dyn_cast<RankedTensorType>(
+      genericOp.getDpsInputOperand(0)->get().getType());
+  auto outputType = dyn_cast<RankedTensorType>(
+      genericOp.getDpsInitOperand(0)->get().getType());
+  if (!inputType || !outputType || inputType.getRank() + 1 != outputType.getRank() ||
+      !inputType.getElementType().isIntOrIndex() ||
+      !isa<FloatType>(outputType.getElementType())) {
+    return false;
+  }
+  AffineMap inputMap =
+      genericOp.getMatchingIndexingMap(genericOp.getDpsInputOperand(0));
+  AffineMap outputMap =
+      genericOp.getMatchingIndexingMap(genericOp.getDpsInitOperand(0));
+  if (!outputMap.isIdentity() ||
+      inputMap.getNumResults() != static_cast<unsigned>(inputType.getRank())) {
+    return false;
+  }
+  for (auto [position, result] : llvm::enumerate(inputMap.getResults())) {
+    auto dim = dyn_cast<AffineDimExpr>(result);
+    if (!dim || dim.getPosition() != position) {
+      return false;
+    }
+  }
+  Block *body = genericOp.getBlock();
+  if (std::distance(body->begin(), body->end()) != 5) {
+    return false;
+  }
+  auto it = body->begin();
+  return isa<linalg::IndexOp>(*it++) && isa<arith::IndexCastOp>(*it++) &&
+         isa<arith::CmpIOp>(*it++) && isa<arith::UIToFPOp>(*it++) &&
+         isa<linalg::YieldOp>(*it);
+}
+
+// Returns true only for a shape-preserving floating-point extension. Folding
+// this producer into a reduction is lossless and cannot change the reduction's
+// arithmetic topology; it only avoids materializing the widened tensor.
+static bool isLosslessWideningCastLike(Operation *op) {
+  auto genericOp = dyn_cast<linalg::GenericOp>(op);
+  if (!genericOp || genericOp.getNumDpsInputs() != 1 ||
+      genericOp.getNumDpsInits() != 1 ||
+      genericOp.getNumLoops() != genericOp.getNumParallelLoops() ||
+      !genericOp.getMatchingIndexingMap(genericOp.getDpsInputOperand(0))
+           .isIdentity() ||
+      !genericOp.getMatchingIndexingMap(genericOp.getDpsInitOperand(0))
+           .isIdentity()) {
+    return false;
+  }
+  Block *body = genericOp.getBlock();
+  if (std::distance(body->begin(), body->end()) != 2) {
+    return false;
+  }
+  auto extension = dyn_cast<arith::ExtFOp>(&body->front());
+  auto yield = dyn_cast<linalg::YieldOp>(body->getTerminator());
+  return extension && yield &&
+         extension.getIn() == body->getArgument(0) &&
+         yield.getValues().size() == 1 &&
+         yield.getValues().front() == extension.getResult();
+}
+
+// Replaces selection reductions over one_hot(labels) with a sparse load of the
+// selected logits. JAX can spell the selection as either
+// `logits * one_hot` or `select(one_hot != 0, logits, 0)`. Besides avoiding a
+// full-vocabulary read in the forward loss, removing this use leaves the cheap
+// one-hot predicate single-use so it can fuse into the elementwise gradient.
+// This also keeps linalg.index out of a fused reduction: producer indices are
+// local to a reduction tile and cannot represent the global vocabulary column.
+struct RewriteSparseOneHotSelection final
+    : OpRewritePattern<linalg::GenericOp> {
+  using Base::Base;
+
+  LogicalResult matchAndRewrite(linalg::GenericOp reduction,
+                                PatternRewriter &rewriter) const override {
+    if (reduction.getNumDpsInputs() != 2 ||
+        reduction.getNumDpsInits() != 1 || reduction.getNumLoops() != 2 ||
+        reduction.getNumParallelLoops() != 1 ||
+        reduction.getNumReductionLoops() != 1) {
+      return failure();
+    }
+
+    OpOperand *firstOperand = reduction.getDpsInputOperand(0);
+    OpOperand *secondOperand = reduction.getDpsInputOperand(1);
+    auto firstOneHot = firstOperand->get().getDefiningOp<linalg::GenericOp>();
+    auto secondOneHot = secondOperand->get().getDefiningOp<linalg::GenericOp>();
+    bool firstIsOneHot = firstOneHot && isSparseOneHotLike(firstOneHot);
+    bool secondIsOneHot = secondOneHot && isSparseOneHotLike(secondOneHot);
+    if (firstIsOneHot == secondIsOneHot) {
+      return failure();
+    }
+    OpOperand *oneHotOperand = firstIsOneHot ? firstOperand : secondOperand;
+    OpOperand *logitsOperand = firstIsOneHot ? secondOperand : firstOperand;
+    linalg::GenericOp oneHotOp = firstIsOneHot ? firstOneHot : secondOneHot;
+    auto logitsType =
+        dyn_cast<RankedTensorType>(logitsOperand->get().getType());
+    auto resultType =
+        dyn_cast<RankedTensorType>(reduction.getResult(0).getType());
+    if (!logitsType || logitsType.getRank() != 2 || !resultType ||
+        resultType.getRank() != 1 ||
+        logitsType.getElementType() != resultType.getElementType()) {
+      return failure();
+    }
+
+    AffineMap identity2 =
+        AffineMap::getMultiDimIdentityMap(2, rewriter.getContext());
+    AffineMap rowMap = AffineMap::get(
+        2, 0, rewriter.getAffineDimExpr(0), rewriter.getContext());
+    if (reduction.getMatchingIndexingMap(logitsOperand) != identity2 ||
+        reduction.getMatchingIndexingMap(oneHotOperand) != identity2 ||
+        reduction.getMatchingIndexingMap(reduction.getDpsInitOperand(0)) !=
+            rowMap) {
+      return failure();
+    }
+
+    Block *body = reduction.getBlock();
+    auto yield = dyn_cast<linalg::YieldOp>(body->getTerminator());
+    if (!yield || yield.getValues().size() != 1) {
+      return failure();
+    }
+    Value firstArgument = body->getArgument(0);
+    Value secondArgument = body->getArgument(1);
+    Value oneHotArgument = firstIsOneHot ? firstArgument : secondArgument;
+    Value logitsArgument = firstIsOneHot ? secondArgument : firstArgument;
+    Value accumulatorArgument = body->getArgument(2);
+    auto isAccumulatingAdd = [&](arith::AddFOp add, Value selected) {
+      return add &&
+             ((add.getLhs() == selected &&
+               add.getRhs() == accumulatorArgument) ||
+              (add.getRhs() == selected &&
+               add.getLhs() == accumulatorArgument)) &&
+             yield.getValues().front() == add.getResult();
+    };
+
+    bool matchesSelection = false;
+    if (std::distance(body->begin(), body->end()) == 3) {
+      auto multiply = dyn_cast<arith::MulFOp>(&body->front());
+      auto add = dyn_cast<arith::AddFOp>(body->front().getNextNode());
+      matchesSelection =
+          multiply &&
+          ((multiply.getLhs() == logitsArgument &&
+            multiply.getRhs() == oneHotArgument) ||
+           (multiply.getLhs() == oneHotArgument &&
+            multiply.getRhs() == logitsArgument)) &&
+          isAccumulatingAdd(add, multiply.getResult());
+    } else if (std::distance(body->begin(), body->end()) == 4) {
+      auto compare = dyn_cast<arith::CmpFOp>(&body->front());
+      auto select =
+          dyn_cast<arith::SelectOp>(body->front().getNextNode());
+      auto add = dyn_cast<arith::AddFOp>(
+          body->front().getNextNode()->getNextNode());
+      bool comparesOneHotToZero =
+          compare && compare.getPredicate() == arith::CmpFPredicate::UNE &&
+          ((compare.getLhs() == oneHotArgument &&
+            matchPattern(compare.getRhs(), m_AnyZeroFloat())) ||
+           (compare.getRhs() == oneHotArgument &&
+            matchPattern(compare.getLhs(), m_AnyZeroFloat())));
+      matchesSelection =
+          comparesOneHotToZero && select &&
+          select.getCondition() == compare.getResult() &&
+          select.getTrueValue() == logitsArgument &&
+          matchPattern(select.getFalseValue(), m_AnyZeroFloat()) &&
+          isAccumulatingAdd(add, select.getResult());
+    }
+    if (!matchesSelection) {
+      return failure();
+    }
+
+    auto fill =
+        reduction.getDpsInitOperand(0)->get().getDefiningOp<linalg::FillOp>();
+    if (!fill || !matchPattern(fill.getInputs().front(), m_AnyZeroFloat())) {
+      return failure();
+    }
+
+    Value labels = oneHotOp.getDpsInputOperand(0)->get();
+    auto labelsType = dyn_cast<RankedTensorType>(labels.getType());
+    if (!labelsType || labelsType.getRank() != 1 ||
+        !labelsType.getElementType().isIntOrIndex()) {
+      return failure();
+    }
+
+    // Retained mixed-precision logits are commonly widened from BF16 before
+    // the selection. Read the retained tensor directly and widen only the one
+    // selected scalar per row. Capturing the source in a rank-1 parallel
+    // generic is intentional: unlike map_load, it cannot ask the tiler for a
+    // rectangular tile of an indirectly-indexed vocabulary dimension.
+    Value sparseSource = logitsOperand->get();
+    if (auto extension = sparseSource.getDefiningOp<linalg::GenericOp>()) {
+      Block *extensionBody = extension.getBlock();
+      if (extension.getNumDpsInputs() == 1 &&
+          extension.getNumDpsInits() == 1 &&
+          extension.getNumLoops() == extension.getNumParallelLoops() &&
+          extension.getMatchingIndexingMap(extension.getDpsInputOperand(0))
+                  .isIdentity() &&
+          extension.getMatchingIndexingMap(extension.getDpsInitOperand(0))
+                  .isIdentity() &&
+          std::distance(extensionBody->begin(), extensionBody->end()) == 2) {
+        auto ext = dyn_cast<arith::ExtFOp>(&extensionBody->front());
+        auto extensionYield =
+            dyn_cast<linalg::YieldOp>(extensionBody->getTerminator());
+        auto sourceType = dyn_cast<RankedTensorType>(
+            extension.getDpsInputOperand(0)->get().getType());
+        if (ext && extensionYield && sourceType &&
+            ext.getIn() == extensionBody->getArgument(0) &&
+            extensionYield.getValues().size() == 1 &&
+            extensionYield.getValues().front() == ext.getResult() &&
+            sourceType.getShape() == logitsType.getShape() &&
+            isa<FloatType>(sourceType.getElementType())) {
+          sparseSource = extension.getDpsInputOperand(0)->get();
+        }
+      }
+    }
+
+    Location loc = reduction.getLoc();
+    Value empty = tensor::EmptyOp::create(
+        rewriter, loc, resultType.getShape(), resultType.getElementType());
+    SmallVector<AffineMap> maps(
+        2, rewriter.getMultiDimIdentityMap(resultType.getRank()));
+    SmallVector<utils::IteratorType> iterators(
+        resultType.getRank(), utils::IteratorType::parallel);
+    auto sparseSelection = linalg::GenericOp::create(
+        rewriter, loc, TypeRange{resultType}, ValueRange{labels},
+        ValueRange{empty}, maps, iterators,
+        [&](OpBuilder &builder, Location bodyLoc, ValueRange args) {
+          Value row = linalg::IndexOp::create(builder, bodyLoc, 0);
+          Value label = args[0];
+          if (!label.getType().isIndex()) {
+            label = arith::IndexCastOp::create(
+                builder, bodyLoc, builder.getIndexType(), label);
+          }
+          Value selected = tensor::ExtractOp::create(
+              builder, bodyLoc, sparseSource, ValueRange{row, label});
+          if (selected.getType() != resultType.getElementType()) {
+            selected = arith::ExtFOp::create(
+                builder, bodyLoc, resultType.getElementType(), selected);
+          }
+          linalg::YieldOp::create(builder, bodyLoc, selected);
+        });
+    rewriter.replaceOp(reduction, sparseSelection.getResult(0));
+    return success();
+  }
+};
+
+// After the sparse forward selection has been rewritten, the remaining
+// full-vocabulary one-hot is only used as a boolean predicate by the dense
+// backward update. Replace that tensor operand with the rank-1 labels and a
+// rank-1 column iota, then form the predicate directly in the consumer. The
+// small materialized iota avoids an integer divide/remainder per dense element
+// that a tiled linalg.index would otherwise introduce, while still avoiding
+// the 4096xV mask.
+struct FuseSparseOneHotPredicate final
+    : OpRewritePattern<linalg::GenericOp> {
+  using Base::Base;
+
+  LogicalResult matchAndRewrite(linalg::GenericOp consumer,
+                                PatternRewriter &rewriter) const override {
+    linalg::GenericOp oneHot;
+    unsigned oneHotOperandNumber = 0;
+    for (OpOperand *operand : consumer.getDpsInputOperands()) {
+      auto candidate = operand->get().getDefiningOp<linalg::GenericOp>();
+      if (!candidate || !isSparseOneHotLike(candidate)) {
+        continue;
+      }
+      if (oneHot) {
+        return failure();
+      }
+      oneHot = candidate;
+      oneHotOperandNumber = operand->getOperandNumber();
+    }
+    if (!oneHot || !oneHot->hasOneUse()) {
+      return failure();
+    }
+
+    Block *body = consumer.getBlock();
+    BlockArgument oneHotArgument = body->getArgument(oneHotOperandNumber);
+    if (!oneHotArgument.hasOneUse()) {
+      return failure();
+    }
+    auto compare = dyn_cast<arith::CmpFOp>(*oneHotArgument.user_begin());
+    if (!compare || compare.getPredicate() != arith::CmpFPredicate::UNE ||
+        !((compare.getLhs() == oneHotArgument &&
+           matchPattern(compare.getRhs(), m_AnyZeroFloat())) ||
+          (compare.getRhs() == oneHotArgument &&
+           matchPattern(compare.getLhs(), m_AnyZeroFloat())))) {
+      return failure();
+    }
+
+    Value labels = oneHot.getDpsInputOperand(0)->get();
+    auto labelsType = cast<RankedTensorType>(labels.getType());
+    auto oneHotType = cast<RankedTensorType>(oneHot.getResult(0).getType());
+    auto columnsType = RankedTensorType::get(
+        {oneHotType.getDimSize(1)}, labelsType.getElementType());
+    Value columnsEmpty = tensor::EmptyOp::create(
+        rewriter, oneHot.getLoc(), columnsType.getShape(),
+        columnsType.getElementType());
+    auto columns = linalg::GenericOp::create(
+        rewriter, oneHot.getLoc(), TypeRange{columnsType}, ValueRange{},
+        ValueRange{columnsEmpty},
+        ArrayRef<AffineMap>{rewriter.getMultiDimIdentityMap(1)},
+        ArrayRef<utils::IteratorType>{utils::IteratorType::parallel},
+        [&](OpBuilder &builder, Location loc, ValueRange) {
+          Value column = linalg::IndexOp::create(builder, loc, 0);
+          if (!labelsType.getElementType().isIndex()) {
+            column = arith::IndexCastOp::create(
+                builder, loc, labelsType.getElementType(), column);
+          }
+          linalg::YieldOp::create(builder, loc, column);
+        });
+    columns->setAttr("iree-metal.sparse-one-hot-columns",
+                     UnitAttr::get(rewriter.getContext()));
+
+    unsigned oldInputCount = consumer.getNumDpsInputs();
+    SmallVector<Value> inputs(consumer.getDpsInputs());
+    inputs[oneHotOperandNumber] = labels;
+    inputs.push_back(columns.getResult(0));
+    SmallVector<AffineMap> maps = consumer.getIndexingMapsArray();
+    maps[oneHotOperandNumber] = AffineMap::get(
+        consumer.getNumLoops(), 0, rewriter.getAffineDimExpr(0),
+        rewriter.getContext());
+    maps.insert(maps.begin() + oldInputCount,
+                AffineMap::get(consumer.getNumLoops(), 0,
+                               rewriter.getAffineDimExpr(1),
+                               rewriter.getContext()));
+    auto replacement = linalg::GenericOp::create(
+        rewriter, consumer.getLoc(), consumer->getResultTypes(), inputs,
+        consumer.getDpsInits(), maps,
+        consumer.getIteratorTypesArray(),
+        [&](OpBuilder &builder, Location loc, ValueRange args) {
+          IRMapping mapping;
+          for (auto [index, oldArgument] :
+               llvm::enumerate(body->getArguments())) {
+            if (index == oneHotOperandNumber) {
+              continue;
+            }
+            unsigned newIndex = index < oldInputCount ? index : index + 1;
+            mapping.map(oldArgument, args[newIndex]);
+          }
+          Value label = args[oneHotOperandNumber];
+          Value column = args[oldInputCount];
+          Value predicate = arith::CmpIOp::create(
+              builder, loc, arith::CmpIPredicate::eq, label, column);
+          mapping.map(compare.getResult(), predicate);
+          for (Operation &operation : body->getOperations()) {
+            if (&operation == compare.getOperation()) {
+              continue;
+            }
+            builder.clone(operation, mapping);
+          }
+        });
+    rewriter.replaceOp(consumer, replacement.getResults());
+    return success();
+  }
+};
 
 /// For all uses of an operation, return the uses that could be fused.
 /// The returned vector contains the uses in dominance order.
@@ -757,6 +1121,17 @@ static bool isFusableWithProducer(OpOperand &operand,
     return false;
   }
 
+  // Keep a sparse one-hot producer materialized for its remaining dense
+  // backward consumer. Recomputing linalg.index plus the label comparison for
+  // every vocabulary-gradient element is measurably slower on Apple than one
+  // coalesced mask read. The forward target selection is already rewritten to
+  // a rank-1 sparse gather, so this boundary does not retain its reduction use.
+  if (isSparseOneHotLike(producer)) {
+    return false;
+  }
+  if (producer->hasAttr("iree-metal.sparse-one-hot-columns")) {
+    return false;
+  }
   // Non-unique scatter batch loops are reductions and remain untiled when the
   // trailing update window is distributed across a Metal workgroup. Fusing a
   // producer into a large update operand can therefore materialize the entire
@@ -792,44 +1167,19 @@ static bool isFusableWithProducer(OpOperand &operand,
     }
   }
 
-  // An all-reduction root has no parallel loop that can tile a fused producer.
-  // Indirect reads lowered through tensor.extract (for example embedding
-  // gathers) consequently materialize the producer's entire result in
-  // workgroup memory. Preserve a dispatch boundary when that static result
-  // alone exceeds Metal's 32 KiB limit. Elementwise and partially-parallel
-  // reductions keep their normal aggressive-fusion behavior.
-  bool oversizedUntiledExtractReduction = false;
-  if (linalgConsumer && linalgConsumer.getNumReductionLoops() != 0 &&
-      linalgConsumer.getNumParallelLoops() == 0) {
-    bool hasTensorExtract = false;
-    producer->walk([&](tensor::ExtractOp) {
-      hasTensorExtract = true;
-      return WalkResult::interrupt();
-    });
-    if (hasTensorExtract) {
-      constexpr int64_t kMetalWorkgroupMemoryLimitBits = 32 * 1024 * 8;
-      auto operandType = dyn_cast<ShapedType>(operand.get().getType());
-      if (!operandType || !operandType.hasStaticShape()) {
-        oversizedUntiledExtractReduction = true;
-      } else {
-        int64_t elementBitWidth = operandType.getElementTypeBitWidth();
-        int64_t maxElements =
-            kMetalWorkgroupMemoryLimitBits / elementBitWidth;
-        int64_t elementCount = 1;
-        for (int64_t dim : operandType.getShape()) {
-          if (dim != 0 && elementCount > maxElements / dim) {
-            oversizedUntiledExtractReduction = true;
-            break;
-          }
-          elementCount *= dim;
-        }
-      }
-    }
-  }
+  // A reduction consumer cannot safely tile a fused non-init producer using
+  // the reduction's mapping. Under aggressive fusion this changed the forward
+  // summation topology of differentiated logsumexp while leaving its gradient
+  // unchanged. Preserve this producer boundary; init-operand fusion and
+  // elementwise aggressive fusion remain enabled.
+  bool reductionNonInitOperand =
+      linalgConsumer && linalgConsumer.getNumReductionLoops() != 0 &&
+      !isLosslessWideningCastLike(producer);
 
   // IREE_METAL_NONINIT_GUARD remains available as a broad diagnostic control.
   if (!options.aggressiveFusion || oversizedNonUniqueScatterUpdate ||
-      oversizedUntiledExtractReduction || getenv("IREE_METAL_NONINIT_GUARD")) {
+      reductionNonInitOperand ||
+      getenv("IREE_METAL_NONINIT_GUARD")) {
     auto consumerFusionOp = dyn_cast<DestinationStyleOpInterface>(consumer);
     if (consumerFusionOp && !consumerFusionOp.isDpsInit(&operand)) {
       return false;
@@ -1147,6 +1497,16 @@ struct FormDispatchRegionsPass final
 /// Create dispatch.region Ops based on a fusion heuristic.
 void FormDispatchRegionsPass::runOnOperation() {
   mlir::FunctionOpInterface funcOp = getOperation();
+  MLIRContext *context = &getContext();
+  RewritePatternSet preprocessingPatterns(context);
+  preprocessingPatterns.add<RewriteSparseOneHotSelection>(context,
+                                                           PatternBenefit(2));
+  preprocessingPatterns.add<FuseSparseOneHotPredicate>(
+      context, PatternBenefit(1));
+  if (failed(applyPatternsGreedily(funcOp, std::move(preprocessingPatterns)))) {
+    funcOp.emitOpError("failed in sparse selection preprocessing");
+    return signalPassFailure();
+  }
   DominanceInfo &dominanceInfo = getAnalysis<DominanceInfo>();
   TensorDimTrackingRewriter rewriter(funcOp);
   FormDispatchRegionsPassOptions options{aggressiveFusion, fusePadWithConsumers,
@@ -1157,7 +1517,6 @@ void FormDispatchRegionsPass::runOnOperation() {
   }
 
   // Canonicalize all the dispatch regions to remove unused operands.
-  MLIRContext *context = &getContext();
   RewritePatternSet patterns(context);
   memref::populateResolveRankedShapedTypeResultDimsPatterns(patterns);
   IREE::Flow::DispatchRegionOp::getCanonicalizationPatterns(patterns, context);

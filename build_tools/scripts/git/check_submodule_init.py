@@ -5,7 +5,6 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 import argparse
-import os
 import pathlib
 import subprocess
 import sys
@@ -33,8 +32,19 @@ def run():
     except:
         return
 
-    output = os.popen("git submodule status")
-    submodules = output.readlines()
+    repo_root = pathlib.Path(
+        subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"], text=True
+        ).strip()
+    )
+    modules_file = repo_root / ".gitmodules"
+    if not modules_file.exists():
+        return
+    paths = subprocess.check_output(
+        ["git", "config", "--file", str(modules_file), "--get-regexp", "path"],
+        text=True,
+    ).splitlines()
+    submodules = [line.split(maxsplit=1)[1] for line in paths]
 
     runtime_submodules = (
         pathlib.Path(__file__)
@@ -43,10 +53,10 @@ def run():
         .split("\n")
     )
 
-    for submodule in submodules:
-        prefix = submodule.strip()[0]
-        name = submodule.split()[1]
-        if prefix == "-" and (not args.runtime_only or name in runtime_submodules):
+    for name in submodules:
+        if (not args.runtime_only or name in runtime_submodules) and not (
+            repo_root / name / ".git"
+        ).exists():
             print(
                 "The git submodule '%s' is not initialized. Please run `git submodule update --init`"
                 % (name)

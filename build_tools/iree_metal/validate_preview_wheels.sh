@@ -155,8 +155,10 @@ for wheel in wheels:
                 '"IREE_METAL_APPLE_PHYSICAL_BACKWARD_COMPACT_SMEM"',
                 '"IREE_METAL_APPLE_PHYSICAL_FRAGMENTS"',
                 '"IREE_METAL_APPLE_PHYSICAL_SCORE_WG64"',
+                '"IREE_METAL_ATTN_PREFETCH_STAGES": "2"',
+                '"IREE_METAL_FUSE_ADAM_UPDATE"',
                 '"--iree-metal-compile-to-metallib=false"',
-                '"--iree-dispatch-creation-fuse-multi-use=false"',
+                '"--iree-dispatch-creation-fuse-multi-use=true"',
                 '"--iree-dispatch-creation-enable-aggressive-fusion=true"',
                 'requested == "baseline"',
             )

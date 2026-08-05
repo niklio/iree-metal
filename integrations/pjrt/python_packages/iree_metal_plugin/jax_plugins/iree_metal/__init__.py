@@ -14,7 +14,7 @@ import jax._src.xla_bridge as xb
 
 logger = logging.getLogger(__name__)
 
-PREVIEW_PROFILE = "preview-20260803"
+PREVIEW_PROFILE = "preview-20260804"
 _PREVIEW_PROFILE_ALIASES = {"preview", PREVIEW_PROFILE}
 _PREVIEW_FEATURE_GATES = (
     "IREE_METAL_APPLE_PHYSICAL_BACKWARD_COMPACT_SMEM",
@@ -24,17 +24,29 @@ _PREVIEW_FEATURE_GATES = (
     "IREE_METAL_CAUSAL_FWD_BOUNDS",
     "IREE_METAL_CAUSAL_TRIANGULAR_GRID",
     "IREE_METAL_FFN_PAD_M64",
+    "IREE_METAL_FUSE_ADAM_UPDATE",
     "IREE_METAL_GELU_REMAT",
     "IREE_METAL_LN_PAIRED",
     "IREE_METAL_SCATTER_WINDOW_WORKGROUPS",
+    "IREE_METAL_SPLIT_RESOURCE_ONLY",
 )
+_PREVIEW_PARAMETER_DEFAULTS = {
+    # Two stages improved every-model HF10 geometric mean while three stages
+    # exceeded the useful shared-memory depth and regressed sustained latency.
+    "IREE_METAL_ATTN_PREFETCH_STAGES": "2",
+}
 _PREVIEW_COMPILER_OPTIONS = (
     # Embed MSL and compile it through the runtime Metal API. This keeps the
     # preview usable without installing Xcode's optional Metal Toolchain.
     "--iree-metal-compile-to-metallib=false",
-    # The current multi-use path can miscompile a transformer gradient graph.
-    "--iree-dispatch-creation-fuse-multi-use=false",
+    # Multi-use fusion removes redundant optimizer and integrated-step
+    # materializations. Reduction producers retain the fork's stricter
+    # correctness boundary in FormDispatchRegions.
+    "--iree-dispatch-creation-fuse-multi-use=true",
     "--iree-dispatch-creation-enable-aggressive-fusion=true",
+    # Bound partial-reduction tiles for global training losses while retaining
+    # aggressive fusion for the transformer body.
+    "--iree-dispatch-creation-enable-split-reduction=true",
 )
 
 
@@ -102,6 +114,8 @@ def _configure_preview_profile() -> tuple[str, str]:
         active_profile = PREVIEW_PROFILE
         for name in _PREVIEW_FEATURE_GATES:
             os.environ.setdefault(name, "1")
+        for name, value in _PREVIEW_PARAMETER_DEFAULTS.items():
+            os.environ.setdefault(name, value)
     elif requested == "baseline":
         active_profile = "baseline"
     else:

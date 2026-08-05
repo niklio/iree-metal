@@ -36,14 +36,36 @@ class PreviewProfileTest(unittest.TestCase):
             }.issubset(iree_metal._PREVIEW_FEATURE_GATES)
         )
 
+    def test_preview_includes_fused_adam_update(self):
+        self.assertIn(
+            "IREE_METAL_FUSE_ADAM_UPDATE", iree_metal._PREVIEW_FEATURE_GATES
+        )
+
+    def test_preview_limits_split_reduction_to_resource_cases(self):
+        self.assertIn(
+            "IREE_METAL_SPLIT_RESOURCE_ONLY", iree_metal._PREVIEW_FEATURE_GATES
+        )
+
+    def test_preview_uses_two_attention_prefetch_stages(self):
+        self.assertEqual(
+            iree_metal._PREVIEW_PARAMETER_DEFAULTS[
+                "IREE_METAL_ATTN_PREFETCH_STAGES"
+            ],
+            "2",
+        )
+
     def test_preview_is_the_default(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             profile, options = iree_metal._configure_preview_profile()
             self.assertEqual(profile, iree_metal.PREVIEW_PROFILE)
             for name in iree_metal._PREVIEW_FEATURE_GATES:
                 self.assertEqual(os.environ[name], "1")
+            self.assertEqual(os.environ["IREE_METAL_ATTN_PREFETCH_STAGES"], "2")
             self.assertIn("--iree-metal-compile-to-metallib=false", options)
-            self.assertIn("--iree-dispatch-creation-fuse-multi-use=false", options)
+            self.assertIn("--iree-dispatch-creation-fuse-multi-use=true", options)
+            self.assertIn(
+                "--iree-dispatch-creation-enable-split-reduction=true", options
+            )
 
     def test_baseline_does_not_enable_feature_gates(self):
         with mock.patch.dict(
@@ -53,18 +75,23 @@ class PreviewProfileTest(unittest.TestCase):
             self.assertEqual(profile, "baseline")
             for name in iree_metal._PREVIEW_FEATURE_GATES:
                 self.assertNotIn(name, os.environ)
+            self.assertNotIn("IREE_METAL_ATTN_PREFETCH_STAGES", os.environ)
 
     def test_explicit_gate_and_compiler_options_are_preserved(self):
         with mock.patch.dict(
             os.environ,
             {
                 "IREE_METAL_FFN_PAD_M64": "0",
+                "IREE_METAL_FUSE_ADAM_UPDATE": "0",
+                "IREE_METAL_ATTN_PREFETCH_STAGES": "1",
                 "IREE_PJRT_IREE_COMPILER_OPTIONS": "--iree-opt-level=O1",
             },
             clear=True,
         ):
             _, options = iree_metal._configure_preview_profile()
             self.assertEqual(os.environ["IREE_METAL_FFN_PAD_M64"], "0")
+            self.assertEqual(os.environ["IREE_METAL_FUSE_ADAM_UPDATE"], "0")
+            self.assertEqual(os.environ["IREE_METAL_ATTN_PREFETCH_STAGES"], "1")
             self.assertTrue(options.endswith("--iree-opt-level=O1"))
 
     def test_unknown_profile_fails_closed(self):

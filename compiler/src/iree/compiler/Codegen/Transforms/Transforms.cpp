@@ -15,6 +15,7 @@
 #include <cstdint>
 
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenDialect.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenOps.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/UKernelOps.h"
 #include "iree/compiler/Codegen/Interfaces/HoistableRegionOpInterface.h"
@@ -604,6 +605,39 @@ getNextWorkgroupMapping(IREE::Codegen::WorkgroupMappingAttr mapping) {
   llvm_unreachable("Unhandled WorkgroupId case");
 }
 
+// Converts a standalone split-reduction mapping to a workgroup mapping. A
+// split reduction normally wraps a workgroup-mapped forall and the pattern
+// below folds the two loops. Scalar-output reductions do not have any
+// partitionable parallel loops, though, so workgroup tiling creates no nested
+// forall. In that case the split loop itself is the complete workgroup loop.
+static SmallVector<Attribute> convertSplitReductionToWorkgroupMapping(
+    MLIRContext *context, ArrayRef<Attribute> splitReductionMapping) {
+  context->getOrLoadDialect<IREE::Codegen::IREECodegenDialect>();
+  auto castedSplitReductionMapping =
+      llvm::map_to_vector(splitReductionMapping, [](Attribute attr) {
+        return cast<IREE::LinalgExt::SplitReductionMappingAttr>(attr);
+      });
+  llvm::sort(castedSplitReductionMapping);
+
+  IREE::Codegen::WorkgroupMappingAttr nextMapping =
+      IREE::Codegen::WorkgroupMappingAttr::get(
+          context, IREE::Codegen::WorkgroupId::IdX);
+  DenseMap<IREE::LinalgExt::SplitReductionMappingAttr,
+           IREE::Codegen::WorkgroupMappingAttr>
+      splitToWorkgroupMap;
+  for (IREE::LinalgExt::SplitReductionMappingAttr mapping :
+       castedSplitReductionMapping) {
+    splitToWorkgroupMap[mapping] = nextMapping;
+    nextMapping = getNextWorkgroupMapping(nextMapping);
+  }
+
+  return llvm::map_to_vector(
+      splitReductionMapping, [&](Attribute attr) -> Attribute {
+        return splitToWorkgroupMap.lookup(
+            cast<IREE::LinalgExt::SplitReductionMappingAttr>(attr));
+      });
+}
+
 static SmallVector<Attribute> appendSplitReductionMappingToWorkgroupMapping(
     ArrayRef<Attribute> currWorkgroupMapping,
     ArrayRef<Attribute> splitReductionMapping) {
@@ -654,11 +688,6 @@ struct FoldSplitReductionForallWithWorkgroupForall
 
   LogicalResult matchAndRewrite(scf::ForallOp forallOp,
                                 PatternRewriter &rewriter) const override {
-    if (forallOp.getNumResults() != 0) {
-      return rewriter.notifyMatchFailure(
-          forallOp, "unhandled operation with return values");
-    }
-
     std::optional<ArrayAttr> mappingAttr = forallOp.getMapping();
     if (!mappingAttr) {
       return rewriter.notifyMatchFailure(forallOp,
@@ -675,7 +704,26 @@ struct FoldSplitReductionForallWithWorkgroupForall
     // loop is nested within the split reduction loop.
     auto nestedForallOps = forallOp.getOps<scf::ForallOp>();
 
-    // For now bail on more than one scf.forall ops.
+    // A scalar-output reduction has no partitionable loop for workgroup tiling
+    // to materialize. The split-reduction forall is already the complete
+    // workgroup loop, so resolve its placeholder mapping directly. This is a
+    // mapping-only rewrite and is valid even when the forall still has tensor
+    // results.
+    if (nestedForallOps.empty()) {
+      ArrayAttr workgroupMapping = rewriter.getArrayAttr(
+          convertSplitReductionToWorkgroupMapping(
+              rewriter.getContext(), mappingAttr->getValue()));
+      rewriter.modifyOpInPlace(
+          forallOp, [&]() { forallOp.setMappingAttr(workgroupMapping); });
+      return success();
+    }
+
+    if (forallOp.getNumResults() != 0) {
+      return rewriter.notifyMatchFailure(
+          forallOp, "unhandled merging of loops with return values");
+    }
+
+    // For now bail on more than one nested scf.forall op.
     if (!llvm::hasSingleElement(nestedForallOps)) {
       return rewriter.notifyMatchFailure(
           forallOp, "unhandled multiple `scf.forall` ops nested within the "

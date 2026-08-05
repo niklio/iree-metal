@@ -10,6 +10,25 @@
 // RUN: env -u IREE_METAL_COOP_NO_PAD -u IREE_METAL_COOP_NO_ATTN_ISOLATE -u IREE_METAL_COOP_NO_ATTN_ISOLATE_BF16 IREE_METAL_FFN_PAD_M64=1 iree-opt --iree-global-opt-raise-contraction-accumulator-to-f32 %s | FileCheck %s --check-prefix=PAD64
 // RUN: env -u IREE_METAL_COOP_NO_PAD -u IREE_METAL_COOP_NO_ATTN_ISOLATE -u IREE_METAL_COOP_NO_ATTN_ISOLATE_BF16 IREE_METAL_FFN_PAD_M64=1 iree-opt --pass-pipeline="builtin.module(func.func(iree-global-opt-raise-contraction-accumulator-to-f32,iree-global-opt-raise-contraction-accumulator-to-f32))" %s | FileCheck %s --check-prefix=PAD64
 
+// DEFAULT-LABEL: func.func @large_vocab_projection(
+// DEFAULT: tensor<768x50304xbf16>
+// DEFAULT: tensor<4096x50304xf32>
+// DEFAULT: tensor.extract_slice
+// DEFAULT-SAME: tensor<4096x50304xbf16> to tensor<4096x50257xbf16>
+// DEFAULT: return
+func.func @large_vocab_projection(
+    %lhs: tensor<4096x768xbf16>,
+    %rhs: tensor<768x50257xbf16>) -> tensor<4096x50257xbf16> {
+  %zero = arith.constant 0.0 : bf16
+  %empty = tensor.empty() : tensor<4096x50257xbf16>
+  %init = linalg.fill ins(%zero : bf16)
+      outs(%empty : tensor<4096x50257xbf16>) -> tensor<4096x50257xbf16>
+  %result = linalg.matmul
+      ins(%lhs, %rhs : tensor<4096x768xbf16>, tensor<768x50257xbf16>)
+      outs(%init : tensor<4096x50257xbf16>) -> tensor<4096x50257xbf16>
+  return %result : tensor<4096x50257xbf16>
+}
+
 // DEFAULT-LABEL: func.func @m_major(
 // DEFAULT: tensor<4624x768xbf16>
 // DEFAULT: tensor<4624x3072xf32>

@@ -20,8 +20,8 @@ Use a fresh Python 3.12 virtual environment. Do not install the stock
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install \
-  https://github.com/niklio/iree-metal/releases/download/iree-metal-v3.11.0.dev2026080303/iree_base_compiler_iree_metal-3.11.0.dev2026080303-cp312-abi3-macosx_13_0_arm64.whl \
-  https://github.com/niklio/iree-metal/releases/download/iree-metal-v3.11.0.dev2026080303/iree_pjrt_plugin_metal_iree_metal-3.11.0.dev2026080303-py3-none-macosx_13_0_arm64.whl
+  https://github.com/niklio/iree-metal/releases/download/iree-metal-v3.11.0.dev2026080401/iree_base_compiler_iree_metal-3.11.0.dev2026080401-cp312-abi3-macosx_13_0_arm64.whl \
+  https://github.com/niklio/iree-metal/releases/download/iree-metal-v3.11.0.dev2026080401/iree_pjrt_plugin_metal_iree_metal-3.11.0.dev2026080401-py3-none-macosx_13_0_arm64.whl
 ```
 
 The wheels install their dependencies, including the required JAX and JAXLIB
@@ -35,24 +35,27 @@ JAX_PLATFORMS=iree_metal python -c \
 ```
 
 That is the only required runtime setting. The wheels select the tested
-`preview-20260803` profile automatically; no tuning flags are needed. For
+`preview-20260804` profile automatically; no tuning flags are needed. For
 diagnosis, the one supported rollback is `IREE_METAL_PROFILE=baseline`.
 
 Advanced users who need an offline installation, exact dependency locking,
 checksums, or GitHub provenance verification can download the self-contained
 bundle from the
-[Developer Preview 2 release](https://github.com/niklio/iree-metal/releases/tag/iree-metal-v3.11.0.dev2026080303)
+[Developer Preview 3 release](https://github.com/niklio/iree-metal/releases/tag/iree-metal-v3.11.0.dev2026080401)
 and follow the [developer preview guide](docs/metal/developer-preview.md). The
 guide also documents the numeric contract, support boundary, and known
 limitations.
 
 ## Project status
 
-The release verifier exercises 233 semantic operation/shape/dtype cases and 10
-deterministic BF16 forward-and-backward model workloads against the exact
-wheels. It requires every check to pass and the model-board geometric mean to
-exceed 1.00x a paired live, artifact-keyed `jax-metal` reference on the disclosed
-Apple M4 system.
+The release verifier keeps four independent gates against the exact wheels:
+233 semantic operation/shape/dtype cases, nine decoder-training operator and
+resource cases, 10 deterministic BF16 forward-and-backward model workloads,
+and 12 paired decoder-training performance workloads. Correctness and resource
+checks must all pass. The model-board geometric mean must exceed 1.00x its live
+artifact-keyed `jax-metal` reference; decoder-training performance must meet
+the aggregate, per-phase, per-workload, and stability thresholds recorded in
+the release evidence on the disclosed Apple M4 system.
 This is a bounded release claim, not universal JAX compatibility. Exact results
 and machine-readable evidence are attached to each release.
 

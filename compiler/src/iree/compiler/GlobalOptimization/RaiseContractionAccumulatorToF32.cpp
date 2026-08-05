@@ -35,6 +35,92 @@ namespace mlir::iree_compiler::GlobalOptimization {
 
 namespace {
 
+static bool isInner2DTranspose(linalg::GenericOp genericOp) {
+  if (genericOp.getNumDpsInputs() != 1 || genericOp.getNumDpsInits() != 1 ||
+      genericOp.getNumLoops() != 2) {
+    return false;
+  }
+  MLIRContext *context = genericOp.getContext();
+  AffineExpr d0, d1;
+  bindDims(context, d0, d1);
+  SmallVector<AffineMap> inputTransposeMaps = {
+      AffineMap::get(2, 0, {d1, d0}, context),
+      AffineMap::get(2, 0, {d0, d1}, context)};
+  SmallVector<AffineMap> outputTransposeMaps = {
+      AffineMap::get(2, 0, {d0, d1}, context),
+      AffineMap::get(2, 0, {d1, d0}, context)};
+  SmallVector<AffineMap> maps = genericOp.getIndexingMapsArray();
+  if ((maps != inputTransposeMaps && maps != outputTransposeMaps) ||
+      !llvm::hasSingleElement(*genericOp.getBlock())) {
+    return false;
+  }
+  auto sourceType =
+      dyn_cast<RankedTensorType>(genericOp.getDpsInputOperand(0)->get().getType());
+  auto resultType = dyn_cast<RankedTensorType>(genericOp->getResult(0).getType());
+  if (!sourceType || !resultType || sourceType.getRank() != 2 ||
+      resultType.getRank() != 2 ||
+      sourceType.getDimSize(0) != resultType.getDimSize(1) ||
+      sourceType.getDimSize(1) != resultType.getDimSize(0)) {
+    return false;
+  }
+  auto yieldOp = cast<linalg::YieldOp>(genericOp.getBlock()->getTerminator());
+  auto blockArg = dyn_cast<BlockArgument>(yieldOp.getOperand(0));
+  return blockArg && blockArg.getOwner() == genericOp.getBlock() &&
+         blockArg.getArgNumber() == 0;
+}
+
+struct FoldTransposeIntoMatmulLhsPattern
+    : OpRewritePattern<linalg::MatmulOp> {
+  using OpRewritePattern<linalg::MatmulOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(linalg::MatmulOp matmulOp,
+                                PatternRewriter &rewriter) const override {
+    auto transposeOp = matmulOp.getDpsInputOperand(0)
+                           ->get()
+                           .getDefiningOp<linalg::GenericOp>();
+    if (!transposeOp || !isInner2DTranspose(transposeOp))
+      return failure();
+    SmallVector<int64_t> ranges =
+        cast<linalg::LinalgOp>(matmulOp.getOperation()).getStaticLoopRanges();
+    if (!llvm::any_of(ranges, [](int64_t d) { return d >= 32768; }))
+      return failure();
+    rewriter.replaceOpWithNewOp<linalg::MatmulTransposeAOp>(
+        matmulOp,
+        ValueRange{transposeOp.getDpsInputOperand(0)->get(),
+                   matmulOp.getDpsInputOperand(1)->get()},
+        ValueRange{matmulOp.getDpsInitOperand(0)->get()});
+    return success();
+  }
+};
+
+struct FoldTransposeIntoMatmulRhsPattern
+    : OpRewritePattern<linalg::MatmulOp> {
+  using OpRewritePattern<linalg::MatmulOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(linalg::MatmulOp matmulOp,
+                                PatternRewriter &rewriter) const override {
+    auto transposeOp = matmulOp.getDpsInputOperand(1)
+                           ->get()
+                           .getDefiningOp<linalg::GenericOp>();
+    if (!transposeOp || !isInner2DTranspose(transposeOp))
+      return failure();
+    SmallVector<int64_t> ranges =
+        cast<linalg::LinalgOp>(matmulOp.getOperation()).getStaticLoopRanges();
+    if (!llvm::any_of(ranges, [](int64_t d) { return d >= 32768; }))
+      return failure();
+    Value source = transposeOp.getDpsInputOperand(0)->get();
+    if (auto sourceTranspose = source.getDefiningOp<linalg::GenericOp>();
+        sourceTranspose && isInner2DTranspose(sourceTranspose)) {
+      return failure();
+    }
+    rewriter.replaceOpWithNewOp<linalg::MatmulTransposeBOp>(
+        matmulOp,
+        ValueRange{matmulOp.getDpsInputOperand(0)->get(), source},
+        ValueRange{matmulOp.getDpsInitOperand(0)->get()});
+    return success();
+  }
+};
+
 // Cast a ranked tensor elementwise to `dstElemType` via a linalg.generic
 // (extf when widening, truncf when narrowing).
 static Value castTensorElementwise(PatternRewriter &rewriter, Location loc,
@@ -93,7 +179,9 @@ struct RaiseAccumulatorPattern : OpInterfaceRewritePattern<linalg::LinalgOp> {
     // scores ([24,512,512], 25MB) — a perf loss, the opposite of flash attention.
     // So attention-on-coop needs real flash-attention fusion (iree_linalg_ext
     // attention op), not batch promotion. Left 2D-only; batch stays scalar.
-    bool isMatmul = IREE::LinalgExt::isPureMatmul(op);
+    bool isMatmul = IREE::LinalgExt::isPureMatmul(op) ||
+                    isa<linalg::MatmulTransposeAOp,
+                        linalg::MatmulTransposeBOp>(op);
     // Promote attention batch matmuls (q@kᵀ / a@v) to f32 so they can hit coop —
     // paired with the reduction-epilogue barrier split below that isolates them
     // from the softmax into their own clean coop dispatch on the matrix units.
@@ -183,15 +271,28 @@ struct RaiseAccumulatorPattern : OpInterfaceRewritePattern<linalg::LinalgOp> {
         RankedTensorType::get(initType.getShape(), f32, initType.getEncoding());
     SmallVector<Value> inputs = linalgOp.getDpsInputs();
 
-    Operation *newOp =
-        isBatchMatmul
-            ? linalg::BatchMatmulOp::create(rewriter, loc,
-                                            TypeRange{f32ResultType}, inputs,
-                                            ValueRange{f32Init})
-                  .getOperation()
-            : linalg::MatmulOp::create(rewriter, loc, TypeRange{f32ResultType},
-                                       inputs, ValueRange{f32Init})
+    Operation *newOp;
+    if (isa<linalg::MatmulTransposeAOp>(op)) {
+      newOp = linalg::MatmulTransposeAOp::create(
+                  rewriter, loc, TypeRange{f32ResultType}, inputs,
+                  ValueRange{f32Init})
                   .getOperation();
+    } else if (isa<linalg::MatmulTransposeBOp>(op)) {
+      newOp = linalg::MatmulTransposeBOp::create(
+                  rewriter, loc, TypeRange{f32ResultType}, inputs,
+                  ValueRange{f32Init})
+                  .getOperation();
+    } else if (isBatchMatmul) {
+      newOp = linalg::BatchMatmulOp::create(
+                  rewriter, loc, TypeRange{f32ResultType}, inputs,
+                  ValueRange{f32Init})
+                  .getOperation();
+    } else {
+      newOp = linalg::MatmulOp::create(rewriter, loc,
+                                       TypeRange{f32ResultType}, inputs,
+                                       ValueRange{f32Init})
+                  .getOperation();
+    }
     // Keep the f32 matmul and the narrowing truncf in SEPARATE dispatches: a
     // FUSED f32-C -> bf16-store miscompiles the coop pipeline, but a standalone
     // f32-output coop matmul + a separate bf16 cast is numerically correct
@@ -370,16 +471,35 @@ struct IsolateBatchMatmulPattern : OpRewritePattern<linalg::BatchMatmulOp> {
 // RaiseAccumulatorPattern (dims now mult-16 and, for vit, >=128). Env-gated
 // IREE_METAL_COOP_PAD.
 struct PadMatmulToCoopPattern : OpInterfaceRewritePattern<linalg::LinalgOp> {
-  using OpInterfaceRewritePattern<linalg::LinalgOp>::OpInterfaceRewritePattern;
+  PadMatmulToCoopPattern(MLIRContext *context,
+                        bool largeVocabularyOnly = false)
+      : OpInterfaceRewritePattern<linalg::LinalgOp>(context),
+        largeVocabularyOnly(largeVocabularyOnly) {}
 
   LogicalResult matchAndRewrite(linalg::LinalgOp linalgOp,
                                 PatternRewriter &rewriter) const override {
     Operation *op = linalgOp.getOperation();
-    if (!IREE::LinalgExt::isPureMatmul(op) || linalgOp.hasDynamicShape()) {
+    bool isPlainMatmul = IREE::LinalgExt::isPureMatmul(op);
+    bool isTransposeMatmul =
+        isa<linalg::MatmulTransposeAOp, linalg::MatmulTransposeBOp>(op);
+    if ((!isPlainMatmul && !isTransposeMatmul) || linalgOp.hasDynamicShape()) {
       return failure();
     }
     SmallVector<int64_t> ranges = linalgOp.getStaticLoopRanges();
     if (ranges.size() != 3) // M, N, K
+      return failure();
+    bool isLargeBF16VocabularyMatmul =
+        llvm::any_of(ranges, [](int64_t d) { return d >= 32768; }) &&
+        llvm::all_of(linalgOp.getDpsInputs(), [](Value input) {
+          return cast<ShapedType>(input.getType()).getElementType().isBF16();
+        });
+    // The generic padding helper is not safe for ordinary transpose matmuls;
+    // its loop-order padding does not correspond to their physical operand
+    // dimension order. The explicit large-vocabulary cases below are covered
+    // by decoder correctness and are the only transpose forms that need it.
+    if (isTransposeMatmul && !isLargeBF16VocabularyMatmul)
+      return failure();
+    if (largeVocabularyOnly && !isLargeBF16VocabularyMatmul)
       return failure();
     // Only pad if a dim is non-mult-16 (else nothing to do — avoids re-firing on
     // the already-padded matmul, which terminates the greedy rewrite).
@@ -417,9 +537,12 @@ struct PadMatmulToCoopPattern : OpInterfaceRewritePattern<linalg::LinalgOp> {
     }
     options.setPaddingValues(padValues);
     options.setPaddingDimensions({0, 1, 2});
-    options.setPadToMultipleOf(padViTFFNTo64
-                                   ? SmallVector<int64_t>({64, 64, 64})
-                                   : SmallVector<int64_t>({16, 16, 16}));
+    options.setPadToMultipleOf(
+        isLargeBF16VocabularyMatmul
+            ? SmallVector<int64_t>({128, 128, 128})
+        : padViTFFNTo64
+            ? SmallVector<int64_t>({64, 64, 64})
+            : SmallVector<int64_t>({16, 16, 16}));
     // Return the unpadded result via extract_slice; don't materialize a copy back
     // into the (differently-shaped) original destination.
     options.setCopyBackOp(linalg::LinalgPaddingOptions::CopyBackOp::None);
@@ -434,6 +557,9 @@ struct PadMatmulToCoopPattern : OpInterfaceRewritePattern<linalg::LinalgOp> {
     rewriter.replaceOp(op, replacements);
     return success();
   }
+
+private:
+  bool largeVocabularyOnly;
 };
 
 // Pad attention batch-matmuls (QK^T, AV; rank-4 loops: batch,M,N,K) to mult-16
@@ -492,6 +618,26 @@ public:
   using Base::Base;
   void runOnOperation() override {
     MLIRContext *ctx = &getContext();
+    RewritePatternSet transposePatterns(ctx);
+    transposePatterns.add<FoldTransposeIntoMatmulLhsPattern,
+                          FoldTransposeIntoMatmulRhsPattern>(ctx);
+    if (failed(applyPatternsGreedily(getOperation(),
+                                     std::move(transposePatterns)))) {
+      return signalPassFailure();
+    }
+    // Pad only explicit large-vocabulary BF16 projections before accumulator
+    // promotion. This keeps the padded F32 accumulator internal to a BF16
+    // result and avoids a full-vocabulary F32 materialization. Applying this
+    // ordering to every matmul corrupts ViT backward gradients, so all ordinary
+    // contractions remain in the long-standing joint greedy rewrite below.
+    if (!getenv("IREE_METAL_COOP_NO_PAD")) {
+      RewritePatternSet vocabularyPaddingPatterns(ctx);
+      vocabularyPaddingPatterns.add<PadMatmulToCoopPattern>(ctx, true);
+      if (failed(applyPatternsGreedily(
+              getOperation(), std::move(vocabularyPaddingPatterns)))) {
+        return signalPassFailure();
+      }
+    }
     RewritePatternSet patterns(ctx);
     patterns.add<RaiseAccumulatorPattern>(ctx);
     // IREE_METAL_COOP_PAD (default ON): pad non-mult-16 matmuls to mult-16 so

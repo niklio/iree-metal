@@ -107,8 +107,10 @@ static LogicalResult setAppleMatmulConfig(linalg::LinalgOp op,
   // eligible, while ViT's padded M=4672 keeps the lower-power default schedule.
   if (!getenv("IREE_METAL_COOP_NO_APPLE_TUNE")) {
     auto outTy = dyn_cast<ShapedType>(op.getDpsInitOperand(0)->get().getType());
-    bool ok = outTy && outTy.getRank() == 2 && outTy.getDimSize(0) >= 2048 &&
-              outTy.getDimSize(1) >= 512 && outTy.getDimSize(0) % 128 == 0 &&
+    bool ok = outTy && outTy.getRank() == 2 &&
+              outTy.getDimSize(0) >= 2048 &&
+              outTy.getDimSize(1) >= 512 &&
+              outTy.getDimSize(0) % 128 == 0 &&
               outTy.getDimSize(1) % 128 == 0;
     if (ok) {
       for (OpOperand *in : op.getDpsInputOperands()) {
@@ -130,17 +132,111 @@ static LogicalResult setAppleMatmulConfig(linalg::LinalgOp op,
     if (ok) {
       sgD = 8;
       mntD = 4;
-      pdD = 1;
+      // The aligned 8-subgroup schedule does not benefit from software
+      // pipelining on Apple M4. Balanced 16-step model controls measured PD=0
+      // 0.5-1.2% faster across GPT-2, BERT, and DistilBERT, while also reducing
+      // sustained power. KT=4 still bounds the staged A/B tiles below 32 KiB.
+      pdD = 0;
+      ktD = 4;
+
+      // Tied-vocabulary contractions need orientation-specific schedules. A
+      // vocabulary-sized output (forward and dW) benefits from the reuse of
+      // MNT=4/KT=4, while dX only carries vocabulary on an input and is faster
+      // at MNT=2/KT=2. This holds for both the 50,304-wide GPT and 32,000-wide
+      // GQA shapes; applying one schedule to all three leaves 4-15 ms per
+      // training phase on the table.
+      bool outputHasVocabularyDimension = llvm::any_of(
+          outTy.getShape(), [](int64_t d) { return d >= 32000; });
+      bool hasVocabularyDimension = outputHasVocabularyDimension;
+      for (OpOperand *in : op.getDpsInputOperands()) {
+        auto type = cast<ShapedType>(in->get().getType());
+        hasVocabularyDimension |= llvm::any_of(
+            type.getShape(), [](int64_t d) { return d >= 32000; });
+      }
+      if (hasVocabularyDimension) {
+        mntD = outputHasVocabularyDimension ? 4 : 2;
+        ktD = outputHasVocabularyDimension ? 4 : 2;
+      }
+    }
+
+    // Text-model rank-2 contractions also contain useful shapes that are only
+    // 64-aligned or whose flattened token extent is below 2048. Leaving those
+    // on the four-subgroup fallback costs 0.5-1.4% end-to-end across the eight
+    // decoder and encoder HF10 models. Apply the same sustained-load schedule
+    // when every matrix dimension is 64-aligned, but preserve the separately
+    // tuned vocabulary orientations and the padded odd-token vision shapes.
+    // The latter are especially important: forcing ViT's padded M=4672 family
+    // to eight subgroups crosses the Apple M4 power limit and regresses badly.
+    bool isAlignedTextRank2 = outTy && outTy.getRank() == 2;
+    bool hasTextScaleDimension = false;
+    auto inspectAlignedTextType = [&](ShapedType type) {
+      if (!type || type.getRank() != 2) {
+        isAlignedTextRank2 = false;
+        return;
+      }
+      for (int64_t d : type.getShape()) {
+        if (d <= 0 || d % 64 != 0 || d >= 32000 || d == 4672) {
+          isAlignedTextRank2 = false;
+          return;
+        }
+        hasTextScaleDimension |= d >= 768;
+      }
+    };
+    inspectAlignedTextType(outTy);
+    for (OpOperand *in : op.getDpsInputOperands()) {
+      inspectAlignedTextType(dyn_cast<ShapedType>(in->get().getType()));
+    }
+    if (isAlignedTextRank2 && hasTextScaleDimension) {
+      sgD = 8;
+      mntD = 4;
+      pdD = 0;
+      ktD = 4;
+    }
+
+    // Text attention batch matmuls use 64-aligned matrix dimensions (typically
+    // sequence 128 and head width 64). The same 8-subgroup schedule improves
+    // their sustained end-to-end latency, but must not be applied to odd-token
+    // vision attention (ViT 577 and DeiT 197), where the larger workgroup
+    // crosses the Apple M4 power limit. Ignore batch dimensions and require the
+    // trailing matrix dimensions of every operand to be 64-aligned.
+    bool isAlignedTextBatchMatmul = outTy && outTy.getRank() > 2;
+    auto inspectTextBatchType = [&](ShapedType type) {
+      if (!type || type.getRank() <= 2) {
+        isAlignedTextBatchMatmul = false;
+        return;
+      }
+      ArrayRef<int64_t> shape = type.getShape();
+      for (int64_t d : shape) {
+        if (d == 197 || d == 577) {
+          isAlignedTextBatchMatmul = false;
+          return;
+        }
+      }
+      for (int64_t d : shape.take_back(2)) {
+        if (d < 64 || d % 64 != 0) {
+          isAlignedTextBatchMatmul = false;
+          return;
+        }
+      }
+    };
+    inspectTextBatchType(outTy);
+    for (OpOperand *in : op.getDpsInputOperands()) {
+      inspectTextBatchType(dyn_cast<ShapedType>(in->get().getType()));
+    }
+    if (isAlignedTextBatchMatmul) {
+      sgD = 8;
+      mntD = 4;
+      pdD = 0;
       ktD = 4;
     }
 
     // Narrow 384-wide rank-2 contractions benefit from smaller per-subgroup MN
     // tiles even when the surrounding large-shape tune is active. This covers
     // forward, projection, and weight-gradient forms without changing batched
-    // attention. Balanced and reversed 16-step controls measured MNT=1 about
-    // 1.0% faster than MNT=2 and about 2.4% faster end-to-end than MNT=4; the
-    // resulting configuration change is limited to 13 rank-2 dispatches in the
-    // representative training graph.
+    // attention. Balanced and reversed 16-step controls measured the
+    // lower-power SG=4/MNT=1/PD=0/KT=2 schedule about 1.5% faster end-to-end
+    // than the previous SG=8/MNT=1/PD=1/KT=4 schedule. The resulting change is
+    // limited to 13 rank-2 dispatches in the representative training graph.
     bool isNarrow384Matmul = outTy && outTy.getRank() == 2;
     bool has384Dimension = false;
     int64_t largestDimension = 0;
@@ -163,7 +259,10 @@ static LogicalResult setAppleMatmulConfig(linalg::LinalgOp op,
       inspectNarrow384Type(dyn_cast<ShapedType>(in->get().getType()));
     }
     if (isNarrow384Matmul && has384Dimension && largestDimension >= 1536) {
+      sgD = 4;
       mntD = 1;
+      pdD = 0;
+      ktD = 2;
     }
   }
   if (succeeded(setCooperativeMatrixConfig(target, op,

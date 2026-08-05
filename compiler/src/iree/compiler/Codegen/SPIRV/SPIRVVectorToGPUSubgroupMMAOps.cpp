@@ -81,21 +81,26 @@ struct SPIRVVectorToGPUSubgroupMMAPass final
       (void)applyPatternsGreedily(funcOp, std::move(cleanup));
     }
 
-    // iree-metal: if the conversion produced NO subgroup mma ops (some matmul shapes,
-    // esp. transposed backward forms, don't vectorize to coop), DON'T hard-fail —
-    // the leftover unrolled vector.contract ops lower to scalar SPIR-V downstream
-    // (addSPIRVVectorLoweringPasses). This makes the coop pipeline degrade
-    // GRACEFULLY to scalar for unsupported shapes instead of killing the whole
-    // compile — critical for training (backward matmuls) to compile at all.
-    WalkResult result = funcOp.walk([](Operation *op) {
+    // iree-metal: a function can contain both successfully converted subgroup
+    // MMA operations and a contraction that cannot use the intrinsic (notably
+    // the small-batch full-vocabulary value-and-grad composition). Test the two
+    // conditions independently: strict mode still requires at least one MMA,
+    // while every contraction left behind must be scalarized. Keying fallback
+    // on "no MMA anywhere" leaves illegal vector<16x16>/vector<16> accumulators
+    // in a mixed function.
+    WalkResult mmaResult = funcOp.walk([](Operation *op) {
       return isa<gpu::SubgroupMmaComputeOp>(op) ? WalkResult::interrupt()
                                                 : WalkResult::advance();
     });
-    if (!result.wasInterrupted()) {
-      if (getenv("IREE_METAL_COOP_STRICT_MMA")) {
-        funcOp->emitError("no GPU subgroup mma compute ops generated");
-        return signalPassFailure();
-      }
+    if (!mmaResult.wasInterrupted() && getenv("IREE_METAL_COOP_STRICT_MMA")) {
+      funcOp->emitError("no GPU subgroup mma compute ops generated");
+      return signalPassFailure();
+    }
+    WalkResult contractionResult = funcOp.walk([](Operation *op) {
+      return isa<vector::ContractionOp>(op) ? WalkResult::interrupt()
+                                           : WalkResult::advance();
+    });
+    if (contractionResult.wasInterrupted()) {
       // Fallback: the contract didn't convert to coop mma. It's still unrolled to
       // the coop-native size (e.g. vector<16xf32>) which scalar SPIR-V can't
       // legalize. Fully unroll leftover vector.contract ops to 1x1x1 so they

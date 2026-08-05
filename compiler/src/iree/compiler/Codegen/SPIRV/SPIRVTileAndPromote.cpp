@@ -366,6 +366,13 @@ LogicalResult SPIRVTileAndPromotePass::doPromoteCMatrix(
       continue; // Don't care
     }
     if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
+      // Bufferization may express a constant accumulator initialization as a
+      // zero-input linalg.generic instead of linalg.fill. It is still only a
+      // fill and must not be counted as a third matmul/epilogue operation.
+      if (linalgOp.getNumDpsInputs() == 0 &&
+          linalgOp.getNumReductionLoops() == 0) {
+        continue;
+      }
       // iree-metal: skip the f32->bf16 input-trunc PROLOGUE producers from the IREE_METAL_COOP_BF16CAST
       // downcast (elementwise, single input, f32->bf16). On memref semantics they feed the matmul via
       // memory (not SSA), so identify them by signature. They fuse into the matmul tiles; doPromoteCMatrix

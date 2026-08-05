@@ -29,22 +29,22 @@
 // RUN:   --implicit-check-not=iree_codegen.apple_scatter_window_workgroups
 
 func.func @nonunique_scatter(
-    %updates: tensor<8x512x768xbf16>,
+    %updates: tensor<8x512x768xf32>,
     %indices: tensor<8x512xi32>,
-    %init: tensor<50257x768xbf16>) -> tensor<50257x768xbf16> {
+    %init: tensor<50257x768xf32>) -> tensor<50257x768xf32> {
   %result = iree_linalg_ext.scatter dimension_map = [0]
       unique_indices(false)
       ins(%updates, %indices :
-          tensor<8x512x768xbf16>, tensor<8x512xi32>)
-      outs(%init : tensor<50257x768xbf16>) {
-    ^bb0(%update: bf16, %current: bf16):
-      %sum = arith.addf %current, %update : bf16
-      iree_linalg_ext.yield %sum : bf16
-  } -> tensor<50257x768xbf16>
-  return %result : tensor<50257x768xbf16>
+          tensor<8x512x768xf32>, tensor<8x512xi32>)
+      outs(%init : tensor<50257x768xf32>) {
+    ^bb0(%update: f32, %current: f32):
+      %sum = arith.addf %current, %update : f32
+      iree_linalg_ext.yield %sum : f32
+  } -> tensor<50257x768xf32>
+  return %result : tensor<50257x768xf32>
 }
 
-// ON-DAG: #[[CONFIG:.+]] = #iree_codegen.lowering_config<tile_sizes = {{\[}}[0, 0, 32], [0, 0, 1]{{\]}}>
+// ON-DAG: #[[CONFIG:.+]] = #iree_codegen.lowering_config<tile_sizes = {{\[}}[0, 0, 1], [0, 0, 1]{{\]}}>
 // ON-DAG: #[[TRANSLATION:.+]] = #iree_codegen.translation_info<pipeline = SPIRVBaseDistribute workgroup_size = [32, 1, 1]>
 // ON-LABEL: func.func @nonunique_scatter(
 // ON-SAME:      translation_info = #[[TRANSLATION]]

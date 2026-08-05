@@ -42,6 +42,7 @@ env \
   -u IREE_METAL_APPLE_PHYSICAL_BACKWARD_COMPACT_SMEM \
   -u IREE_METAL_APPLE_PHYSICAL_FRAGMENTS \
   -u IREE_METAL_APPLE_PHYSICAL_SCORE_WG64 \
+  -u IREE_METAL_ATTN_PREFETCH_STAGES \
   -u IREE_METAL_CAUSAL_BWD_BOUNDS \
   -u IREE_METAL_CAUSAL_FWD_BOUNDS \
   -u IREE_METAL_CAUSAL_TRIANGULAR_GRID \
@@ -70,6 +71,7 @@ expected_gates = (
     "IREE_METAL_SCATTER_WINDOW_WORKGROUPS",
 )
 assert all(os.environ.get(name) == "1" for name in expected_gates), os.environ
+assert os.environ.get("IREE_METAL_ATTN_PREFETCH_STAGES") == "2", os.environ
 
 @jax.jit
 def loss(a, b):

@@ -1,6 +1,10 @@
-// RUN: iree-opt --pass-pipeline="builtin.module(util.func(iree-dispatch-creation-set-split-reduction-sizes))" --split-input-file %s | FileCheck %s
+// RUN: env -u IREE_METAL_SPLIT_RESOURCE_ONLY iree-opt --pass-pipeline="builtin.module(util.func(iree-dispatch-creation-set-split-reduction-sizes))" --split-input-file %s | FileCheck %s
+// RUN: env IREE_METAL_SPLIT_RESOURCE_ONLY=0 iree-opt --pass-pipeline="builtin.module(util.func(iree-dispatch-creation-set-split-reduction-sizes))" --split-input-file %s | FileCheck %s
+// RUN: env IREE_METAL_SPLIT_RESOURCE_ONLY=1 iree-opt --pass-pipeline="builtin.module(util.func(iree-dispatch-creation-set-split-reduction-sizes))" --split-input-file %s | FileCheck --check-prefix=RESOURCE %s
 
 // CHECK-LABEL: @basic
+// RESOURCE-LABEL: @basic
+// RESOURCE-NOT: iree_linalg_ext.split_reduction
 util.func public @basic(%arg0: tensor<4096xf32>) -> tensor<1xf32> {
   // CHECK: iree_linalg_ext.split_reduction = [1024 : index]
   %1 = arith.constant dense<0.0> : tensor<1xf32>
@@ -18,9 +22,11 @@ util.func public @basic(%arg0: tensor<4096xf32>) -> tensor<1xf32> {
 // -----
 
 // CHECK-LABEL: @basic_multi_dim
+// RESOURCE-LABEL: @basic_multi_dim
 util.func public @basic_multi_dim(%arg0: tensor<4x512xf32>) -> tensor<f32> {
   // With multiple reduction dims, inner dims are tiled first.
   // CHECK: iree_linalg_ext.split_reduction = [2 : index, 512 : index]
+  // RESOURCE: iree_linalg_ext.split_reduction = [2 : index, 512 : index]
   %1 = arith.constant dense<0.0> : tensor<f32>
   %2 = linalg.generic {
       indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> ()>],
@@ -45,6 +51,63 @@ util.func public @basic_round_split_tile_size_up(%arg0: tensor<255x255xf32>) -> 
       indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> ()>],
       iterator_types = ["reduction", "reduction"]
   } ins(%arg0 : tensor<255x255xf32>) outs(%1 : tensor<f32>) {
+  ^bb0(%in: f32, %out: f32):
+    %3 = arith.addf %in, %out : f32
+    linalg.yield %3 : f32
+  } -> tensor<f32>
+  util.return %2 : tensor<f32>
+}
+
+// -----
+
+// CHECK-LABEL: @large_prime_inner_dimension
+util.func public @large_prime_inner_dimension(%arg0: tensor<33x50021xf32>) -> tensor<f32> {
+  // Do not select the full 50,021-wide prime as one partial-reduction tile.
+  // Consume the small outer dimension and split across the prime dimension.
+  // CHECK: iree_linalg_ext.split_reduction = [33 : index, 1 : index]
+  %1 = arith.constant dense<0.0> : tensor<f32>
+  %2 = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> ()>],
+      iterator_types = ["reduction", "reduction"]
+  } ins(%arg0 : tensor<33x50021xf32>) outs(%1 : tensor<f32>) {
+  ^bb0(%in: f32, %out: f32):
+    %3 = arith.addf %in, %out : f32
+    linalg.yield %3 : f32
+  } -> tensor<f32>
+  util.return %2 : tensor<f32>
+}
+
+// -----
+
+// CHECK-LABEL: @large_prime_middle_dimension
+util.func public @large_prime_middle_dimension(%arg0: tensor<24x4099x64xf32>) -> tensor<f32> {
+  // Keep each partial tile bounded: 24*1*64 FP32 elements instead of
+  // 1*4099*64, which exceeds a 32 KiB Metal threadgroup-memory budget.
+  // CHECK: iree_linalg_ext.split_reduction = [1 : index, 1 : index, 64 : index]
+  %1 = arith.constant dense<0.0> : tensor<f32>
+  %2 = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d1, d2)>, affine_map<(d0, d1, d2) -> ()>],
+      iterator_types = ["reduction", "reduction", "reduction"]
+  } ins(%arg0 : tensor<24x4099x64xf32>) outs(%1 : tensor<f32>) {
+  ^bb0(%in: f32, %out: f32):
+    %3 = arith.addf %in, %out : f32
+    linalg.yield %3 : f32
+  } -> tensor<f32>
+  util.return %2 : tensor<f32>
+}
+
+// -----
+
+// CHECK-LABEL: @small_prime_dimension
+util.func public @small_prime_dimension(%arg0: tensor<257xf32>) -> tensor<f32> {
+  // Small complete reductions should not create partial reductions merely
+  // because the extent is prime.
+  // CHECK: iree_linalg_ext.split_reduction = [257 : index]
+  %1 = arith.constant dense<0.0> : tensor<f32>
+  %2 = linalg.generic {
+      indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> ()>],
+      iterator_types = ["reduction"]
+  } ins(%arg0 : tensor<257xf32>) outs(%1 : tensor<f32>) {
   ^bb0(%in: f32, %out: f32):
     %3 = arith.addf %in, %out : f32
     linalg.yield %3 : f32

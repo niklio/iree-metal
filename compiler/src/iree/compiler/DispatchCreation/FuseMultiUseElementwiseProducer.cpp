@@ -19,16 +19,21 @@
 #include "iree/compiler/DispatchCreation/Passes.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
 #include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/Transforms/Transforms.h"
 #include "mlir/Dialect/Tensor/Transforms/Transforms.h"
 #include "mlir/IR/Dominance.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Iterators.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+
+#include <limits>
 
 #define DEBUG_TYPE "iree-dispatch-creation-fusion-of-tensor-ops"
 
@@ -256,6 +261,198 @@ static FailureOr<unsigned> fuseMultiUseProducers(
   return fusedOps.size();
 }
 
+// Fuses the two-result Adam moment update produced by the ordinary multi-use
+// pass into its single-result parameter update. The generic elementwise fusion
+// utility stops at a multi-result producer, leaving the largest parameters to
+// make two complete memory passes. Keep this deliberately narrow: FP32,
+// identity-mapped, all-parallel moment/parameter updates with rsqrt in the
+// consumer body.
+struct FuseAdamMomentAndParameterUpdate final
+    : OpRewritePattern<linalg::GenericOp> {
+  using Base::Base;
+
+  LogicalResult matchAndRewrite(linalg::GenericOp consumer,
+                                PatternRewriter &rewriter) const override {
+    std::string location;
+    llvm::raw_string_ostream locationStream(location);
+    consumer.getLoc().print(locationStream);
+    if (!StringRef(location).contains_insensitive("adamw")) {
+      return failure();
+    }
+    if (consumer.getNumDpsInputs() != 3 || consumer.getNumDpsInits() != 1 ||
+        consumer.getNumResults() != 1 ||
+        consumer.getNumLoops() != consumer.getNumParallelLoops() ||
+        !consumer.getMatchingIndexingMap(consumer.getDpsInitOperand(0))
+             .isIdentity() ||
+        !llvm::hasSingleElement(consumer.getBody()->getOps<math::RsqrtOp>()) ||
+        llvm::range_size(consumer.getBody()->getOps<arith::MulFOp>()) != 3 ||
+        llvm::range_size(consumer.getBody()->getOps<arith::AddFOp>()) != 2 ||
+        !llvm::hasSingleElement(consumer.getBody()->getOps<arith::SubFOp>())) {
+      return failure();
+    }
+
+    linalg::GenericOp producer;
+    SmallVector<unsigned> producerInputNumbers;
+    for (auto [inputNumber, operand] :
+         llvm::enumerate(consumer.getDpsInputOperands())) {
+      auto candidate =
+          operand->get().getDefiningOp<linalg::GenericOp>();
+      if (!candidate || candidate.getNumResults() != 2) {
+        continue;
+      }
+      if (producer && producer != candidate) {
+        return failure();
+      }
+      producer = candidate;
+      producerInputNumbers.push_back(inputNumber);
+    }
+    if (!producer || producerInputNumbers.size() != 2 ||
+        producer->getBlock() != consumer->getBlock() ||
+        producer.getNumDpsInputs() != 4 || producer.getNumDpsInits() != 2 ||
+        producer.getNumLoops() != producer.getNumParallelLoops() ||
+        producer.getNumLoops() != consumer.getNumLoops() ||
+        producer.getIteratorTypesArray() !=
+            consumer.getIteratorTypesArray()) {
+      return failure();
+    }
+    unsigned identityProducerInputs = 0;
+    unsigned scalarProducerInputs = 0;
+    for (OpOperand *operand : producer.getDpsInputOperands()) {
+      AffineMap map = producer.getMatchingIndexingMap(operand);
+      identityProducerInputs += map.isIdentity();
+      scalarProducerInputs += map.getNumResults() == 0;
+    }
+    if (identityProducerInputs != 3 || scalarProducerInputs != 1 ||
+        llvm::range_size(producer.getBody()->getOps<arith::MulFOp>()) != 6 ||
+        llvm::range_size(producer.getBody()->getOps<arith::AddFOp>()) != 2) {
+      return failure();
+    }
+
+    SmallVector<bool> consumedResults(2, false);
+    for (unsigned inputNumber : producerInputNumbers) {
+      auto result = dyn_cast<OpResult>(
+          consumer.getDpsInputOperand(inputNumber)->get());
+      if (!result || result.getOwner() != producer ||
+          result.getResultNumber() >= consumedResults.size() ||
+          consumedResults[result.getResultNumber()]) {
+        return failure();
+      }
+      consumedResults[result.getResultNumber()] = true;
+      if (!consumer.getMatchingIndexingMap(
+                       consumer.getDpsInputOperand(inputNumber))
+               .isIdentity()) {
+        return failure();
+      }
+    }
+    if (!llvm::all_of(consumedResults, [](bool value) { return value; })) {
+      return failure();
+    }
+
+    auto isIdentityF32Init = [](linalg::GenericOp op, OpOperand *operand) {
+      auto type = dyn_cast<ShapedType>(operand->get().getType());
+      return type && type.getElementType().isF32() &&
+             op.getMatchingIndexingMap(operand).isIdentity();
+    };
+    if (!isIdentityF32Init(producer, producer.getDpsInitOperand(0)) ||
+        !isIdentityF32Init(producer, producer.getDpsInitOperand(1)) ||
+        !isIdentityF32Init(consumer, consumer.getDpsInitOperand(0))) {
+      return failure();
+    }
+
+    SmallVector<Value> inputs(producer.getDpsInputs());
+    SmallVector<AffineMap> maps;
+    for (OpOperand *operand : producer.getDpsInputOperands()) {
+      maps.push_back(producer.getMatchingIndexingMap(operand));
+    }
+    SmallVector<unsigned> consumerArgumentToNewInput(
+        consumer.getNumDpsInputs(), std::numeric_limits<unsigned>::max());
+    for (auto [inputNumber, operand] :
+         llvm::enumerate(consumer.getDpsInputOperands())) {
+      if (operand->get().getDefiningOp() == producer) {
+        continue;
+      }
+      consumerArgumentToNewInput[inputNumber] = inputs.size();
+      inputs.push_back(operand->get());
+      maps.push_back(consumer.getMatchingIndexingMap(operand));
+    }
+
+    SmallVector<Value> inits(producer.getDpsInits());
+    llvm::append_range(inits, consumer.getDpsInits());
+    for (unsigned index = 0; index < producer.getNumDpsInits(); ++index) {
+      maps.push_back(producer.getMatchingIndexingMap(
+          producer.getDpsInitOperand(index)));
+    }
+    maps.push_back(
+        consumer.getMatchingIndexingMap(consumer.getDpsInitOperand(0)));
+
+    SmallVector<Type> resultTypes(producer->getResultTypes());
+    llvm::append_range(resultTypes, consumer->getResultTypes());
+    Block *producerBody = producer.getBlock();
+    Block *consumerBody = consumer.getBlock();
+    auto replacement = linalg::GenericOp::create(
+        rewriter, consumer.getLoc(), resultTypes, inputs, inits, maps,
+        consumer.getIteratorTypesArray(),
+        [&](OpBuilder &builder, Location loc, ValueRange arguments) {
+          IRMapping producerMapping;
+          for (auto [index, argument] :
+               llvm::enumerate(producerBody->getArguments())) {
+            unsigned newIndex = index < producer.getNumDpsInputs()
+                                    ? index
+                                    : inputs.size() +
+                                          index - producer.getNumDpsInputs();
+            producerMapping.map(argument, arguments[newIndex]);
+          }
+          for (Operation &operation : producerBody->without_terminator()) {
+            builder.clone(operation, producerMapping);
+          }
+          auto producerYield =
+              cast<linalg::YieldOp>(producerBody->getTerminator());
+          SmallVector<Value> producerValues;
+          for (Value value : producerYield.getValues()) {
+            producerValues.push_back(producerMapping.lookup(value));
+          }
+
+          IRMapping consumerMapping;
+          for (unsigned inputNumber = 0;
+               inputNumber < consumer.getNumDpsInputs(); ++inputNumber) {
+            Value value = consumer.getDpsInputOperand(inputNumber)->get();
+            if (auto result = dyn_cast<OpResult>(value);
+                result && result.getOwner() == producer) {
+              consumerMapping.map(consumerBody->getArgument(inputNumber),
+                                  producerValues[result.getResultNumber()]);
+            } else {
+              consumerMapping.map(
+                  consumerBody->getArgument(inputNumber),
+                  arguments[consumerArgumentToNewInput[inputNumber]]);
+            }
+          }
+          consumerMapping.map(
+              consumerBody->getArgument(consumer.getNumDpsInputs()),
+              arguments[inputs.size() + producer.getNumDpsInits()]);
+          for (Operation &operation : consumerBody->without_terminator()) {
+            builder.clone(operation, consumerMapping);
+          }
+          auto consumerYield =
+              cast<linalg::YieldOp>(consumerBody->getTerminator());
+          SmallVector<Value> yieldedValues(producerValues);
+          for (Value value : consumerYield.getValues()) {
+            yieldedValues.push_back(consumerMapping.lookup(value));
+          }
+          linalg::YieldOp::create(builder, loc, yieldedValues);
+        });
+
+    for (auto [index, result] : llvm::enumerate(producer->getResults())) {
+      rewriter.replaceUsesWithIf(result, replacement.getResult(index),
+                                 [&](OpOperand &use) {
+                                   return use.getOwner() != consumer;
+                                 });
+    }
+    rewriter.replaceOp(consumer, replacement.getResults().drop_front(2));
+    rewriter.eraseOp(producer);
+    return success();
+  }
+};
+
 namespace {
 
 /// Pass to fuse linalg on tensor operations as well as fusion of hal.interface*
@@ -289,6 +486,16 @@ void FuseMultiUseElementwiseProducerPass::runOnOperation() {
     }
     if (numOfFusableCandidates.value() == 0) {
       break;
+    }
+  }
+
+  const char *fuseAdamUpdate = getenv("IREE_METAL_FUSE_ADAM_UPDATE");
+  if (fuseAdamUpdate && StringRef(fuseAdamUpdate) != "0") {
+    RewritePatternSet patterns(context);
+    patterns.add<FuseAdamMomentAndParameterUpdate>(context);
+    if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
+      funcOp->emitError("failed to fuse Adam moment and parameter updates");
+      return signalPassFailure();
     }
   }
 }

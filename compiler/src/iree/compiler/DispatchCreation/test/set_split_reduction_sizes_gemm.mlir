@@ -18,6 +18,31 @@ util.func public @split_matmul(%arg0: tensor<32x40960xf32>, %arg1: tensor<40960x
 
 // -----
 
+// A vocabulary-gradient matmul already has enough output parallelism and must
+// remain unsplit so its cooperative matrix loop is not wrapped in a partial
+// reduction.
+util.func public @split_vocab_gradient(%arg0: tensor<4096x50272xbf16>, %arg1: tensor<50272x768xbf16>, %arg2: tensor<4096x768xf32>) -> tensor<4096x768xf32> {
+  %0 = linalg.matmul ins(%arg0, %arg1 : tensor<4096x50272xbf16>, tensor<50272x768xbf16>) outs(%arg2 : tensor<4096x768xf32>) -> tensor<4096x768xf32>
+  util.return %0 : tensor<4096x768xf32>
+}
+
+// CHECK-LABEL: @split_vocab_gradient
+//   CHECK-NOT: iree_linalg_ext.split_reduction
+
+// -----
+
+// Smaller-output contractions still benefit from partials. Preserve an
+// intrinsic-compatible K divisor when the default split is not 16-aligned.
+util.func public @split_aligned_small_output(%arg0: tensor<512x50272xbf16>, %arg1: tensor<50272x512xbf16>, %arg2: tensor<512x512xf32>) -> tensor<512x512xf32> {
+  %0 = linalg.matmul ins(%arg0, %arg1 : tensor<512x50272xbf16>, tensor<50272x512xbf16>) outs(%arg2 : tensor<512x512xf32>) -> tensor<512x512xf32>
+  util.return %0 : tensor<512x512xf32>
+}
+
+// CHECK-LABEL: @split_aligned_small_output
+//       CHECK: iree_linalg_ext.split_reduction = [25136 : index]
+
+// -----
+
 util.func public @split_very_large_k(%arg0: tensor<128x16800000xbf16>, %arg1: tensor<16800000x134xbf16>, %arg2: tensor<128x134xf32>) -> tensor<128x134xf32> {
   %0 = linalg.matmul ins(%arg0, %arg1 : tensor<128x16800000xbf16>, tensor<16800000x134xbf16>) outs(%arg2 : tensor<128x134xf32>) -> tensor<128x134xf32>
   util.return %0 : tensor<128x134xf32>

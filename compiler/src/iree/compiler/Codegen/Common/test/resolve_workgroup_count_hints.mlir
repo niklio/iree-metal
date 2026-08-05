@@ -34,6 +34,38 @@ hal.executable private @resolve_multiple_calls {
 
 // -----
 
+#pipeline_layout = #hal.pipeline.layout<bindings = [
+  #hal.pipeline.binding<storage_buffer>
+]>
+hal.executable private @ignore_processor_id_condition {
+  hal.executable.variant public @variant target(#hal.executable.target<"", "", {}>) {
+    hal.executable.export public @entry_point layout(#pipeline_layout) count(%device: !hal.device) -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
+      hal.return %x, %y, %z : index, index, index
+    }
+    builtin.module {
+      func.func @entry_point() {
+        %thread_id_x = gpu.thread_id x
+        %c0 = arith.constant 0 : index
+        %is_leader = arith.cmpi eq, %thread_id_x, %c0 : index
+        // A processor-dependent condition cannot be cloned into the host-side
+        // workgroup-count region. Fall back to the unconditional maximum.
+        scf.if %is_leader {
+          iree_codegen.workgroup_count_hint(7, 8, 9)
+        }
+        return
+      }
+    }
+  }
+}
+// CHECK-LABEL: hal.executable private @ignore_processor_id_condition
+//       CHECK:   hal.executable.export public @entry_point
+//  CHECK-SAME:     layout({{.+}}) count(%{{.+}}: !hal.device) -> (index, index, index)
+//   CHECK-NOT:     gpu.thread_id
+//       CHECK:     hal.return %c7, %c8, %c9 : index, index, index
+
+// -----
+
 #pipeline_layout = #hal.pipeline.layout<constants = 2, bindings = [
   #hal.pipeline.binding<storage_buffer>
 ]>

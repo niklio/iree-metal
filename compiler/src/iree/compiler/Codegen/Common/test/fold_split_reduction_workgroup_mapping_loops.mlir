@@ -1,5 +1,19 @@
 // RUN: iree-opt --iree-codegen-fold-split-reduction-and-workgroup-mapping-loops --split-input-file --mlir-print-local-scope --allow-unregistered-dialect %s | FileCheck %s
 
+// A scalar-output split reduction has no nested workgroup forall. Its split
+// mapping is itself the complete workgroup mapping.
+func.func @standalone_split_mapping(%0 : index, %1 : index) {
+  scf.forall (%arg0, %arg1) in (%0, %1) {
+    "use"(%arg0, %arg1) : (index, index) -> ()
+  } {mapping = [#iree_linalg_ext.split_reduction_mapping<1>, #iree_linalg_ext.split_reduction_mapping<0>]}
+  return
+}
+// CHECK-LABEL: func @standalone_split_mapping
+//       CHECK:   scf.forall
+//       CHECK:       mapping = [#iree_codegen.workgroup_mapping<y>, #iree_codegen.workgroup_mapping<x>]
+
+// -----
+
 func.func @simple_example_1dmapping(%0 : index, %1 : index, %2 : index, %3 : index,
     %4 : index, %5 : index) {
   scf.forall (%arg0) = (%0) to (%1) step (%2) {
