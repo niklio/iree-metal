@@ -79,14 +79,3 @@ small, sanitized reproducer.
 
 iree-metal retains IREE's Apache License 2.0 with LLVM Exceptions and all
 upstream notices. See [LICENSE](LICENSE).
-
-<details>
-<summary>About upstream IREE</summary>
-
-IREE (**I**ntermediate **R**epresentation **E**xecution **E**nvironment,
-pronounced "eerie") is an MLIR-based compiler and runtime. Visit
-[iree.dev](https://iree.dev/) and the
-[upstream repository](https://github.com/iree-org/iree) for the official
-project.
-
-</details>
