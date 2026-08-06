@@ -22,6 +22,21 @@ Each release manifest is authoritative for source and submodule revisions,
 build host, deployment target, Python, toolchain, JAX, and the active compiler
 profile.
 
+## Install from PyPI
+
+Use a clean CPython 3.12 environment and explicitly allow the developer
+prerelease:
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --pre iree-metal
+```
+
+`iree-metal` is a platform-specific metapackage that pins the matching forked
+compiler and PJRT plugin. It is independently maintained and is not an official
+iree-org, IREE project, or Linux Foundation distribution.
+
 ## Install the offline bundle
 
 Download `iree-metal-preview-3.11.0.dev2026080401-macos-arm64.tar.gz` from the

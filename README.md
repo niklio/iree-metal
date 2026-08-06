@@ -19,13 +19,12 @@ Use a fresh Python 3.12 virtual environment. Do not install the stock
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
-python -m pip install \
-  https://github.com/niklio/iree-metal/releases/download/iree-metal-v3.11.0.dev2026080401/iree_base_compiler_iree_metal-3.11.0.dev2026080401-cp312-abi3-macosx_13_0_arm64.whl \
-  https://github.com/niklio/iree-metal/releases/download/iree-metal-v3.11.0.dev2026080401/iree_pjrt_plugin_metal_iree_metal-3.11.0.dev2026080401-py3-none-macosx_13_0_arm64.whl
+python -m pip install --pre iree-metal
 ```
 
-The wheels install their dependencies, including the required JAX and JAXLIB
-0.6.1 versions.
+The `iree-metal` metapackage installs the matching compiler and PJRT plugin
+wheels plus their dependencies, including the required JAX and JAXLIB 0.6.1
+versions.
 
 Then select the backend when running your program:
 
