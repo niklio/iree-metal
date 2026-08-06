@@ -1,68 +1,68 @@
 # iree-metal
 
-iree-metal is an experimental, open-source JAX backend for Apple GPUs. It is
-an independently maintained fork of [IREE](https://github.com/iree-org/iree),
-focused on BF16 transformer and vision-model workloads through IREE's Metal
-runtime and Apple `simdgroup_matrix` instructions.
+iree-metal is an experimental JAX backend for Apple GPUs, built on an
+independently maintained fork of [IREE](https://github.com/iree-org/iree).
 
-This project is not an Apple product and is not an official IREE distribution.
-The developer preview is intentionally narrow: Apple M4, CPython 3.12,
-and JAX/JAXLIB 0.6.1. Its wheel tag has a macOS 13 deployment target, but the
-release manifest names the newer macOS version actually validated.
+> **Developer preview:** This project is not an Apple product or an official
+> IREE distribution. Compatibility is intentionally limited while the backend
+> is under active development.
 
-## Install the developer preview
+## System requirements
 
-Use a fresh Python 3.12 virtual environment. Do not install the stock
-`iree-base-compiler` package in the same environment because it shares the
-`iree.compiler` import namespace with this preview.
+- An Apple Silicon Mac (`arm64`)
+- macOS 13 or newer
+- Python 3.12
+
+The current release is tested on Apple M4. Other Apple Silicon Macs meet the
+wheel's installation requirements but are not yet part of the performance
+claim.
+
+## Install
+
+Start with a fresh virtual environment:
 
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
-python -m pip install --pre iree-metal
+python -m pip install iree-metal
 ```
 
-The `iree-metal` metapackage installs the matching compiler and PJRT plugin
-wheels plus their dependencies, including the required JAX and JAXLIB 0.6.1
-versions.
+The [`iree-metal`](https://pypi.org/project/iree-metal/) package installs the
+matching compiler, Metal PJRT plugin, and tested JAX dependencies. Do not add
+the stock `iree-base-compiler` package to the same environment because both
+packages provide the `iree.compiler` namespace.
 
-Then select the backend when running your program:
+## Verify the installation
 
 ```bash
 JAX_PLATFORMS=iree_metal python -c \
   'import jax; print(jax.devices())'
 ```
 
-That is the only required runtime setting. The wheels select the tested
-`preview-20260804` profile automatically; no tuning flags are needed. For
-diagnosis, the one supported rollback is `IREE_METAL_PROFILE=baseline`.
+You should see one Apple GPU device. Run an existing JAX program with the same
+environment variable:
 
-Advanced users who need an offline installation, exact dependency locking,
-checksums, or GitHub provenance verification can download the self-contained
-bundle from the
-[Developer Preview 3 release](https://github.com/niklio/iree-metal/releases/tag/iree-metal-v3.11.0.dev2026080401)
-and follow the [developer preview guide](docs/metal/developer-preview.md). The
-guide also documents the numeric contract, support boundary, and known
-limitations.
+```bash
+JAX_PLATFORMS=iree_metal python your_program.py
+```
+
+No tuning flags are required. To diagnose a possible optimization issue, use
+the baseline profile:
+
+```bash
+IREE_METAL_PROFILE=baseline JAX_PLATFORMS=iree_metal python your_program.py
+```
 
 ## Project status
 
-The release verifier keeps four independent gates against the exact wheels:
-233 semantic operation/shape/dtype cases, nine decoder-training operator and
-resource cases, 10 deterministic BF16 forward-and-backward model workloads,
-and 12 paired decoder-training performance workloads. Correctness and resource
-checks must all pass. The model-board geometric mean must exceed 1.00x its live
-artifact-keyed `jax-metal` reference; decoder-training performance must meet
-the aggregate, per-phase, per-workload, and stability thresholds recorded in
-the release evidence on the disclosed Apple M4 system.
-This is a bounded release claim, not universal JAX compatibility. Exact results
-and machine-readable evidence are attached to each release.
+The preview is verified against a bounded correctness and BF16 model suite on
+Apple M4; it is not a claim of universal JAX compatibility. See the
+[developer preview guide](docs/metal/developer-preview.md) for supported
+workloads, known limitations, offline installation, checksums, and reproducible
+benchmark evidence.
 
-The fork carries independently reviewable changes in the compiler, runtime,
-PJRT plugin, LLVM/MLIR, SPIRV-Cross, and StableHLO. Third-party modifications
-live as checksummed source overlays in `submodule-patches/`; the release build
-verifies their exact resulting Git trees. A recursive clone of a release tag
-therefore contains every modification without auxiliary fork repositories.
+The exact wheels and release evidence are available from
+[Developer Preview 3](https://github.com/niklio/iree-metal/releases/tag/iree-metal-v3.11.0.dev2026080401).
 
 ## Contributing and support
 
@@ -72,15 +72,13 @@ therefore contains every modification without auxiliary fork repositories.
 - [Governance](GOVERNANCE.md)
 - [Code of conduct](CODE_OF_CONDUCT.md)
 
-Bug reports should use the iree-metal developer-preview issue template and
-include a sanitized minimal reproducer plus the attached release manifest.
+Bug reports should use the developer-preview issue template and include a
+small, sanitized reproducer.
 
 ## License and upstream relationship
 
 iree-metal retains IREE's Apache License 2.0 with LLVM Exceptions and all
-upstream notices. See [LICENSE](LICENSE). Changes that are generally useful and
-sufficiently isolated are intended to be proposed upstream; preview-specific
-packaging and experimental optimization profiles may remain fork-only.
+upstream notices. See [LICENSE](LICENSE).
 
 <details>
 <summary>About upstream IREE</summary>
