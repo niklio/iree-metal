@@ -8,6 +8,9 @@ on:
         required: true
         default: iree-metal-v3.11.0.dev2026080401
         type: string
+  release:
+    types:
+      - published
   push:
     branches:
       - release/pypi-bootstrap
@@ -25,6 +28,9 @@ jobs:
     timeout-minutes: 20
     outputs:
       version: ${{ steps.release.outputs.version }}
+      compiler_published: ${{ steps.pypi.outputs.compiler_published }}
+      metapackage_published: ${{ steps.pypi.outputs.metapackage_published }}
+      plugin_published: ${{ steps.pypi.outputs.plugin_published }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -38,7 +44,7 @@ jobs:
         id: release
         env:
           GH_TOKEN: ${{ github.token }}
-          REQUESTED_TAG: ${{ inputs.release_tag }}
+          REQUESTED_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
         run: |
           tag="${REQUESTED_TAG:-iree-metal-v3.11.0.dev2026080401}"
           version="${tag#iree-metal-v}"
@@ -48,6 +54,25 @@ jobs:
           test "${release_state}" = $'false\ttrue'
           echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Check for distributions already on PyPI
+        id: pypi
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          check_project() {
+            project="$1"
+            output="$2"
+            if curl --fail --silent --show-error \
+              "https://pypi.org/pypi/${project}/${VERSION}/json" >/dev/null; then
+              echo "${output}=true" >> "${GITHUB_OUTPUT}"
+            else
+              echo "${output}=false" >> "${GITHUB_OUTPUT}"
+            fi
+          }
+          check_project iree-base-compiler-iree-metal compiler_published
+          check_project iree-metal metapackage_published
+          check_project iree-pjrt-plugin-metal-iree-metal plugin_published
 
       - name: Download exact public release wheels
         env:
@@ -79,8 +104,9 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  publish:
+  publish_compiler:
     needs: prepare
+    if: needs.prepare.outputs.compiler_published != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: pypi
@@ -91,9 +117,74 @@ jobs:
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: iree-metal-pypi-${{ needs.prepare.outputs.version }}
-          path: dist
+          path: all-dist
 
-      - name: Publish with PyPI Trusted Publishing
+      - name: Select compiler distribution
+        run: |
+          mkdir dist
+          cp all-dist/iree_base_compiler_iree_metal-*.whl dist/
+
+      - name: Publish compiler with PyPI Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        with:
+          packages-dir: dist
+          verbose: true
+
+  publish_plugin:
+    needs: prepare
+    if: needs.prepare.outputs.plugin_published != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download validated distributions
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: iree-metal-pypi-${{ needs.prepare.outputs.version }}
+          path: all-dist
+
+      - name: Select plugin distribution
+        run: |
+          mkdir dist
+          cp all-dist/iree_pjrt_plugin_metal_iree_metal-*.whl dist/
+
+      - name: Publish plugin with PyPI Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        with:
+          packages-dir: dist
+          verbose: true
+
+  publish_metapackage:
+    needs:
+      - prepare
+      - publish_compiler
+      - publish_plugin
+    if: >-
+      always() &&
+      needs.prepare.result == 'success' &&
+      needs.prepare.outputs.metapackage_published != 'true' &&
+      (needs.publish_compiler.result == 'success' || needs.publish_compiler.result == 'skipped') &&
+      (needs.publish_plugin.result == 'success' || needs.publish_plugin.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download validated distributions
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: iree-metal-pypi-${{ needs.prepare.outputs.version }}
+          path: all-dist
+
+      - name: Select metapackage distribution
+        run: |
+          mkdir dist
+          cp all-dist/iree_metal-*.whl dist/
+
+      - name: Publish metapackage with PyPI Trusted Publishing
         uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
         with:
           packages-dir: dist
