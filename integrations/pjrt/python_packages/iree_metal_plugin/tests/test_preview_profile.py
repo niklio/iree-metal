@@ -92,6 +92,10 @@ class PreviewProfileTest(unittest.TestCase):
             ],
             "8",
         )
+        self.assertNotIn(
+            "IREE_METAL_SCATTER_WINDOW_TILE",
+            iree_metal._PREVIEW_PARAMETER_DEFAULTS,
+        )
 
     def test_preview_is_the_default(self):
         with mock.patch.dict(os.environ, {}, clear=True):

@@ -64,8 +64,9 @@ _PREVIEW_PARAMETER_DEFAULTS = {
     "IREE_METAL_ATTN_PV_MN_TILE_SEED": "4",
     "IREE_METAL_ATTN_PV_K_TILE_SEED": "1",
     "IREE_METAL_VIT_POSITIONAL_SCATTER_WIDTH": "8",
-    # Amortize the two remaining bandwidth- and scheduling-bound kernels.
-    "IREE_METAL_SCATTER_WINDOW_TILE": "32",
+    # Amortize the remaining ViT gradient-layout kernel. Scatter window tiling
+    # stays resource-derived: a global width override can exceed Metal's 32 KiB
+    # threadgroup-memory limit on full-vocabulary decoder training.
     "IREE_METAL_VIT_TRANSPOSE_HEAD_TILE": "2",
 }
 _PREVIEW_COMPILER_OPTIONS = (
