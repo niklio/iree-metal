@@ -54,6 +54,45 @@ class PreviewProfileTest(unittest.TestCase):
             "2",
         )
 
+    def test_preview_includes_validated_vit_gates(self):
+        self.assertTrue(
+            {
+                "IREE_METAL_MSL4_VIT_FFN_COMPACT_EPILOGUE",
+                "IREE_METAL_MSL4_VIT_FFN_DW",
+                "IREE_METAL_MSL4_VIT_FFN_REDUCTION",
+                "IREE_METAL_MSL4_VIT_FFN_RECONSTRUCT_EPILOGUE",
+                "IREE_METAL_MSL4_VIT_GELU_SAVED_COMPACT",
+                "IREE_METAL_MSL4_VIT_RAW_PAD_MATMUL",
+                "IREE_METAL_VIT_FFN18_DIRECT_COOP",
+                "IREE_METAL_VIT_POSITIONAL_SCATTER",
+                "IREE_METAL_VIT_SIMDGROUP_TRANSPOSE",
+            }.issubset(iree_metal._PREVIEW_FEATURE_GATES)
+        )
+        self.assertEqual(
+            iree_metal._PREVIEW_PARAMETER_DEFAULTS[
+                "IREE_METAL_MSL4_VIT_FFN_F32"
+            ],
+            "dynamic",
+        )
+        self.assertEqual(
+            iree_metal._PREVIEW_PARAMETER_DEFAULTS[
+                "IREE_METAL_MSL4_VIT_PROJECTION_TILE"
+            ],
+            "128x32",
+        )
+        self.assertEqual(
+            iree_metal._PREVIEW_PARAMETER_DEFAULTS[
+                "IREE_METAL_VIT_TRANSPOSE_HEAD_TILE"
+            ],
+            "2",
+        )
+        self.assertEqual(
+            iree_metal._PREVIEW_PARAMETER_DEFAULTS[
+                "IREE_METAL_VIT_POSITIONAL_SCATTER_WIDTH"
+            ],
+            "8",
+        )
+
     def test_preview_is_the_default(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             profile, options = iree_metal._configure_preview_profile()

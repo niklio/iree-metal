@@ -957,6 +957,20 @@ LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
   GPUMMAHeuristicSeeds pvMatmulSeeds = {/*bestSubgroupCountPerWorkgroup=*/4,
                                         /*bestMNTileCountPerSubgroup=*/4,
                                         /*bestKTileCountPerSubgroup=*/4};
+  auto overrideAttentionSeed = [](const char *name, int64_t &seed) {
+    if (const char *value = std::getenv(name)) {
+      int64_t parsed = std::strtoll(value, nullptr, 10);
+      if (parsed > 0) {
+        seed = parsed;
+      }
+    }
+  };
+  overrideAttentionSeed("IREE_METAL_ATTN_PV_SUBGROUP_SEED",
+                        pvMatmulSeeds.bestSubgroupCountPerWorkgroup);
+  overrideAttentionSeed("IREE_METAL_ATTN_PV_MN_TILE_SEED",
+                        pvMatmulSeeds.bestMNTileCountPerSubgroup);
+  overrideAttentionSeed("IREE_METAL_ATTN_PV_K_TILE_SEED",
+                        pvMatmulSeeds.bestKTileCountPerSubgroup);
 
   LDBG() << "Attention Vector Distribution Config";
 

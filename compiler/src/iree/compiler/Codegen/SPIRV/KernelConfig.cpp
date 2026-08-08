@@ -1234,11 +1234,24 @@ setCooperativeMatrixConfig(IREE::GPU::TargetAttr target, linalg::LinalgOp op,
     return failure();
   }
 
+  DictionaryAttr pipelineConfig = getSoftwarePipeliningAttrDict(
+      op->getContext(), pipelineDepth, storeStage);
+  if (getenv("IREE_METAL_COOP_NO_BANK_PADDING")) {
+    Builder b(op->getContext());
+    SmallVector<NamedAttribute> pipelineAttrs(pipelineConfig.begin(),
+                                              pipelineConfig.end());
+    auto pipelineOptions = IREE::GPU::GPUPipelineOptionsAttr::get(
+        op->getContext(), /*prefetchNumStages=*/0,
+        /*no_reduce_shared_memory_bank_conflicts=*/true,
+        /*use_igemm_convolution=*/false,
+        /*reorder_workgroups_strategy=*/std::nullopt);
+    pipelineAttrs.emplace_back(
+        IREE::GPU::GPUPipelineOptionsAttr::getDictKeyName(), pipelineOptions);
+    pipelineConfig = b.getDictionaryAttr(pipelineAttrs);
+  }
   return setOpConfigAndEntryPointFnTranslation(
       op->getParentOfType<mlir::FunctionOpInterface>(), op, tileSizes, pipeline,
-      workgroupSize, subgroupSize,
-      getSoftwarePipeliningAttrDict(op->getContext(), pipelineDepth,
-                                    storeStage));
+      workgroupSize, subgroupSize, pipelineConfig);
 }
 
 } // namespace detail
@@ -1529,6 +1542,19 @@ static LogicalResult setScatterOpConfig(IREE::GPU::TargetAttr target,
           subgroupSize);
       // Preserve power-of-two thread tiles for subgroup distribution.
       windowTile = llvm::bit_floor(static_cast<uint64_t>(windowTile));
+    }
+    // Experimental resource probe: the current Apple lowering promotes the
+    // index table but reads the tiled update columns directly from device
+    // memory. Permit an explicit window tile so final MSL resource accounting
+    // can validate wider tiles independently of the conservative tensor-level
+    // estimate above.
+    if (const char *value = getenv("IREE_METAL_SCATTER_WINDOW_TILE")) {
+      char *end = nullptr;
+      long parsed = std::strtol(value, &end, 10);
+      if (end != value && *end == '\0' && parsed > 0) {
+        windowTile = std::clamp<int64_t>(parsed, 1, subgroupSize);
+        windowTile = llvm::bit_floor(static_cast<uint64_t>(windowTile));
+      }
     }
   }
   for (auto [i, it] : llvm::enumerate(its)) {
@@ -2087,6 +2113,52 @@ static LogicalResult setDefaultOpConfig(IREE::GPU::TargetAttr target,
   }
 
   // Common case for all linalg ops.
+
+  // ViT attention-gradient layout conversion. The generic default assigns one
+  // [64]-element row to each workgroup, producing 8*577*12 = 55,392 tiny
+  // workgroups. Amortize scheduling across attention heads while preserving
+  // the existing vector<4> inner loop and 32-thread workgroup.
+  const char *transposeHeadTile =
+      std::getenv("IREE_METAL_VIT_TRANSPOSE_HEAD_TILE");
+  if (transposeHeadTile) {
+    SmallVector<int64_t> ranges = linalgOp.getStaticLoopRanges();
+    int64_t headTile = 1;
+    bool validTile =
+        !StringRef(transposeHeadTile).getAsInteger(10, headTile) &&
+        headTile >= 1 && headTile <= 12 && 12 % headTile == 0;
+    if (validTile && ranges.size() == 4 &&
+        ranges[0] == 8 && ranges[1] == 577 && ranges[2] == 12 &&
+        ranges[3] == 64 && linalgOp.getNumDpsInputs() == 1) {
+      Type inputElementType =
+          getElementTypeOrSelf(linalgOp.getDpsInputOperand(0)->get().getType());
+      Type outputElementType =
+          getElementTypeOrSelf(linalgOp.getDpsInitOperand(0)->get().getType());
+      if (inputElementType.isF32() && outputElementType.isBF16()) {
+        TileSizesListType tileSizes = {
+            {1, 1, headTile, 128}, {0, 1, headTile, 4}};
+        std::array<int64_t, 3> transposeWorkgroupSize = {32, 1, 1};
+        return setOpConfigAndEntryPointFnTranslation(
+            funcOp, op, tileSizes, CodeGenPipeline::SPIRVBaseVectorize,
+            transposeWorkgroupSize);
+      }
+    }
+  }
+
+  // The paired ViT compact FFN epilogue uses one subgroup but benefits from
+  // amortizing workgroup scheduling over multiple vector4 loads per thread.
+  // Keep the validated 128-element tile behind the same gate as the MSL
+  // producer/consumer reinterpretation.
+  if (std::getenv("IREE_METAL_MSL4_VIT_FFN_COMPACT_EPILOGUE")) {
+    SmallVector<int64_t> ranges = linalgOp.getStaticLoopRanges();
+    if (ranges.size() == 1 && ranges[0] == 14180352 &&
+        linalgOp.getNumDpsInputs() == 5) {
+      TileSizesListType tileSizes = {{128}, {4}};
+      std::array<int64_t, 3> compactWorkgroupSize = {32, 1, 1};
+      return setOpConfigAndEntryPointFnTranslation(
+          funcOp, op, tileSizes, CodeGenPipeline::SPIRVBaseVectorize,
+          compactWorkgroupSize);
+    }
+  }
 
   // The core idea is to distribute the partitioned loops to the workgroup
   // dimensions. The goal is to fill up the GPU as much as possible, which means

@@ -14,6 +14,8 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
+#include <cstdlib>
+
 namespace mlir::iree_compiler {
 
 #define GEN_PASS_DEF_MATHTRANSFORMPASS
@@ -89,6 +91,11 @@ static bool predicateF32Cast(StringRef name,
 
 static bool predicateApprox(StringRef name,
                             IREE::HAL::ExecutableTargetAttr target) {
+  if (std::getenv("IREE_METAL_NATIVE_EXP") && target &&
+      target.getBackend().getValue().starts_with("metal") &&
+      name == math::ExpOp::getOperationName()) {
+    return false;
+  }
   if (isROCMBackend(target)) {
     // On ROCm, we do not need most rewrites as we can generally bottom out on
     // either device library functions, or handling of intrinsics in AMDGPU.

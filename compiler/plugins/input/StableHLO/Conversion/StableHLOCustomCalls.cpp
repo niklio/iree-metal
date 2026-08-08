@@ -883,13 +883,12 @@ matchPairedAttention(mlir::stablehlo::DotGeneralOp outputDot) {
   if (!mask) {
     // The standard ViT-base sequence is one element beyond the aligned native
     // path. Its paired rewrite pads to the best measured sustained physical
-    // length and masks the added keys. Although 608 has the same cool-state
-    // latency, repeated 16-step workers cross the Apple M4 power limit. The
-    // 592 schedule stays in the same latency band without the late frequency
-    // cliff. The environment override is also used by focused tests and
-    // schedule sweeps; zero disables the automatic padding of an otherwise
-    // unaligned sequence.
-    int64_t requestedSequence = sequence == 577 ? 592 : sequence;
+    // length and masks the added keys. On the complete ViT training step, 608
+    // is faster through the 16-step sustained protocol and also improves the
+    // gradient signature relative to 592. The environment override remains
+    // available for focused tests and schedule sweeps; zero disables the
+    // automatic padding of an otherwise unaligned sequence.
+    int64_t requestedSequence = sequence == 577 ? 608 : sequence;
     if (const char *value = std::getenv("IREE_METAL_ATTN_PAD_SEQUENCE")) {
       char *end = nullptr;
       long parsed = std::strtol(value, &end, 10);

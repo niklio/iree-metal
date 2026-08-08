@@ -24,7 +24,7 @@ profile.
 
 ## Install the offline bundle
 
-Download `iree-metal-preview-3.11.0.dev2026080401-macos-arm64.tar.gz` from the
+Download `iree-metal-preview-3.11.0.dev2026080801-macos-arm64.tar.gz` from the
 GitHub prerelease. The bundle contains the two project wheels and all locked
 runtime dependencies needed for an offline installation. Do not mix wheels
 from different releases and do not install stock `iree-base-compiler` in the
@@ -33,9 +33,9 @@ import namespace.
 
 ```bash
 shasum -a 256 -c \
-  iree-metal-preview-3.11.0.dev2026080401-macos-arm64.tar.gz.sha256
-tar -xzf iree-metal-preview-3.11.0.dev2026080401-macos-arm64.tar.gz
-cd iree-metal-preview-3.11.0.dev2026080401
+  iree-metal-preview-3.11.0.dev2026080801-macos-arm64.tar.gz.sha256
+tar -xzf iree-metal-preview-3.11.0.dev2026080801-macos-arm64.tar.gz
+cd iree-metal-preview-3.11.0.dev2026080801
 shasum -a 256 -c SHA256SUMS
 
 python3.12 -m venv .venv
@@ -77,7 +77,7 @@ PY
 ```
 
 No campaign environment flags are required. The preview wheel selects the
-versioned `preview-20260804` profile, uses runtime MSL compilation so Xcode's
+versioned `preview-20260808` profile, uses runtime MSL compilation so Xcode's
 optional Metal Toolchain is not needed, and applies the tested fusion and
 optimization settings internally. The first execution includes compilation
 and is not representative of steady-state performance.
@@ -178,8 +178,8 @@ and Xcode:
 ```bash
 git clone --recursive https://github.com/niklio/iree-metal.git
 cd iree-metal
-git checkout iree-metal-v3.11.0.dev2026080401
-export IREE_METAL_VERSION=3.11.0.dev2026080401
+git checkout iree-metal-v3.11.0.dev2026080801
+export IREE_METAL_VERSION=3.11.0.dev2026080801
 export IREE_METAL_PYTHON=python3.12
 ./build_tools/iree_metal/build_preview_wheels.sh
 ./build_tools/iree_metal/smoke_test_wheels.sh ./wheelhouse

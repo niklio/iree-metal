@@ -5,6 +5,9 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/compiler/Dialect/HAL/Conversion/StreamToHAL/Patterns.h"
+
+#include <cstdlib>
+
 #include "iree/compiler/Dialect/HAL/Analysis/Captures.h"
 #include "iree/compiler/Dialect/HAL/Conversion/StreamToHAL/Utils.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
@@ -659,6 +662,104 @@ struct CmdFillOpPattern : StreamConversionPattern<IREE::Stream::CmdFillOp> {
   LogicalResult
   matchAndRewrite(IREE::Stream::CmdFillOp fillOp, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    // ViT materializes Q/K/V into 4,616x768 live tensors backed by
+    // 4,864x768 allocations. The fused attention kernel masks every padded
+    // token lane before it can contribute to an output. The six exact
+    // allocation offsets below cover the three forward Q/K/V buffers in the
+    // first transformer block and the recycled three-buffer set in later
+    // blocks. Keep the similarly sized offset-zero backward scratch fill.
+    if (std::getenv("IREE_METAL_VIT_DEAD_QKV_PAD_FILL")) {
+      auto offset =
+          fillOp.getTargetOffset().getDefiningOp<arith::ConstantIndexOp>();
+      auto length =
+          fillOp.getTargetLength().getDefiningOp<arith::ConstantIndexOp>();
+      if (offset && length && length.value() == 7471104 &&
+          llvm::is_contained({21292160ll, 28763264ll, 36234368ll,
+                              184817792ll, 192288896ll, 199760000ll},
+                             offset.value())) {
+        rewriter.eraseOp(fillOp);
+        return success();
+      }
+    }
+    // The attention backward path reuses a same-sized offset-zero scratch
+    // allocation. Test its padded-token fill separately from forward Q/K/V so
+    // any masked-lane assumption remains attributable and reversible.
+    if (std::getenv("IREE_METAL_VIT_DEAD_ATTN_SCRATCH_PAD_FILL")) {
+      auto offset =
+          fillOp.getTargetOffset().getDefiningOp<arith::ConstantIndexOp>();
+      auto length =
+          fillOp.getTargetLength().getDefiningOp<arith::ConstantIndexOp>();
+      if (offset && length && offset.value() == 0 &&
+          length.value() == 7471104) {
+        rewriter.eraseOp(fillOp);
+        return success();
+      }
+    }
+    // ViT pads the 4,616 live token rows to 4,624 or 4,672 before several
+    // matmuls. The producer/copy overwrites every live row, while each paired
+    // consumer reads only the corresponding live output rows. Zeroing the
+    // dead tail therefore adds bandwidth and a command without affecting any
+    // observable tensor. Exact allocation offsets and lengths keep this
+    // experiment isolated from similarly sized attention scratch buffers.
+    if (std::getenv("IREE_METAL_VIT_DEAD_ROW_PAD_FILL")) {
+      auto offset =
+          fillOp.getTargetOffset().getDefiningOp<arith::ConstantIndexOp>();
+      auto length =
+          fillOp.getTargetLength().getDefiningOp<arith::ConstantIndexOp>();
+      if (offset && length) {
+        int64_t offsetValue = offset.value();
+        int64_t lengthValue = length.value();
+        bool isProjectionRows =
+            lengthValue == 7102464 &&
+            llvm::is_contained({0ll, 14189696ll, 177715328ll}, offsetValue);
+        bool isSmallFFNRows =
+            lengthValue == 7176192 &&
+            llvm::is_contained({0ll, 14201920ll}, offsetValue);
+        bool isLargeFFNRows =
+            lengthValue == 28704768 &&
+            llvm::is_contained({0ll, 21295104ll, 134820928ll}, offsetValue);
+        if (isProjectionRows || isSmallFFNRows || isLargeFFNRows) {
+          rewriter.eraseOp(fillOp);
+          return success();
+        }
+      }
+    }
+    // The 96x577x577 softmax-backward copies and consumers address only the
+    // live rectangle of their 96x592x592 allocation. The 64 MiB border fill is
+    // therefore dead; removing its 36 commands saves about 2.3 ms per ViT step.
+    if (std::getenv("IREE_METAL_VIT_DEAD_ATTN_PAD_FILL")) {
+      auto length =
+          fillOp.getTargetLength().getDefiningOp<arith::ConstantIndexOp>();
+      if (length && length.value() == 67289088) {
+        rewriter.eraseOp(fillOp);
+        return success();
+      }
+    }
+    // Paired with the exact ViT raw-pad Metal tensor matmuls. Those shaders
+    // read the original 4,616-row subspan and the padding-copy entry points are
+    // empty, so their zero-filled destination subspans are dead. Keep this at
+    // HAL conversion so Stream scheduling and executable numbering remain
+    // unchanged while measuring the transfer removal in isolation.
+    if (std::getenv("IREE_METAL_MSL4_VIT_RAW_PAD_MATMUL")) {
+      auto offset =
+          fillOp.getTargetOffset().getDefiningOp<arith::ConstantIndexOp>();
+      auto length =
+          fillOp.getTargetLength().getDefiningOp<arith::ConstantIndexOp>();
+      if (offset && length) {
+        int64_t offsetValue = offset.value();
+        int64_t lengthValue = length.value();
+        bool isSmallFFN =
+            offsetValue == 7090176 && lengthValue == 7176192;
+        bool isLargeFFN =
+            offsetValue == 28360704 && lengthValue == 28704768;
+        bool isProjection =
+            offsetValue == 7090176 && lengthValue == 7102464;
+        if (isSmallFFN || isLargeFFN || isProjection) {
+          rewriter.eraseOp(fillOp);
+          return success();
+        }
+      }
+    }
     auto commandBufferMapping = mapping->lookupCommandBufferFor(fillOp);
     auto targetBinding = commandBufferMapping.resolveBinding(
         fillOp.getLoc(), fillOp.getTarget(), adaptor.getTarget(),
@@ -676,6 +777,61 @@ struct CmdCopyOpPattern : StreamConversionPattern<IREE::Stream::CmdCopyOp> {
   LogicalResult
   matchAndRewrite(IREE::Stream::CmdCopyOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    // ViT copies each live 4,616x3,072 bf16 FFN-gradient tensor into a padded
+    // scratch allocation immediately before its matmul. The raw-pad MPP
+    // kernel deliberately reads only those original 4,616 rows, so forward
+    // the dispatch's read-only binding to the copy source and retain the
+    // separate target binding used for the matmul output.
+    bool forwardLargeFFNCopy =
+        std::getenv("IREE_METAL_VIT_FORWARD_LARGE_FFN_COPY") != nullptr;
+    bool forwardSmallMatmulCopy =
+        std::getenv("IREE_METAL_VIT_FORWARD_SMALL_MATMUL_COPY") != nullptr;
+    if (forwardLargeFFNCopy || forwardSmallMatmulCopy) {
+      auto sourceOffset =
+          op.getSourceOffset().getDefiningOp<arith::ConstantIndexOp>();
+      auto targetOffset =
+          op.getTargetOffset().getDefiningOp<arith::ConstantIndexOp>();
+      auto length = op.getLength().getDefiningOp<arith::ConstantIndexOp>();
+      auto dispatchOp =
+          dyn_cast_or_null<IREE::Stream::CmdDispatchOp>(op->getNextNode());
+      bool isLargeFFNCopy =
+          forwardLargeFFNCopy && sourceOffset && targetOffset && length &&
+          sourceOffset.value() == 0 && targetOffset.value() == 0 &&
+          length.value() == 28360704;
+      bool isSmallMatmulCopy =
+          forwardSmallMatmulCopy && sourceOffset && targetOffset && length &&
+          llvm::is_contained({0ll, 14204928ll, 134820928ll},
+                             sourceOffset.value()) &&
+          targetOffset.value() == 0 && length.value() == 7090176;
+      if ((isLargeFFNCopy || isSmallMatmulCopy) && dispatchOp) {
+        int forwardedBinding = -1;
+        for (auto [index, resource] : llvm::enumerate(dispatchOp.getResources())) {
+          auto access = cast<IREE::Stream::ResourceAccessBitfieldAttr>(
+                            dispatchOp.getResourceAccesses()[index])
+                            .getValue();
+          if (resource == op.getTarget() &&
+              dispatchOp.getResourceOffsets()[index] == op.getTargetOffset() &&
+              access == IREE::Stream::ResourceAccessBitfield::Read) {
+            if (forwardedBinding != -1)
+              return rewriter.notifyMatchFailure(
+                  op, "multiple candidate read bindings for forwarded copy");
+            forwardedBinding = index;
+          }
+        }
+        if (forwardedBinding != -1) {
+          dispatchOp.getResourcesMutable()[forwardedBinding].assign(
+              op.getSource());
+          dispatchOp.getResourceSizesMutable()[forwardedBinding].assign(
+              op.getSourceSize());
+          dispatchOp.getResourceOffsetsMutable()[forwardedBinding].assign(
+              op.getSourceOffset());
+          dispatchOp.getResourceLengthsMutable()[forwardedBinding].assign(
+              op.getLength());
+          rewriter.eraseOp(op);
+          return success();
+        }
+      }
+    }
     auto commandBufferMapping = mapping->lookupCommandBufferFor(op);
     auto sourceBinding = commandBufferMapping.resolveBinding(
         op.getLoc(), op.getSource(), adaptor.getSource(),
@@ -765,6 +921,108 @@ struct CmdDispatchOpPattern
   LogicalResult
   matchAndRewrite(IREE::Stream::CmdDispatchOp dispatchOp, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    // ViT dispatch 283 transposes a 4616x3072 activation solely for dispatch
+    // 285. Metal's left-transposed matmul descriptor can consume the producer
+    // layout directly. Forward that exact read binding and erase the
+    // materialization. Dispatch 285 writes into the non-overlapping tail of
+    // the same allocation, beginning immediately after the 28,360,704 live
+    // input bytes, so the direct binding remains race-free.
+    if (std::getenv("IREE_METAL_VIT_FORWARD_LARGE_FFN_TRANSPOSE")) {
+      bool isTranspose283 = false;
+      dispatchOp.forEachEntryPointAttr([&](SymbolRefAttr entryPointAttr) {
+        isTranspose283 |= entryPointAttr.getLeafReference().getValue().contains(
+            "dispatch_283_transpose_4616x3072_bf16");
+      });
+      if (isTranspose283 && dispatchOp.getResources().size() == 2) {
+        int inputBinding = -1;
+        int outputBinding = -1;
+        for (auto [index, resource] :
+             llvm::enumerate(dispatchOp.getResources())) {
+          auto access = cast<IREE::Stream::ResourceAccessBitfieldAttr>(
+                            dispatchOp.getResourceAccesses()[index])
+                            .getValue();
+          if (access == IREE::Stream::ResourceAccessBitfield::Read)
+            inputBinding = index;
+          else if (access == IREE::Stream::ResourceAccessBitfield::Write)
+            outputBinding = index;
+        }
+        // CmdExecuteOp has already been lowered at this point. Its commands
+        // survive together under the memoized command-buffer scope.
+        Operation *commandScope = dispatchOp->getParentOp();
+        IREE::Stream::CmdDispatchOp matmul285;
+        int matmulInputBinding = -1;
+        if (inputBinding >= 0 && outputBinding >= 0 && commandScope) {
+          Value transposeOutput = dispatchOp.getResources()[outputBinding];
+          commandScope->walk([&](IREE::Stream::CmdDispatchOp candidate) {
+            bool isMatmul285 = false;
+            candidate.forEachEntryPointAttr([&](SymbolRefAttr entryPointAttr) {
+              isMatmul285 |=
+                  entryPointAttr.getLeafReference().getValue().contains(
+                      "dispatch_285_matmul_3072x768x4672_bf16xbf16xf32");
+            });
+            if (!isMatmul285)
+              return;
+            for (auto [index, resource] :
+                 llvm::enumerate(candidate.getResources())) {
+              auto access = cast<IREE::Stream::ResourceAccessBitfieldAttr>(
+                                candidate.getResourceAccesses()[index])
+                                .getValue();
+              if (resource == transposeOutput &&
+                  access == IREE::Stream::ResourceAccessBitfield::Read) {
+                if (matmul285)
+                  matmulInputBinding = -2;
+                else {
+                  matmul285 = candidate;
+                  matmulInputBinding = index;
+                }
+              }
+            }
+          });
+        }
+        if (matmul285 && matmulInputBinding >= 0) {
+          matmul285.getResourcesMutable()[matmulInputBinding].assign(
+              dispatchOp.getResources()[inputBinding]);
+          matmul285.getResourceSizesMutable()[matmulInputBinding].assign(
+              dispatchOp.getResourceSizes()[inputBinding]);
+          matmul285.getResourceOffsetsMutable()[matmulInputBinding].assign(
+              dispatchOp.getResourceOffsets()[inputBinding]);
+          matmul285.getResourceLengthsMutable()[matmulInputBinding].assign(
+              dispatchOp.getResourceLengths()[inputBinding]);
+          rewriter.eraseOp(dispatchOp);
+          return success();
+        }
+      }
+    }
+    if (std::getenv("IREE_METAL_VIT_FUSED_GELU_OUTPUT")) {
+      bool sawEntryPoint = false;
+      bool allEntriesAreFusedTanh = true;
+      dispatchOp.forEachEntryPointAttr([&](SymbolRefAttr entryPointAttr) {
+        sawEntryPoint = true;
+        StringRef name = entryPointAttr.getLeafReference().getValue();
+        allEntriesAreFusedTanh &=
+            name.contains("dispatch_20_elementwise_14180352_bf16");
+      });
+      if (sawEntryPoint && allEntriesAreFusedTanh) {
+        rewriter.eraseOp(dispatchOp);
+        return success();
+      }
+    }
+    if (std::getenv("IREE_METAL_MSL4_VIT_RAW_PAD_MATMUL")) {
+      bool sawEntryPoint = false;
+      bool allEntriesAreDeadPadCopies = true;
+      dispatchOp.forEachEntryPointAttr([&](SymbolRefAttr entryPointAttr) {
+        sawEntryPoint = true;
+        StringRef name = entryPointAttr.getLeafReference().getValue();
+        allEntriesAreDeadPadCopies &=
+            name.contains("dispatch_277_slow_memcpy") ||
+            name.contains("dispatch_284_slow_memcpy") ||
+            name.contains("dispatch_297_slow_memcpy");
+      });
+      if (sawEntryPoint && allEntriesAreDeadPadCopies) {
+        rewriter.eraseOp(dispatchOp);
+        return success();
+      }
+    }
     auto loc = dispatchOp.getLoc();
     auto commandBufferMapping = mapping->lookupCommandBufferFor(dispatchOp);
 
