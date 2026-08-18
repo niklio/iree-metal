@@ -1549,7 +1549,7 @@ static LogicalResult setScatterOpConfig(IREE::GPU::TargetAttr target,
     // [4096, 32] update tile to request 540 KiB of workgroup memory. Those
     // large-vocabulary cases retain the resource-derived window above.
     const char *value = getenv("IREE_METAL_SCATTER_WINDOW_TILE");
-    ArrayRef<int64_t> outputShape = op.getOutputType().getShape();
+    ArrayRef<int64_t> outputShape = op.getOriginalType().getShape();
     bool hasSmallStaticOutputDomain =
         !outputShape.empty() && !ShapedType::isDynamic(outputShape.front()) &&
         outputShape.front() <= 4096;
