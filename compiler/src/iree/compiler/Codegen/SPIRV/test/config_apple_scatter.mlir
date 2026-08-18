@@ -101,12 +101,14 @@ func.func @oversized_bf16_scatter(
   return %result : tensor<50257x768xbf16>
 }
 
+// BOUNDED-DAG: #[[DEFAULT_CONFIG:.+]] = #iree_codegen.lowering_config<tile_sizes = {{\[}}[0, 0, 1], [0, 0, 1]{{\]}}>
+// BOUNDED-DAG: #[[BF16_CONFIG:.+]] = #iree_codegen.lowering_config<tile_sizes = {{\[}}[0, 0, 32], [0, 0, 1]{{\]}}>
 // BOUNDED-LABEL: func.func @nonunique_scatter(
 // BOUNDED:         iree_linalg_ext.scatter
-// BOUNDED-SAME:      lowering_config = #iree_codegen.lowering_config<tile_sizes = {{\[}}[0, 0, 1], [0, 0, 1]{{\]}}>
+// BOUNDED-SAME:      lowering_config = #[[DEFAULT_CONFIG]]
 // BOUNDED-LABEL: func.func @bounded_bf16_scatter(
 // BOUNDED:         iree_linalg_ext.scatter
-// BOUNDED-SAME:      lowering_config = #iree_codegen.lowering_config<tile_sizes = {{\[}}[0, 0, 32], [0, 0, 1]{{\]}}>
+// BOUNDED-SAME:      lowering_config = #[[BF16_CONFIG]]
 // BOUNDED-LABEL: func.func @oversized_bf16_scatter(
 // BOUNDED:         iree_linalg_ext.scatter
-// BOUNDED-SAME:      lowering_config = #iree_codegen.lowering_config<tile_sizes = {{\[}}[0, 0, 1], [0, 0, 1]{{\]}}>
+// BOUNDED-SAME:      lowering_config = #[[DEFAULT_CONFIG]]
