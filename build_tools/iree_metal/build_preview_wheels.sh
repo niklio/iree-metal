@@ -161,12 +161,16 @@ IREE_COMPILER_CUSTOM_REPOSITORY_URL="https://github.com/niklio/iree-metal" \
 echo "Building iree-pjrt-plugin-metal-iree-metal ${preview_version}"
 # setuptools builds local projects in place. Remove this package's generated
 # staging tree so an earlier developer build can never leak a stale native
-# library or bytecode into the release wheel. The CMake object cache lives in
-# ${build_root} and is intentionally preserved.
+# library or bytecode into the release wheel. Reconfigure a reused CMake build
+# so release-only compiler flags such as the source-prefix maps cannot be
+# silently ignored by an older cache. The dependency and object caches live in
+# ${build_root} and are intentionally preserved; Ninja rebuilds only commands
+# whose configuration changed.
 plugin_package_dir="${repo_root}/integrations/pjrt/python_packages/iree_metal_plugin"
 rm -rf \
   "${plugin_package_dir}/build" \
   "${plugin_package_dir}/iree_pjrt_plugin_metal_iree_metal.egg-info"
+rm -f "${IREE_PJRT_CMAKE_BUILD_DIR}/CMakeCache.txt"
 "${build_python}" -m pip wheel --no-build-isolation --no-deps -v \
   --wheel-dir "${wheelhouse}" \
   "${plugin_package_dir}"
