@@ -14,7 +14,8 @@ The preview deliberately has a narrow validation envelope:
   a macOS 13 deployment target, but that tag alone is not evidence that older
   macOS releases were tested.
 - CPython 3.12.
-- JAX and JAXLIB 0.6.1 exactly.
+- JAX and JAXLIB `>=0.10.2,<0.12`; exact verified pairs are listed in the
+  attached compatibility evidence. The offline bundle locks JAX/JAXLIB 0.11.1.
 - BF16 transformer and vision-model training shapes as the primary optimized
   workload. General JAX coverage is incomplete.
 
@@ -24,7 +25,7 @@ profile.
 
 ## Install the offline bundle
 
-Download `iree-metal-preview-3.11.0.dev2026080801-macos-arm64.tar.gz` from the
+Download `iree-metal-preview-3.11.0.dev2026081801-macos-arm64.tar.gz` from the
 GitHub prerelease. The bundle contains the two project wheels and all locked
 runtime dependencies needed for an offline installation. Do not mix wheels
 from different releases and do not install stock `iree-base-compiler` in the
@@ -33,9 +34,9 @@ import namespace.
 
 ```bash
 shasum -a 256 -c \
-  iree-metal-preview-3.11.0.dev2026080801-macos-arm64.tar.gz.sha256
-tar -xzf iree-metal-preview-3.11.0.dev2026080801-macos-arm64.tar.gz
-cd iree-metal-preview-3.11.0.dev2026080801
+  iree-metal-preview-3.11.0.dev2026081801-macos-arm64.tar.gz.sha256
+tar -xzf iree-metal-preview-3.11.0.dev2026081801-macos-arm64.tar.gz
+cd iree-metal-preview-3.11.0.dev2026081801
 shasum -a 256 -c SHA256SUMS
 
 python3.12 -m venv .venv
@@ -77,7 +78,7 @@ PY
 ```
 
 No campaign environment flags are required. The preview wheel selects the
-versioned `preview-20260808` profile, uses runtime MSL compilation so Xcode's
+versioned `preview-20260818` profile, uses runtime MSL compilation so Xcode's
 optional Metal Toolchain is not needed, and applies the tested fusion and
 optimization settings internally. The first execution includes compilation
 and is not representative of steady-state performance.
@@ -113,7 +114,7 @@ environments installed from the exact release wheelhouse:
 - 233 BF16/F32 semantic cases spanning JIT, reverse-mode autodiff, vectorization,
   reductions, gathers, scatters, transformer primitives, shapes, and index
   patterns. Each records compilation, execution, determinism, timeout, and
-  output comparison against the JAX 0.6.1 CPU oracle.
+  output comparison against the JAX 0.11.1 CPU oracle.
 - 10 deterministic BF16 forward-and-backward transformer and vision workloads.
   Each validates loss, gradient norm, persistent per-leaf gradient signatures,
   replay determinism, and synchronized throughput.
@@ -151,7 +152,8 @@ private filesystem paths, or common credential patterns.
 - Dynamic shapes, multiple devices, distributed execution, and broad JAX test
   compatibility are not release claims.
 - Performance is shape-sensitive and compilation can be substantial.
-- Only the exact JAX version and wheel pair in the release are supported.
+- Only the recorded JAX compatibility range and matching release wheel pair
+  are supported; the complete semantic/model claim uses locked JAX 0.11.1.
 - Older macOS releases and non-M4 Apple GPUs are not validated by this preview.
 - The forked compiler distribution still shares an import namespace with stock
   IREE and therefore requires a dedicated virtual environment.
@@ -178,8 +180,8 @@ and Xcode:
 ```bash
 git clone --recursive https://github.com/niklio/iree-metal.git
 cd iree-metal
-git checkout iree-metal-v3.11.0.dev2026080801
-export IREE_METAL_VERSION=3.11.0.dev2026080801
+git checkout iree-metal-v3.11.0.dev2026081801
+export IREE_METAL_VERSION=3.11.0.dev2026081801
 export IREE_METAL_PYTHON=python3.12
 ./build_tools/iree_metal/build_preview_wheels.sh
 ./build_tools/iree_metal/smoke_test_wheels.sh ./wheelhouse

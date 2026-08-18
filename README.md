@@ -6,9 +6,10 @@ focused on BF16 transformer and vision-model workloads through IREE's Metal
 runtime and Apple `simdgroup_matrix` instructions.
 
 This project is not an Apple product and is not an official IREE distribution.
-The developer preview is intentionally narrow: Apple M4, CPython 3.12,
-and JAX/JAXLIB 0.6.1. Its wheel tag has a macOS 13 deployment target, but the
-release manifest names the newer macOS version actually validated.
+The developer preview is intentionally narrow: Apple M4, CPython 3.12, and
+JAX/JAXLIB 0.10.2 through the latest verified release below 0.12. Its wheel tag
+has a macOS 13 deployment target, but the release manifest names the newer
+macOS version actually validated.
 
 ## Install the developer preview
 
@@ -19,13 +20,12 @@ Use a fresh Python 3.12 virtual environment. Do not install the stock
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
-python -m pip install \
-  https://github.com/niklio/iree-metal/releases/download/iree-metal-v3.11.0.dev2026080801/iree_base_compiler_iree_metal-3.11.0.dev2026080801-cp312-abi3-macosx_13_0_arm64.whl \
-  https://github.com/niklio/iree-metal/releases/download/iree-metal-v3.11.0.dev2026080801/iree_pjrt_plugin_metal_iree_metal-3.11.0.dev2026080801-py3-none-macosx_13_0_arm64.whl
+python -m pip install iree-metal==3.11.0.dev2026081801
 ```
 
-The wheels install their dependencies, including the required JAX and JAXLIB
-0.6.1 versions.
+The metapackage installs the matching compiler and plugin wheels. A fresh
+environment resolves the release's locked JAX/JAXLIB 0.11.1 pair; the plugin
+metadata admits the separately verified `>=0.10.2,<0.12` compatibility range.
 
 Then select the backend when running your program:
 
@@ -35,21 +35,22 @@ JAX_PLATFORMS=iree_metal python -c \
 ```
 
 That is the only required runtime setting. The wheels select the tested
-`preview-20260808` profile automatically; no tuning flags are needed. For
+`preview-20260818` profile automatically; no tuning flags are needed. For
 diagnosis, the one supported rollback is `IREE_METAL_PROFILE=baseline`.
 
 Advanced users who need an offline installation, exact dependency locking,
 checksums, or GitHub provenance verification can download the self-contained
 bundle from the
-[Developer Preview 4 release](https://github.com/niklio/iree-metal/releases/tag/iree-metal-v3.11.0.dev2026080801)
+[Developer Preview 5 release](https://github.com/niklio/iree-metal/releases/tag/iree-metal-v3.11.0.dev2026081801)
 and follow the [developer preview guide](docs/metal/developer-preview.md). The
 guide also documents the numeric contract, support boundary, and known
 limitations.
 
 ## Project status
 
-The release verifier keeps four independent gates against the exact wheels:
-233 semantic operation/shape/dtype cases, nine decoder-training operator and
+The release verifier first runs a clean-wheel JAX/PJRT compatibility matrix,
+then keeps four independent artifact gates against the exact wheels: 233
+semantic operation/shape/dtype cases, nine decoder-training operator and
 resource cases, 10 deterministic BF16 forward-and-backward model workloads,
 and 12 paired decoder-training performance workloads. Correctness and resource
 checks must all pass. The model-board geometric mean must exceed 1.00x its live

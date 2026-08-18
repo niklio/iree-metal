@@ -482,6 +482,27 @@ formatSourceDeclaration(IREE::ABI::InvocationModel invocationModel,
   return StringAttr::get(exportOp.getContext(), decl);
 }
 
+// Returns a compact result-to-argument alias map for runtime bindings.
+// Entries are encoded as "result:argument" pairs. Unlike the human-readable
+// declaration this is intended to be parsed by runtimes, so it is independent
+// of source argument names and type formatting.
+static StringAttr formatOutputAliases(FunctionOpInterface exportOp) {
+  std::string aliases;
+  llvm::raw_string_ostream os(aliases);
+  bool hasAliases = false;
+  for (unsigned argIndex = 0; argIndex < exportOp.getNumArguments();
+       ++argIndex) {
+    auto outputAttr =
+        exportOp.getArgAttrOfType<IntegerAttr>(argIndex, "iree.abi.output");
+    if (!outputAttr) continue;
+    if (hasAliases) os << ",";
+    os << outputAttr.getInt() << ":" << argIndex;
+    hasAliases = true;
+  }
+  return hasAliases ? StringAttr::get(exportOp.getContext(), aliases)
+                    : StringAttr{};
+}
+
 // Populates attributes on |wrapperOp| to support runtime reflection.
 // These are attached to the exported function and can be queried at runtime
 // with iree_vm_function_lookup_attr_by_name.
@@ -508,6 +529,10 @@ static void populateReflectionAttrs(IREE::ABI::InvocationModel invocationModel,
     attrs.emplace_back("iree.abi.model",
                        StringAttr::get(context, "coarse-fences"));
     break;
+  }
+
+  if (auto outputAliasesAttr = formatOutputAliases(exportOp)) {
+    attrs.emplace_back("iree.abi.output_aliases", outputAliasesAttr);
   }
 
   // If not provided by the user add the source declaration as the MLIR type.

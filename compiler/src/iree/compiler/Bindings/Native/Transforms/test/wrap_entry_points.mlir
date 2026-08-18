@@ -104,6 +104,7 @@ util.func public @exportEncodings(%arg0: tensor<?x8x8x3xf32> {iree.abi.encoding 
 //  CHECK-SAME:   iree.abi.stub
 //  CHECK-SAME:   iree.reflection =
 //  CHECK-SAME:       iree.abi.declaration = "sync func @outputStorage(%input0: tensor<?x8x8x3xf32>, %input1: !hal.buffer {iree.abi.output = 1 : index}) -> (%output0: tensor<?x8x8x3xf32>, %output1: tensor<?x8x8x3xf32>)"
+//  CHECK-SAME:       iree.abi.output_aliases = "1:1"
 //  CHECK-SAME: } {
 //  CHECK-NEXT:   %[[ARG0_DIM0:.+]] = hal.buffer_view.dim<%[[ARG0]] : !hal.buffer_view>[0] : index
 //  CHECK-NEXT:   %[[ARG0_TENSOR:.+]] = hal.tensor.import %[[ARG0]] "input0" : !hal.buffer_view -> tensor<?x8x8x3xf32>{%[[ARG0_DIM0]]}

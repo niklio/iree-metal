@@ -692,6 +692,20 @@ static void expandTimelineOp(IREE::Stream::TimelineOpInterface timelineOp,
   }
 }
 
+// Preserves the resource/timepoint association materialized by a barrier.
+//
+// Unlike other TimelineOpInterface operations, TimepointBarrierOp has no
+// await-timepoint operand: its purpose is to derive a timepoint from the
+// resource flowing into it. Running it through expandTimelineOp consumes a
+// preceding timepoint.await and then has nowhere to store that dependency.
+// This is especially harmful for region results, where the detached branch
+// timepoint becomes dead and the branch's asynchronous work is erased.
+static void expandTimepointBarrierOp(
+    IREE::Stream::TimepointBarrierOp op,
+    IRMapping &resourceTimepointMap) {
+  resourceTimepointMap.map(op.getResult(), op.getResultTimepoint());
+}
+
 // Expands a RegionBranchOpInterface op (scf.if, scf.for, etc) to yield expanded
 // values.
 static void
@@ -801,6 +815,9 @@ static void expandTimepoints(Operation *op, SymbolTable &symbolTable,
     expandAwaitOp(awaitOp, resourceTimepointMap);
   } else if (auto executeOp = dyn_cast<IREE::Stream::AsyncExecuteOp>(op)) {
     expandAsyncExecuteOp(executeOp, resourceTimepointMap);
+  } else if (auto barrierOp =
+                 dyn_cast<IREE::Stream::TimepointBarrierOp>(op)) {
+    expandTimepointBarrierOp(barrierOp, resourceTimepointMap);
   } else if (auto timelineOp =
                  dyn_cast<IREE::Stream::TimelineOpInterface>(op)) {
     expandTimelineOp(timelineOp, resourceTimepointMap);

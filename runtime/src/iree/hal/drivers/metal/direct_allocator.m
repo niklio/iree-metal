@@ -421,7 +421,25 @@ static iree_status_t iree_hal_metal_allocator_export_buffer(
     iree_hal_external_buffer_type_t requested_type,
     iree_hal_external_buffer_flags_t requested_flags,
     iree_hal_external_buffer_t* IREE_RESTRICT out_external_buffer) {
-  return iree_make_status(IREE_STATUS_UNAVAILABLE, "unsupported exporting to external buffer");
+  if (requested_type != IREE_HAL_EXTERNAL_BUFFER_TYPE_DEVICE_ALLOCATION) {
+    return iree_make_status(IREE_STATUS_UNAVAILABLE,
+                            "unsupported Metal external buffer type");
+  }
+
+  // DEVICE_ALLOCATION is represented by the native id<MTLBuffer> handle on
+  // Metal. The handle is non-owning; callers must retain the source HAL buffer
+  // for at least as long as the exported handle may be used.
+  id<MTLBuffer> metal_buffer = iree_hal_metal_buffer_handle(buffer);
+  if (!metal_buffer) {
+    return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
+                            "Metal buffer has no native handle");
+  }
+  out_external_buffer->type = requested_type;
+  out_external_buffer->flags = requested_flags;
+  out_external_buffer->size = iree_hal_buffer_allocation_size(buffer);
+  out_external_buffer->handle.device_allocation.ptr =
+      (uint64_t)(__bridge void*)metal_buffer;
+  return iree_ok_status();
 }
 
 static const iree_hal_allocator_vtable_t iree_hal_metal_allocator_vtable = {

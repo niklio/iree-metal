@@ -133,14 +133,14 @@ for wheel in wheels:
             requirements = metadata.get_all("Requires-Dist", [])
             required_fragments = (
                 f"iree-base-compiler-iree-metal=={version}",
-                "jax==0.6.1",
-                "jaxlib==0.6.1",
+                "jax<0.12,>=0.10.2",
+                "jaxlib<0.12,>=0.10.2",
             )
             normalized = [r.replace(" ", "") for r in requirements]
             for fragment in required_fragments:
                 if not any(fragment in r for r in normalized):
                     raise SystemExit(
-                        f"plugin metadata is missing exact dependency {fragment}: {requirements}"
+                        f"plugin metadata is missing dependency constraint {fragment}: {requirements}"
                     )
             native = [n for n in names if "pjrt_plugin_iree_metal" in n]
             if len(native) != 1:

@@ -14,7 +14,7 @@ import jax._src.xla_bridge as xb
 
 logger = logging.getLogger(__name__)
 
-PREVIEW_PROFILE = "preview-20260808"
+PREVIEW_PROFILE = "preview-20260818"
 _PREVIEW_PROFILE_ALIASES = {"preview", PREVIEW_PROFILE}
 _PREVIEW_FEATURE_GATES = (
     "IREE_METAL_APPLE_PHYSICAL_BACKWARD_COMPACT_SMEM",
@@ -208,6 +208,87 @@ def _find_native_library() -> Path:
     return base / f"{stem}{suffixes[0]}"
 
 
+def _enable_jax_buffer_donation() -> bool:
+    """Enables JAX's existing StableHLO donation lowering for iree_metal.
+
+    JAX currently guards input/output alias generation with a private list of
+    platform names instead of querying the PJRT plugin. IREE already consumes
+    the resulting ``tf.aliasing_output`` annotation, so register iree_metal
+    with that lowering until JAX exposes a public plugin capability API.
+
+    Returns whether the active JAX version exposed the compatibility hook.
+    """
+    try:
+        from jax._src.interpreters import mlir as jax_mlir
+    except ImportError:
+        return False
+
+    platforms = getattr(jax_mlir, "_platforms_with_donation", None)
+    if not isinstance(platforms, list):
+        return False
+    if "iree_metal" not in platforms:
+        platforms.append("iree_metal")
+    return True
+
+
+def _enable_jax_persistent_cache() -> bool:
+    """Allows JAX's cache to use this backend's PJRT serialization support.
+
+    Current JAX releases still gate the persistent cache on a hard-coded list
+    of built-in platform names. The backend now implements executable
+    serialization and deserialization, so preserve JAX's normal checks while
+    admitting iree_metal after that legacy platform-name gate rejects it.
+    """
+    try:
+        from jax._src import compilation_cache
+    except ImportError:
+        return False
+
+    original = compilation_cache.is_cache_used
+    if getattr(original, "_iree_metal_enabled", False):
+        return True
+
+    def is_cache_used(backend):
+        used = original(backend)
+        if used or getattr(backend, "platform", None) != "iree_metal":
+            return used
+        if not compilation_cache._is_cache_enabled():
+            return False
+        if not getattr(backend, "supports_executable_serialization", True):
+            return False
+        # The original check has already serialized access through JAX's cache
+        # mutex and marked this task checked. Record the corrected result for
+        # subsequent calls.
+        compilation_cache._cache_used = True
+        return True
+
+    is_cache_used._iree_metal_enabled = True
+    compilation_cache.is_cache_used = is_cache_used
+    return True
+
+
+def _register_jax_capabilities() -> bool:
+    """Uses JAX's public plugin capability API when it is available."""
+    try:
+        from jax.extend import backend as jax_backend
+    except ImportError:
+        return False
+    register = getattr(jax_backend, "register_backend_capabilities", None)
+    if register is None:
+        return False
+
+    from . import _dlpack
+
+    register(
+        "iree_metal",
+        supports_buffer_donation=True,
+        supports_persistent_cache=True,
+        dlpack_device_type=_dlpack._K_DL_METAL,
+        dlpack_exporter=_dlpack.export,
+    )
+    return True
+
+
 def initialize():
     is_preview = _verify_compiler_distribution()
     path = _find_native_library()
@@ -222,6 +303,24 @@ def initialize():
     }
     if is_preview:
         active_profile, compiler_options = _configure_preview_profile()
+        if not _register_jax_capabilities():
+            logger.info(
+                "JAX does not yet expose backend capability registration; "
+                "using the versioned released-JAX compatibility bridge."
+            )
+            if not _enable_jax_buffer_donation():
+                logger.warning(
+                    "This JAX version does not expose its platform donation "
+                    "registry; donate_argnums will remain unavailable."
+                )
+            if not _enable_jax_persistent_cache():
+                logger.warning(
+                    "This JAX version does not expose its persistent cache hook."
+                )
+            from . import _dlpack
+
+            if not _dlpack.enable_legacy():
+                logger.warning("This JAX version does not expose its DLPack hook.")
         options["IREE_COMPILER_OPTIONS"] = compiler_options
         # The upstream plugin defaults to debug logging. A packaged preview
         # should be quiet unless the user asks for diagnostics.

@@ -19,6 +19,7 @@ else
   exit 2
 fi
 python_bin="${IREE_METAL_PYTHON:-python3}"
+jax_version="${IREE_METAL_JAX_VERSION:-0.11.1}"
 python_version="$("${python_bin}" --version 2>&1)"
 manifest="${wheelhouse}/iree-metal-preview-${preview_version}.manifest.txt"
 checksums="${wheelhouse}/SHA256SUMS"
@@ -68,7 +69,8 @@ fi
   echo "python: ${python_version}"
   echo "deployment-target: ${MACOSX_DEPLOYMENT_TARGET:-13.0}"
   echo "validated-host: Apple M4; product version above; CPython 3.12"
-  echo "jax-version: 0.6.1"
+  echo "jax-version: ${jax_version}"
+  echo "jax-compatibility-range: >=0.10.2,<0.12"
   echo "default-profile: ${preview_profile}"
   echo "rollback-profile: baseline"
   echo "compiler-options: --iree-metal-compile-to-metallib=false --iree-dispatch-creation-fuse-multi-use=true --iree-dispatch-creation-enable-aggressive-fusion=true --iree-dispatch-creation-enable-split-reduction=true"

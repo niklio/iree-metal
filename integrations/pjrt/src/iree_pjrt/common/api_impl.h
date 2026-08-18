@@ -8,6 +8,7 @@
 #define IREE_PJRT_PLUGIN_PJRT_COMMON_API_IMPL_H_
 
 #include <atomic>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -86,6 +87,10 @@ class BufferInstance {
   DeviceInstance& device() { return device_; }
   iree_status_t AsyncDeallocate();
   iree_status_t Delete();
+  iree_status_t IncreaseExternalReferenceCount();
+  iree_status_t DecreaseExternalReferenceCount();
+  iree_status_t UnsafePointer(uintptr_t* out_ptr);
+  iree_status_t OpaqueDeviceMemoryDataPointer(void** out_ptr);
   bool is_deleted() { return is_deleted_; }
   bool is_on_cpu() {
     // TODO: Plumb through an indication if running on CPU and then implement
@@ -97,6 +102,9 @@ class BufferInstance {
   iree_status_t GetHostSizeInBytes(iree_host_size_t* host_size);
   iree_status_t CopyToHost(void* dst, iree_host_size_t dst_size,
                            EventInstance** done_event);
+  iree_status_t CopyRawToHost(void* dst, iree_device_size_t source_offset,
+                              iree_host_size_t transfer_size,
+                              EventInstance** done_event);
 
   // Advance the ready and done fences.
   iree_status_t AdvanceReadyFence(iree_hal_semaphore_t* semaphore,
@@ -128,6 +136,9 @@ class BufferInstance {
   iree::vm::ref<iree_hal_buffer_view_t> buffer_view_;
   // When the buffer resource gets freed, this is set to true.
   bool is_deleted_ = false;
+  // External consumers such as DLPack pin the backing storage independently
+  // of the PJRT buffer's logical deletion state.
+  std::atomic<int> external_ref_count_{0};
   // Fences.
   // ready_fence_: Signalled when the buffer is ready to be consumed. Consumers
   //   should wait on this fence.
@@ -240,7 +251,7 @@ class DeviceInstance {
   }
   ClientInstance& client() { return client_; }
   bool is_addressable() { return true; }
-  int local_hardware_id() { return -1; }
+  int local_hardware_id() { return info_.client_id(); }
 
   void set_memory(MemoryInstance* memory) { memories_.push_back(memory); }
   MemoryInstance* memory() { return memories_[0]; }
@@ -272,8 +283,18 @@ class DeviceInstance {
       EventInstance** out_done_with_host_buffer_event,
       BufferInstance** out_buffer);
 
+  // Wraps a native device allocation without copying it. This is the PJRT
+  // entry point used by DLPack consumers.
+  iree_status_t CreateViewOfDeviceBuffer(
+      void* device_buffer_ptr, PJRT_Buffer_Type type, const int64_t* dims,
+      size_t num_dims, const PJRT_Buffer_MemoryLayout* layout,
+      intptr_t stream,
+      void (*on_delete_callback)(void* device_buffer_ptr, void* user_arg),
+      void* on_delete_callback_arg, BufferInstance** out_buffer);
+
   // TODO(laurenzo): Eagerly set up device to allow simple access.
   iree_status_t GetHalDevice(iree_hal_device_t** out_device);
+  iree_status_t MemoryStats(PJRT_Device_MemoryStats_Args* args);
 
   DeviceDescription* device_description() { return &info_; }
 
@@ -325,6 +346,7 @@ class EventInstance {
   }
 
   iree_status_t OnReady(PJRT_Event_OnReadyCallback callback, void* user_arg);
+  iree_status_t Await();
   ErrorInstance* error();
   bool is_ready();
 
@@ -332,6 +354,7 @@ class EventInstance {
   void SignalReady(iree_status_t status);
 
   std::mutex lock_;
+  std::condition_variable ready_condition_;
   iree_status_t status_ = iree_ok_status();
   bool is_ready_;
   std::vector<std::pair<PJRT_Event_OnReadyCallback, void*>> pending_callbacks_;
@@ -370,10 +393,12 @@ struct ExecutableImage {
 
   void AddRef() { ref_count.fetch_add(1); }
   void DecRef() {
-    if (ref_count.fetch_sub(1) == 0) {
+    if (ref_count.fetch_sub(1) == 1) {
       delete this;
     }
   }
+
+  const std::string& fingerprint() const { return fingerprint_; }
 
  private:
   // The reference count. Must be disposed when reaching zero.
@@ -386,10 +411,23 @@ struct ExecutableImage {
   // Original code fed to the compiler. Stored for debugging.
   const std::string code;
 
+  // Stable for the lifetime of the executable and derived from the compiled
+  // VMFB bytes. PJRT requires identical compiled inputs to fingerprint alike.
+  std::string fingerprint_;
+
   // Meta-data about the executable is lazily set when an Executable is obtained
   // from a LoadedExecutable.
   iree_host_size_t arg_count;
   iree_host_size_t result_count;
+  std::vector<PJRT_Buffer_Type> output_types;
+  std::vector<int64_t> output_dims;
+  std::vector<size_t> output_dim_sizes;
+  std::vector<const char*> output_memory_kinds;
+  std::vector<size_t> output_memory_kind_sizes;
+  int64_t argument_size_in_bytes = 0;
+  int64_t output_size_in_bytes = 0;
+  int64_t alias_size_in_bytes = 0;
+  std::vector<PJRT_NamedValue> cost_properties;
   bool metadata_initialized = false;
 };
 
@@ -401,6 +439,8 @@ struct ResidentExecutable {
   iree_vm_function_t main_function;
   iree_host_size_t arg_count;
   iree_host_size_t result_count;
+  // Result-to-argument donation aliases, or -1 for unaliased results.
+  std::vector<int64_t> output_aliases;
 };
 
 class LoadedExecutableInstance {
@@ -440,11 +480,15 @@ class LoadedExecutableInstance {
   // we just give it the raw C argument struct vs breaking it down.
   iree_status_t BatchExecute(PJRT_LoadedExecutable_Execute_Args* args);
 
+  iree_status_t Delete();
+  bool is_deleted() const { return is_deleted_.load(); }
+
  private:
   ClientInstance& client_;
   ExecutableImage* image_;  // Ref-counted semantics.
   std::vector<DeviceInstance*> addressable_devices_;
   std::vector<ResidentExecutable> resident_executables_;
+  std::atomic<bool> is_deleted_{false};
 };
 
 //===----------------------------------------------------------------------===//

@@ -8,7 +8,9 @@ repo_root="$(cd "${script_dir}/../.." && pwd)"
 wheelhouse="${IREE_METAL_WHEELHOUSE:-${repo_root}/wheelhouse}"
 python_bin="${IREE_METAL_PYTHON:-python3}"
 preview_version="${IREE_METAL_VERSION:-}"
-jax_version="0.6.1"
+jax_version="0.11.1"
+jax_min_version="0.10.2"
+jax_max_version="0.12"
 build_root="${IREE_METAL_BUILD_ROOT:-${repo_root}/.iree-metal-build}"
 requirements_file="${script_dir}/requirements-preview-macos-arm64-py312.txt"
 build_requirements_file="${script_dir}/requirements-build-macos-arm64-py312.txt"
@@ -139,8 +141,10 @@ patches_applied=1
 
 printf '{\n  "package-version": "%s",\n  "package-suffix": "-iree-metal"\n}\n' \
   "${preview_version}" > "${compiler_version_file}"
-printf '{\n  "package-version": "%s",\n  "package-suffix": "-iree-metal",\n  "compiler-package-name": "iree-base-compiler-iree-metal",\n  "compiler-package-version": "%s",\n  "jax-version": "%s",\n  "jaxlib-version": "%s",\n  "python-requires": ">=3.12,<3.13",\n  "project-url": "https://github.com/niklio/iree-metal"\n}\n' \
-  "${preview_version}" "${preview_version}" "${jax_version}" "${jax_version}" \
+printf '{\n  "package-version": "%s",\n  "package-suffix": "-iree-metal",\n  "compiler-package-name": "iree-base-compiler-iree-metal",\n  "compiler-package-version": "%s",\n  "jax-requires": ">=%s,<%s",\n  "jaxlib-requires": ">=%s,<%s",\n  "python-requires": ">=3.12,<3.13",\n  "project-url": "https://github.com/niklio/iree-metal"\n}\n' \
+  "${preview_version}" "${preview_version}" \
+  "${jax_min_version}" "${jax_max_version}" \
+  "${jax_min_version}" "${jax_max_version}" \
   > "${pjrt_version_file}"
 
 export IREE_CMAKE_BUILD_TYPE=Release
@@ -194,6 +198,7 @@ cp "${repo_root}/docs/metal/releases/${preview_version}.md" \
 "${build_python}" "${script_dir}/write_preview_sbom.py" \
   "${wheelhouse}" "${preview_version}"
 IREE_METAL_PYTHON="${build_python}" \
+  IREE_METAL_JAX_VERSION="${jax_version}" \
   "${script_dir}/write_preview_manifest.sh" "${wheelhouse}" "${preview_version}"
 
 echo "Preview artifacts written to ${wheelhouse}"

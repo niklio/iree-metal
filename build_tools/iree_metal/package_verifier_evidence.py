@@ -111,8 +111,8 @@ def require_parity(summary: dict[str, Any], label: str) -> None:
 def validate_hardware(summary: dict[str, Any], label: str) -> None:
     if summary.get("hardware", {}).get("model") != "Apple M4":
         raise SystemExit(f"{label} must be physically verified on Apple M4")
-    if summary.get("jax_version") != "0.6.1":
-        raise SystemExit(f"{label} must use JAX 0.6.1")
+    if summary.get("jax_version") != "0.11.1":
+        raise SystemExit(f"{label} must use JAX 0.11.1")
 
 
 def validate_combined_summary(summary: dict[str, Any], version: str) -> None:

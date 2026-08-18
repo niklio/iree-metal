@@ -122,7 +122,7 @@ jobs:
             --verify-tag \
             --draft \
             --prerelease \
-            --title "iree-metal ${version} — Developer Preview 2" \
+            --title "iree-metal ${version} — Developer Preview 5" \
             --notes-file wheelhouse/RELEASE_NOTES.md \
             wheelhouse/*.whl \
             wheelhouse/SHA256SUMS \

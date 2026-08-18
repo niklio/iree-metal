@@ -59,14 +59,29 @@ with requirements_path.open() as requirements_txt:
             f"{compiler_package_name}>={pin_versions['iree-base-compiler']}"
         )
 
-    # Preview releases can declare the exact JAX/JAXLIB pair they were tested
-    # against. Keep the historical lower-bound behavior for upstream builds
-    # that do not provide these fields.
+    # Preview releases can declare either the exact JAX/JAXLIB pair they were
+    # tested against or an explicitly verified compatibility range. Keep the
+    # historical lower-bound behavior for upstream builds that do not provide
+    # these fields.
     jax_version = version_info.get("jax-version")
     jaxlib_version = version_info.get("jaxlib-version")
-    if jax_version:
+    jax_requires = version_info.get("jax-requires")
+    jaxlib_requires = version_info.get("jaxlib-requires")
+    if jax_version and jax_requires:
+        raise ValueError(
+            "version_info.json cannot set both jax-version and jax-requires"
+        )
+    if jaxlib_version and jaxlib_requires:
+        raise ValueError(
+            "version_info.json cannot set both jaxlib-version and jaxlib-requires"
+        )
+    if jax_requires:
+        install_requires.append(f"jax{jax_requires}")
+    elif jax_version:
         install_requires.append(f"jax=={jax_version}")
-    if jaxlib_version:
+    if jaxlib_requires:
+        install_requires.append(f"jaxlib{jaxlib_requires}")
+    elif jaxlib_version:
         install_requires.append(f"jaxlib=={jaxlib_version}")
     else:
         install_requires.append(f"jaxlib>={pin_versions['jaxlib']}")

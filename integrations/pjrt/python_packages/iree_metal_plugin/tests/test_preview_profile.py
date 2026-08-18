@@ -5,10 +5,13 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 import os
+import gc
 import sys
 import types
 import unittest
 from unittest import mock
+
+import numpy as np
 
 # Profile resolution is pure Python and does not need a JAX installation. Stub
 # only the import surface used by the plugin module so packaging CI can run this
@@ -19,14 +22,101 @@ jax_src_module = types.ModuleType("jax._src")
 jax_src_module.__path__ = []
 xla_bridge_module = types.ModuleType("jax._src.xla_bridge")
 xla_bridge_module.register_plugin = mock.Mock()
+jax_interpreters_module = types.ModuleType("jax._src.interpreters")
+jax_interpreters_module.__path__ = []
+jax_mlir_module = types.ModuleType("jax._src.interpreters.mlir")
+jax_mlir_module._platforms_with_donation = ["cpu"]
+compilation_cache_module = types.ModuleType("jax._src.compilation_cache")
+compilation_cache_module._cache_used = False
+compilation_cache_module._is_cache_enabled = lambda: True
+compilation_cache_module.is_cache_used = lambda backend: False
+jax_src_module.compilation_cache = compilation_cache_module
 sys.modules.setdefault("jax", jax_module)
 sys.modules.setdefault("jax._src", jax_src_module)
 sys.modules.setdefault("jax._src.xla_bridge", xla_bridge_module)
+sys.modules.setdefault("jax._src.interpreters", jax_interpreters_module)
+sys.modules.setdefault("jax._src.interpreters.mlir", jax_mlir_module)
+sys.modules.setdefault("jax._src.compilation_cache", compilation_cache_module)
 
 from jax_plugins import iree_metal
+from jax_plugins.iree_metal import _dlpack
 
 
 class PreviewProfileTest(unittest.TestCase):
+    def test_enables_jax_donation_lowering_idempotently(self):
+        platforms = jax_mlir_module._platforms_with_donation
+        platforms[:] = ["cpu"]
+        self.assertTrue(iree_metal._enable_jax_buffer_donation())
+        self.assertTrue(iree_metal._enable_jax_buffer_donation())
+        self.assertEqual(platforms, ["cpu", "iree_metal"])
+
+    def test_enables_persistent_cache_for_serializable_metal_backend(self):
+        class Backend:
+            platform = "iree_metal"
+            supports_executable_serialization = True
+
+        compilation_cache_module._cache_used = False
+        self.assertTrue(iree_metal._enable_jax_persistent_cache())
+        self.assertTrue(compilation_cache_module.is_cache_used(Backend()))
+        self.assertTrue(compilation_cache_module._cache_used)
+
+    def test_public_capability_registration_avoids_legacy_monkeypatches(self):
+        register = mock.Mock()
+        backend_module = types.ModuleType("jax.extend.backend")
+        backend_module.register_backend_capabilities = register
+        extend_module = types.ModuleType("jax.extend")
+        extend_module.backend = backend_module
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "jax.extend": extend_module,
+                "jax.extend.backend": backend_module,
+            },
+        ), mock.patch.object(
+            iree_metal, "_enable_jax_buffer_donation"
+        ) as donation, mock.patch.object(
+            iree_metal, "_enable_jax_persistent_cache"
+        ) as cache, mock.patch.object(
+            _dlpack, "enable_legacy"
+        ) as dlpack:
+            self.assertTrue(iree_metal._register_jax_capabilities())
+            donation.assert_not_called()
+            cache.assert_not_called()
+            dlpack.assert_not_called()
+        register.assert_called_once_with(
+            "iree_metal",
+            supports_buffer_donation=True,
+            supports_persistent_cache=True,
+            dlpack_device_type=8,
+            dlpack_exporter=_dlpack.export,
+        )
+
+    def test_builds_and_releases_metal_dlpack_capsule(self):
+        class Device:
+            local_hardware_id = 3
+
+        class Array:
+            device = Device()
+            shape = (2, 3)
+            dtype = np.dtype(np.float32)
+            blocked = False
+
+            def block_until_ready(self):
+                self.blocked = True
+
+            def unsafe_buffer_pointer(self):
+                return 0x1000
+
+        array = Array()
+        context_count = len(_dlpack._contexts)
+        capsule = _dlpack._metal_dlpack_capsule(array)
+        self.assertTrue(array.blocked)
+        self.assertIn('"dltensor"', repr(capsule))
+        self.assertEqual(len(_dlpack._contexts), context_count + 1)
+        del capsule
+        gc.collect()
+        self.assertEqual(len(_dlpack._contexts), context_count)
+
     def test_preview_includes_shipped_physical_apple_attention_gates(self):
         self.assertTrue(
             {

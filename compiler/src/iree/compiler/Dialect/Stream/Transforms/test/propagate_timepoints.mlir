@@ -215,3 +215,44 @@ util.func private @asyncExecuteConsume(%arg0: !stream.resource<external>, %arg1:
 
   util.return
 }
+
+// -----
+
+// Tests that a barrier preserves the completion timepoint of a resource
+// yielded from structured control flow. Consuming the await as if the barrier
+// had an await operand disconnects the branch work and lets it be erased.
+
+// CHECK-LABEL: @scfIfBarrier
+// CHECK: %[[IF:.+]]:2 = scf.if
+// CHECK: %[[IF_SIZE:.+]] = stream.resource.size %[[IF]]#0
+// CHECK: %[[READY:.+]] = stream.timepoint.await %[[IF]]#1 => %[[IF]]#0
+// CHECK: %[[BARRIER_RESOURCE:.+]], %[[BARRIER_TIMEPOINT:.+]] = stream.timepoint.barrier %[[READY]]
+// CHECK: util.return %[[BARRIER_TIMEPOINT]]
+util.func private @scfIfBarrier(
+    %condition: i1,
+    %arg0: !stream.resource<external>,
+    %arg1: !stream.resource<external>) -> !stream.timepoint {
+  %c4 = arith.constant 4 : index
+  %result = scf.if %condition -> (!stream.resource<external>) {
+    %branch_result, %branch_timepoint = stream.async.execute
+        with(%arg0 as %capture: !stream.resource<external>{%c4})
+        -> !stream.resource<external>{%c4} {
+      stream.yield %capture : !stream.resource<external>{%c4}
+    } => !stream.timepoint
+    %ready = stream.timepoint.await %branch_timepoint => %branch_result :
+        !stream.resource<external>{%c4}
+    scf.yield %ready : !stream.resource<external>
+  } else {
+    %branch_result, %branch_timepoint = stream.async.execute
+        with(%arg1 as %capture: !stream.resource<external>{%c4})
+        -> !stream.resource<external>{%c4} {
+      stream.yield %capture : !stream.resource<external>{%c4}
+    } => !stream.timepoint
+    %ready = stream.timepoint.await %branch_timepoint => %branch_result :
+        !stream.resource<external>{%c4}
+    scf.yield %ready : !stream.resource<external>
+  }
+  %barrier_result, %barrier_timepoint = stream.timepoint.barrier %result :
+      !stream.resource<external>{%c4} => !stream.timepoint
+  util.return %barrier_timepoint : !stream.timepoint
+}

@@ -6,10 +6,17 @@
 
 #include "iree_pjrt/common/api_impl.h"
 
+#include <algorithm>
+#include <charconv>
+#include <cinttypes>
+#include <iomanip>
 #include <iterator>
+#include <limits>
 #include <optional>
 #include <sstream>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include "iree/hal/api.h"
 #include "iree_pjrt/common/iree_helpers.h"
@@ -23,8 +30,207 @@ namespace iree::pjrt {
 
 const std::string_view kMlirFormat = "mlir";
 
+// JAX uses "device" as the canonical memory kind for ordinary device-backed
+// arrays. The HAL device name (for example, "Apple M4") is a hardware
+// description, not a PJRT memory kind, and advertising it here prevents JAX
+// from selecting an addressable memory for compiled inputs and outputs.
+constexpr std::string_view kDeviceMemoryKind = "device";
+
 // We hardcode the maximum number of dimensions to avoid mallocs.
 constexpr int64_t kMaxDims = 9;
+
+namespace {
+
+// Compiler output used when restoring a serialized VMFB. The ordinary compile
+// path memory maps an IREE compiler output; deserialization instead owns a copy
+// of the bytes supplied by PJRT's caller.
+class InMemoryCompilerOutput final : public CompilerOutput {
+ public:
+  InMemoryCompilerOutput(const char* data, size_t size)
+      : bytes_(data, data + size) {}
+
+  void* GetData() override { return bytes_.data(); }
+  size_t GetDataSize() override { return bytes_.size(); }
+
+ private:
+  std::vector<char> bytes_;
+};
+
+struct SerializedExecutableStorage {
+  explicit SerializedExecutableStorage(const CompilerOutput& output)
+      : bytes(static_cast<const char*>(
+                  const_cast<CompilerOutput&>(output).GetData()),
+              static_cast<const char*>(
+                  const_cast<CompilerOutput&>(output).GetData()) +
+                  const_cast<CompilerOutput&>(output).GetDataSize()) {}
+  std::vector<char> bytes;
+};
+
+std::string FingerprintCompilerOutput(CompilerOutput& output) {
+  // FNV-1a is sufficient here: this is a deterministic PJRT identity, not a
+  // security boundary. Prefixing the algorithm leaves room to change it in a
+  // future serialization generation without ambiguity.
+  constexpr uint64_t kFnvOffset = UINT64_C(14695981039346656037);
+  constexpr uint64_t kFnvPrime = UINT64_C(1099511628211);
+  uint64_t hash = kFnvOffset;
+  const auto* data = static_cast<const uint8_t*>(output.GetData());
+  for (size_t i = 0; i < output.GetDataSize(); ++i) {
+    hash ^= data[i];
+    hash *= kFnvPrime;
+  }
+  std::ostringstream stream;
+  stream << "iree-vmfb-fnv1a64-" << std::hex << std::setfill('0')
+         << std::setw(16) << hash;
+  return stream.str();
+}
+
+struct TensorMetadata {
+  PJRT_Buffer_Type element_type = PJRT_Buffer_Type_INVALID;
+  std::vector<int64_t> dims;
+  int64_t size_in_bytes = 0;
+};
+
+std::optional<std::pair<PJRT_Buffer_Type, int64_t>> ParseElementType(
+    std::string_view type) {
+  if (type == "i1") return std::pair(PJRT_Buffer_Type_PRED, 1);
+  if (type == "i8") return std::pair(PJRT_Buffer_Type_S8, 1);
+  if (type == "i16") return std::pair(PJRT_Buffer_Type_S16, 2);
+  if (type == "i32") return std::pair(PJRT_Buffer_Type_S32, 4);
+  if (type == "i64") return std::pair(PJRT_Buffer_Type_S64, 8);
+  if (type == "ui8") return std::pair(PJRT_Buffer_Type_U8, 1);
+  if (type == "ui16") return std::pair(PJRT_Buffer_Type_U16, 2);
+  if (type == "ui32") return std::pair(PJRT_Buffer_Type_U32, 4);
+  if (type == "ui64") return std::pair(PJRT_Buffer_Type_U64, 8);
+  if (type == "f16") return std::pair(PJRT_Buffer_Type_F16, 2);
+  if (type == "bf16") return std::pair(PJRT_Buffer_Type_BF16, 2);
+  if (type == "f32") return std::pair(PJRT_Buffer_Type_F32, 4);
+  if (type == "f64") return std::pair(PJRT_Buffer_Type_F64, 8);
+  if (type == "complex<f32>") return std::pair(PJRT_Buffer_Type_C64, 8);
+  if (type == "complex<f64>") return std::pair(PJRT_Buffer_Type_C128, 16);
+  return std::nullopt;
+}
+
+std::optional<TensorMetadata> ParseTensorMetadata(std::string_view value) {
+  size_t tensor_start = value.find("tensor<");
+  if (tensor_start == std::string_view::npos) return std::nullopt;
+  size_t content_start = tensor_start + strlen("tensor<");
+  int angle_depth = 1;
+  size_t content_end = content_start;
+  for (; content_end < value.size(); ++content_end) {
+    if (value[content_end] == '<') ++angle_depth;
+    if (value[content_end] == '>' && --angle_depth == 0) break;
+  }
+  if (angle_depth != 0) return std::nullopt;
+  std::string_view content = value.substr(content_start,
+                                          content_end - content_start);
+
+  size_t element_start = 0;
+  angle_depth = 0;
+  for (size_t i = 0; i < content.size(); ++i) {
+    if (content[i] == '<') ++angle_depth;
+    if (content[i] == '>') --angle_depth;
+    if (content[i] == 'x' && angle_depth == 0) element_start = i + 1;
+  }
+  auto parsed_type = ParseElementType(content.substr(element_start));
+  if (!parsed_type) return std::nullopt;
+
+  TensorMetadata metadata;
+  metadata.element_type = parsed_type->first;
+  int64_t element_count = 1;
+  std::string_view dimensions = content.substr(0, element_start);
+  if (!dimensions.empty()) dimensions.remove_suffix(1);  // trailing 'x'
+  size_t position = 0;
+  while (position < dimensions.size()) {
+    size_t separator = dimensions.find('x', position);
+    std::string_view dimension = dimensions.substr(
+        position, separator == std::string_view::npos
+                      ? std::string_view::npos
+                      : separator - position);
+    int64_t extent = -1;
+    if (dimension != "?") {
+      auto result = std::from_chars(dimension.data(),
+                                    dimension.data() + dimension.size(), extent);
+      if (result.ec != std::errc() || result.ptr != dimension.data() + dimension.size() ||
+          extent < 0) {
+        return std::nullopt;
+      }
+      element_count *= extent;
+    } else {
+      element_count = -1;
+    }
+    metadata.dims.push_back(extent);
+    if (separator == std::string_view::npos) break;
+    position = separator + 1;
+  }
+  metadata.size_in_bytes =
+      element_count < 0 ? 0 : element_count * parsed_type->second;
+  return metadata;
+}
+
+std::vector<std::string_view> SplitFunctionValues(std::string_view values) {
+  std::vector<std::string_view> result;
+  int depth = 0;
+  size_t start = 0;
+  for (size_t i = 0; i < values.size(); ++i) {
+    switch (values[i]) {
+      case '<':
+      case '(':
+      case '{': ++depth; break;
+      case '>':
+      case ')':
+      case '}': --depth; break;
+      case ',':
+        if (depth == 0) {
+          result.push_back(values.substr(start, i - start));
+          start = i + 1;
+        }
+        break;
+    }
+  }
+  if (start < values.size()) result.push_back(values.substr(start));
+  return result;
+}
+
+std::optional<std::string_view> FunctionValueList(std::string_view declaration,
+                                                  bool results) {
+  size_t start = results ? declaration.find("->") : declaration.find("func @");
+  if (start == std::string_view::npos) return std::nullopt;
+  start = declaration.find('(', start);
+  if (start == std::string_view::npos) return std::nullopt;
+  int depth = 1;
+  size_t end = start + 1;
+  for (; end < declaration.size(); ++end) {
+    if (declaration[end] == '(') ++depth;
+    if (declaration[end] == ')' && --depth == 0) break;
+  }
+  if (depth != 0) return std::nullopt;
+  return declaration.substr(start + 1, end - start - 1);
+}
+
+PJRT_NamedValue MakeInt64Property(const char* name, int64_t value) {
+  PJRT_NamedValue property{};
+  property.struct_size = PJRT_NamedValue_STRUCT_SIZE;
+  property.name = name;
+  property.name_size = strlen(name);
+  property.type = PJRT_NamedValue_kInt64;
+  property.int64_value = value;
+  property.value_size = 1;
+  return property;
+}
+
+}  // namespace
+
+struct ExternalDeviceBufferRelease {
+  void* device_buffer_ptr;
+  void (*callback)(void* device_buffer_ptr, void* user_arg);
+  void* user_arg;
+};
+
+void ReleaseExternalDeviceBuffer(void* user_data, iree_hal_buffer_t*) {
+  auto release = std::unique_ptr<ExternalDeviceBufferRelease>(
+      static_cast<ExternalDeviceBufferRelease*>(user_data));
+  release->callback(release->device_buffer_ptr, release->user_arg);
+}
 
 // Some general conversion functions for managing around some API layering
 // that is in flight. It is expected that most of this goes away over time.
@@ -343,8 +549,10 @@ void BufferInstance::BindApi(PJRT_Api* api) {
   api->PJRT_Buffer_DynamicDimensionIndices =
       +[](PJRT_Buffer_DynamicDimensionIndices_Args* args) -> PJRT_Error* {
     IREE_TRACE_SCOPE_NAMED("PJRT_Buffer_DynamicDimensionIndices");
-    return MakeError(iree_make_status(IREE_STATUS_UNIMPLEMENTED,
-                                      "PJRT_Buffer_DynamicDimensionIndices"));
+    // IREE's PJRT buffers always have fully resolved runtime dimensions.
+    args->dynamic_dim_indices = nullptr;
+    args->num_dynamic_dims = 0;
+    return nullptr;
   };
   api->PJRT_Buffer_GetMemoryLayout =
       +[](PJRT_Buffer_GetMemoryLayout_Args* args) -> PJRT_Error* {
@@ -398,8 +606,38 @@ void BufferInstance::BindApi(PJRT_Api* api) {
   api->PJRT_Buffer_CopyToDevice =
       +[](PJRT_Buffer_CopyToDevice_Args* args) -> PJRT_Error* {
     IREE_TRACE_SCOPE_NAMED("PJRT_Buffer_CopyToDevice");
-    return MakeError(iree_make_status(IREE_STATUS_UNIMPLEMENTED,
-                                      "PJRT_Buffer_CopyToDevice"));
+    auto* buffer = BufferInstance::Unwrap(args->buffer);
+    if (DeviceInstance::Unwrap(args->dst_device) == &buffer->device()) {
+      return MakeError(iree_make_status(
+          IREE_STATUS_INVALID_ARGUMENT, "buffer is already on destination device"));
+    }
+    return MakeError(iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "destination device is not in this single-device Metal client"));
+  };
+  api->PJRT_Buffer_CopyToMemory =
+      +[](PJRT_Buffer_CopyToMemory_Args* args) -> PJRT_Error* {
+    IREE_TRACE_SCOPE_NAMED("PJRT_Buffer_CopyToMemory");
+    auto* buffer = BufferInstance::Unwrap(args->buffer);
+    if (MemoryInstance::Unwrap(args->dst_memory) == buffer->device().memory()) {
+      return MakeError(iree_make_status(
+          IREE_STATUS_INVALID_ARGUMENT, "buffer is already in destination memory"));
+    }
+    return MakeError(iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "destination memory is not in this single-memory Metal client"));
+  };
+  api->PJRT_Buffer_CopyRawToHost =
+      +[](PJRT_Buffer_CopyRawToHost_Args* args) -> PJRT_Error* {
+    IREE_TRACE_SCOPE_NAMED("PJRT_Buffer_CopyRawToHost");
+    if (args->offset < 0 || args->transfer_size < 0) {
+      return MakeError(iree_make_status(
+          IREE_STATUS_INVALID_ARGUMENT, "copy offset and size must be non-negative"));
+    }
+    return MakeError(BufferInstance::Unwrap(args->buffer)->CopyRawToHost(
+        args->dst, static_cast<iree_device_size_t>(args->offset),
+        static_cast<iree_host_size_t>(args->transfer_size),
+        reinterpret_cast<EventInstance**>(&args->event)));
   };
   api->PJRT_Buffer_IsOnCpu =
       +[](PJRT_Buffer_IsOnCpu_Args* args) -> PJRT_Error* {
@@ -428,10 +666,26 @@ void BufferInstance::BindApi(PJRT_Api* api) {
   api->PJRT_Buffer_UnsafePointer =
       +[](PJRT_Buffer_UnsafePointer_Args* args) -> PJRT_Error* {
     BufferInstance* buffer = BufferInstance::Unwrap(args->buffer);
-    iree_hal_buffer_t* hal_buffer =
-        iree_hal_buffer_view_buffer(buffer->buffer_view());
-    args->buffer_pointer = (uintptr_t)hal_buffer;
-    return nullptr;
+    return MakeError(buffer->UnsafePointer(&args->buffer_pointer));
+  };
+  api->PJRT_Buffer_IncreaseExternalReferenceCount =
+      +[](PJRT_Buffer_IncreaseExternalReferenceCount_Args* args)
+      -> PJRT_Error* {
+    return MakeError(BufferInstance::Unwrap(args->buffer)
+                         ->IncreaseExternalReferenceCount());
+  };
+  api->PJRT_Buffer_DecreaseExternalReferenceCount =
+      +[](PJRT_Buffer_DecreaseExternalReferenceCount_Args* args)
+      -> PJRT_Error* {
+    return MakeError(BufferInstance::Unwrap(args->buffer)
+                         ->DecreaseExternalReferenceCount());
+  };
+  api->PJRT_Buffer_OpaqueDeviceMemoryDataPointer =
+      +[](PJRT_Buffer_OpaqueDeviceMemoryDataPointer_Args* args)
+      -> PJRT_Error* {
+    return MakeError(BufferInstance::Unwrap(args->buffer)
+                         ->OpaqueDeviceMemoryDataPointer(
+                             &args->device_memory_ptr));
   };
 }
 
@@ -457,12 +711,97 @@ iree_status_t BufferInstance::AsyncDeallocate() {
 iree_status_t BufferInstance::Delete() {
   IREE_TRACE_SCOPE();
   is_deleted_ = true;
-  buffer_view_.release();
+  if (external_ref_count_.load() == 0) {
+    buffer_view_.reset();
+  }
+  return iree_ok_status();
+}
+
+iree_status_t BufferInstance::IncreaseExternalReferenceCount() {
+  IREE_TRACE_SCOPE();
+  if (is_deleted_ || !buffer_view_) {
+    return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
+                            "cannot externally reference a deleted buffer");
+  }
+  external_ref_count_.fetch_add(1);
+  return iree_ok_status();
+}
+
+iree_status_t BufferInstance::DecreaseExternalReferenceCount() {
+  IREE_TRACE_SCOPE();
+  int previous_count = external_ref_count_.fetch_sub(1);
+  if (previous_count <= 0) {
+    external_ref_count_.fetch_add(1);
+    return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
+                            "buffer external reference count is already zero");
+  }
+  if (previous_count == 1 && is_deleted_) {
+    buffer_view_.reset();
+  }
+  return iree_ok_status();
+}
+
+iree_status_t BufferInstance::UnsafePointer(uintptr_t* out_ptr) {
+  IREE_TRACE_SCOPE();
+  if (!buffer_view_) {
+    return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
+                            "cannot access a deleted buffer");
+  }
+  iree_hal_external_buffer_t external_buffer;
+  IREE_RETURN_IF_ERROR(iree_hal_allocator_export_buffer(
+      device_.device_allocator(),
+      iree_hal_buffer_view_buffer(buffer_view_.get()),
+      IREE_HAL_EXTERNAL_BUFFER_TYPE_DEVICE_ALLOCATION,
+      IREE_HAL_EXTERNAL_BUFFER_FLAG_NONE, &external_buffer));
+  *out_ptr = static_cast<uintptr_t>(
+      external_buffer.handle.device_allocation.ptr);
+  return iree_ok_status();
+}
+
+iree_status_t BufferInstance::OpaqueDeviceMemoryDataPointer(void** out_ptr) {
+  IREE_TRACE_SCOPE();
+  if (external_ref_count_.load() <= 0 || !buffer_view_) {
+    return iree_make_status(
+        IREE_STATUS_FAILED_PRECONDITION,
+        "opaque device pointer requires an external buffer reference");
+  }
+  iree_hal_external_buffer_t external_buffer;
+  IREE_RETURN_IF_ERROR(iree_hal_allocator_export_buffer(
+      device_.device_allocator(),
+      iree_hal_buffer_view_buffer(buffer_view_.get()),
+      IREE_HAL_EXTERNAL_BUFFER_TYPE_DEVICE_ALLOCATION,
+      IREE_HAL_EXTERNAL_BUFFER_FLAG_NONE, &external_buffer));
+  *out_ptr = reinterpret_cast<void*>(
+      static_cast<uintptr_t>(external_buffer.handle.device_allocation.ptr));
   return iree_ok_status();
 }
 
 iree_status_t BufferInstance::CopyToHost(void* dst, iree_host_size_t dst_size,
                                          EventInstance** out_done_event) {
+  return CopyRawToHost(dst, /*source_offset=*/0, dst_size, out_done_event);
+}
+
+iree_status_t BufferInstance::CopyRawToHost(
+    void* dst, iree_device_size_t source_offset, iree_host_size_t dst_size,
+    EventInstance** out_done_event) {
+  if (!buffer_view_) {
+    return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
+                            "cannot copy a deleted buffer");
+  }
+  iree_device_size_t buffer_size =
+      iree_hal_buffer_view_byte_length(buffer_view_.get());
+  if (source_offset > buffer_size || dst_size > buffer_size - source_offset) {
+    return iree_make_status(
+        IREE_STATUS_OUT_OF_RANGE,
+        "copy range [%" PRIu64 ", %" PRIu64 ") exceeds buffer size %" PRIu64,
+        static_cast<uint64_t>(source_offset),
+        static_cast<uint64_t>(source_offset + dst_size),
+        static_cast<uint64_t>(buffer_size));
+  }
+  if (dst_size != 0 && !dst) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "copy destination must not be null");
+  }
   // Use a data structure to handle intermediary buffer when necessary. This
   // needs to include the destination and aligned buffer, along with the size
   // so the destination can be mem-copied if necessary.
@@ -523,7 +862,7 @@ iree_status_t BufferInstance::CopyToHost(void* dst, iree_host_size_t dst_size,
   transfer_command.type = IREE_HAL_TRANSFER_COMMAND_TYPE_COPY;
   transfer_command.copy.source_buffer =
       iree_hal_buffer_view_buffer(buffer_view());
-  transfer_command.copy.source_offset = 0;
+  transfer_command.copy.source_offset = source_offset;
   transfer_command.copy.target_buffer = dst_buffer.get();
   transfer_command.copy.target_offset = 0;
   transfer_command.copy.length = dst_size;
@@ -733,6 +1072,12 @@ void MemoryInstance::BindApi(PJRT_Api* api) {
     args->kind_size = kind.size();
     return nullptr;
   };
+  api->PJRT_Memory_Kind_Id =
+      +[](PJRT_Memory_Kind_Id_Args* args) -> PJRT_Error* {
+    // There is one memory kind in the Metal client.
+    args->kind_id = 0;
+    return nullptr;
+  };
   api->PJRT_Memory_ToString =
       +[](PJRT_Memory_ToString_Args* args) -> PJRT_Error* {
     auto to_string = MemoryInstance::Unwrap(args->memory)->ToString();
@@ -757,9 +1102,7 @@ void MemoryInstance::BindApi(PJRT_Api* api) {
 }
 
 int MemoryInstance::Id() { return device_->device_description()->device_id(); }
-std::string_view MemoryInstance::Kind() {
-  return device_->device_description()->kind_string();
-}
+std::string_view MemoryInstance::Kind() { return kDeviceMemoryKind; }
 std::string_view MemoryInstance::DebugString() {
   return device_->device_description()->debug_string();
 }
@@ -805,6 +1148,47 @@ void DeviceInstance::BindApi(PJRT_Api* api) {
         DeviceInstance::Unwrap(args->device)->device_description());
     return nullptr;
   };
+  api->PJRT_Device_MemoryStats =
+      +[](PJRT_Device_MemoryStats_Args* args) -> PJRT_Error* {
+    IREE_TRACE_SCOPE_NAMED("PJRT_Device_MemoryStats");
+    return MakeError(DeviceInstance::Unwrap(args->device)->MemoryStats(args));
+  };
+}
+
+iree_status_t DeviceInstance::MemoryStats(PJRT_Device_MemoryStats_Args* args) {
+  IREE_RETURN_IF_ERROR(OpenDevice());
+  iree_hal_allocator_statistics_t statistics;
+  iree_hal_allocator_query_statistics(device_allocator(), &statistics);
+  args->bytes_in_use = 0;
+  args->peak_bytes_in_use = 0;
+  args->peak_bytes_in_use_is_set = false;
+  args->num_allocs = 0;
+  args->num_allocs_is_set = false;
+  args->largest_alloc_size = 0;
+  args->largest_alloc_size_is_set = false;
+  args->bytes_limit = 0;
+  args->bytes_limit_is_set = false;
+  args->bytes_reserved = 0;
+  args->bytes_reserved_is_set = false;
+  args->peak_bytes_reserved = 0;
+  args->peak_bytes_reserved_is_set = false;
+  args->bytes_reservable_limit = 0;
+  args->bytes_reservable_limit_is_set = false;
+  args->largest_free_block_bytes = 0;
+  args->largest_free_block_bytes_is_set = false;
+  args->pool_bytes = 0;
+  args->pool_bytes_is_set = false;
+  args->peak_pool_bytes = 0;
+  args->peak_pool_bytes_is_set = false;
+#if IREE_STATISTICS_ENABLE
+  args->bytes_in_use = static_cast<int64_t>(
+      statistics.host_bytes_allocated - statistics.host_bytes_freed +
+      statistics.device_bytes_allocated - statistics.device_bytes_freed);
+  args->peak_bytes_in_use = static_cast<int64_t>(
+      statistics.host_bytes_peak + statistics.device_bytes_peak);
+  args->peak_bytes_in_use_is_set = true;
+#endif
+  return iree_ok_status();
 }
 
 iree_status_t DeviceInstance::CreateFence(iree_hal_fence_t** out_fence) {
@@ -1281,6 +1665,139 @@ iree_status_t DeviceInstance::HostBufferToDevice(
   return err;
 }
 
+iree_status_t DeviceInstance::CreateViewOfDeviceBuffer(
+    void* device_buffer_ptr, PJRT_Buffer_Type type, const int64_t* dims,
+    size_t num_dims, const PJRT_Buffer_MemoryLayout* layout, intptr_t stream,
+    void (*on_delete_callback)(void* device_buffer_ptr, void* user_arg),
+    void* on_delete_callback_arg, BufferInstance** out_buffer) {
+  IREE_RETURN_IF_ERROR(OpenDevice());
+  if (!device_buffer_ptr) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "device buffer pointer must not be null");
+  }
+  if (num_dims > kMaxDims) {
+    return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
+                            "only supports up to %d dims but got %d",
+                            (int)kMaxDims, (int)num_dims);
+  }
+  if (stream != 0) {
+    return iree_make_status(
+        IREE_STATUS_UNIMPLEMENTED,
+        "importing a Metal device buffer with a stream is not implemented");
+  }
+
+  iree_hal_element_type_t element_type;
+  IREE_RETURN_IF_ERROR(
+      PJRTApiConverter::MapBufferTypeToElementType(type, &element_type));
+  if (!iree_hal_element_is_byte_aligned(element_type)) {
+    return iree_make_status(
+        IREE_STATUS_UNIMPLEMENTED,
+        "sub-byte device buffer element types cannot be imported");
+  }
+  iree_device_size_t element_byte_size =
+      iree_hal_element_dense_byte_count(element_type);
+
+  // IREE buffer views currently represent dense row-major tensors. Reject
+  // layouts that would silently reinterpret the imported allocation.
+  if (layout && layout->type == PJRT_Buffer_MemoryLayout_Type_Tiled) {
+    if (layout->tiled.minor_to_major_size != num_dims ||
+        layout->tiled.num_tiles != 0) {
+      return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
+                              "tiled device buffer layout is not supported");
+    }
+    for (size_t i = 0; i < num_dims; ++i) {
+      if (layout->tiled.minor_to_major[i] !=
+          static_cast<int64_t>(num_dims - i - 1)) {
+        return iree_make_status(
+            IREE_STATUS_UNIMPLEMENTED,
+            "non-row-major device buffer layout is not supported");
+      }
+    }
+  } else if (layout &&
+             layout->type == PJRT_Buffer_MemoryLayout_Type_Strides) {
+    if (layout->strides.num_byte_strides != num_dims) {
+      return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                              "device buffer strides must match its rank");
+    }
+    int64_t expected_stride = static_cast<int64_t>(element_byte_size);
+    for (size_t i = num_dims; i > 0; --i) {
+      size_t dim_index = i - 1;
+      if (layout->strides.byte_strides[dim_index] != expected_stride) {
+        return iree_make_status(
+            IREE_STATUS_UNIMPLEMENTED,
+            "non-row-major device buffer strides are not supported");
+      }
+      if (dims[dim_index] < 0 ||
+          (dims[dim_index] != 0 &&
+           expected_stride > std::numeric_limits<int64_t>::max() /
+                                 dims[dim_index])) {
+        return iree_make_status(IREE_STATUS_OUT_OF_RANGE,
+                                "device buffer shape is too large");
+      }
+      expected_stride *= dims[dim_index];
+    }
+  } else if (layout &&
+             layout->type != PJRT_Buffer_MemoryLayout_Type_Tiled) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "unknown device buffer layout type");
+  }
+
+  std::array<iree_hal_dim_t, kMaxDims> shape;
+  iree_device_size_t byte_length = element_byte_size;
+  for (size_t i = 0; i < num_dims; ++i) {
+    if (dims[i] < 0) {
+      return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                              "device buffer dimensions must be nonnegative");
+    }
+    if (dims[i] != 0 &&
+        byte_length > std::numeric_limits<iree_device_size_t>::max() /
+                          static_cast<iree_device_size_t>(dims[i])) {
+      return iree_make_status(IREE_STATUS_OUT_OF_RANGE,
+                              "device buffer shape is too large");
+    }
+    byte_length *= static_cast<iree_device_size_t>(dims[i]);
+    shape[i] = static_cast<iree_hal_dim_t>(dims[i]);
+  }
+
+  iree_hal_external_buffer_t external_buffer;
+  memset(&external_buffer, 0, sizeof(external_buffer));
+  external_buffer.type = IREE_HAL_EXTERNAL_BUFFER_TYPE_DEVICE_ALLOCATION;
+  external_buffer.flags = IREE_HAL_EXTERNAL_BUFFER_FLAG_NONE;
+  external_buffer.size = byte_length;
+  external_buffer.handle.device_allocation.ptr =
+      static_cast<uint64_t>(reinterpret_cast<uintptr_t>(device_buffer_ptr));
+
+  std::unique_ptr<ExternalDeviceBufferRelease> release;
+  iree_hal_buffer_release_callback_t release_callback =
+      iree_hal_buffer_release_callback_null();
+  if (on_delete_callback) {
+    release = std::make_unique<ExternalDeviceBufferRelease>(
+        ExternalDeviceBufferRelease{device_buffer_ptr, on_delete_callback,
+                                    on_delete_callback_arg});
+    release_callback.fn = ReleaseExternalDeviceBuffer;
+    release_callback.user_data = release.get();
+  }
+
+  iree_hal_buffer_params_t params;
+  memset(&params, 0, sizeof(params));
+  params.type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL;
+  params.access = IREE_HAL_MEMORY_ACCESS_ALL;
+  params.usage = IREE_HAL_BUFFER_USAGE_DEFAULT;
+  iree::vm::ref<iree_hal_buffer_t> buffer;
+  IREE_RETURN_IF_ERROR(iree_hal_allocator_import_buffer(
+      device_allocator(), params, &external_buffer, release_callback,
+      &buffer));
+  release.release();
+
+  iree::vm::ref<iree_hal_buffer_view_t> buffer_view;
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_view_create(
+      buffer.get(), num_dims, shape.data(), element_type,
+      IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR, client_.host_allocator(),
+      &buffer_view));
+  *out_buffer = new BufferInstance(*this, std::move(buffer_view));
+  return iree_ok_status();
+}
+
 iree_status_t DeviceInstance::AcquireHostStagingBuffer(
     iree_const_byte_span_t initial_contents, bool snapshot_initial_contents_now,
     bool* initial_contents_snapshotted, iree_hal_buffer_t** out_buffer) {
@@ -1396,6 +1913,20 @@ void ClientInstance::BindApi(PJRT_Api* api) {
     args->device = *devices[id_as_size];
     return nullptr;
   };
+  api->PJRT_Client_LookupAddressableDevice =
+      +[](PJRT_Client_LookupAddressableDevice_Args* args) -> PJRT_Error* {
+    auto& devices = ClientInstance::Unwrap(args->client)->addressable_devices();
+    for (auto* device : devices) {
+      if (device->local_hardware_id() == args->local_hardware_id) {
+        args->addressable_device = *device;
+        return nullptr;
+      }
+    }
+    return MakeError(iree_make_status(
+        IREE_STATUS_OUT_OF_RANGE,
+        "local hardware id %d does not name an addressable device",
+        args->local_hardware_id));
+  };
   api->PJRT_Client_AddressableMemories =
       +[](PJRT_Client_AddressableMemories_Args* args) -> PJRT_Error* {
     const auto& memories = ClientInstance::Unwrap(args->client)->memories();
@@ -1438,6 +1969,24 @@ void ClientInstance::BindApi(PJRT_Api* api) {
     }
     return nullptr;
   };
+  api->PJRT_Client_DmaMap =
+      +[](PJRT_Client_DmaMap_Args* args) -> PJRT_Error* {
+    // Metal's unified memory model does not require explicit host DMA
+    // registration, but validate the range so the no-op is deterministic.
+    if (args->size != 0 && !args->data) {
+      return MakeError(iree_make_status(
+          IREE_STATUS_INVALID_ARGUMENT, "DMA mapping data must not be null"));
+    }
+    return nullptr;
+  };
+  api->PJRT_Client_DmaUnmap =
+      +[](PJRT_Client_DmaUnmap_Args* args) -> PJRT_Error* {
+    if (!args->data) {
+      return MakeError(iree_make_status(
+          IREE_STATUS_INVALID_ARGUMENT, "DMA unmapping data must not be null"));
+    }
+    return nullptr;
+  };
   api->PJRT_Client_BufferFromHostBuffer =
       +[](PJRT_Client_BufferFromHostBuffer_Args* args) -> PJRT_Error* {
     IREE_TRACE_SCOPE_NAMED("PJRT_Client_BufferFromHostBuffer");
@@ -1450,10 +1999,24 @@ void ClientInstance::BindApi(PJRT_Api* api) {
         reinterpret_cast<BufferInstance**>(&args->buffer));
     return MakeError(status);
   };
-  api->PJRT_LoadedExecutable_Fingerprint =
-      +[](PJRT_LoadedExecutable_Fingerprint_Args* args) -> PJRT_Error* {
-    return MakeError(iree_make_status(IREE_STATUS_UNIMPLEMENTED,
-                                      "PJRT_LoadedExecutable_Fingerprint"));
+  api->PJRT_Client_CreateViewOfDeviceBuffer =
+      +[](PJRT_Client_CreateViewOfDeviceBuffer_Args* args) -> PJRT_Error* {
+    IREE_TRACE_SCOPE_NAMED("PJRT_Client_CreateViewOfDeviceBuffer");
+    DeviceInstance* device = nullptr;
+    if (args->memory) {
+      device = MemoryInstance::Unwrap(args->memory)->device();
+    } else if (args->device) {
+      device = DeviceInstance::Unwrap(args->device);
+    } else {
+      return MakeError(iree_make_status(
+          IREE_STATUS_INVALID_ARGUMENT,
+          "device or memory is required for a device buffer view"));
+    }
+    return MakeError(device->CreateViewOfDeviceBuffer(
+        args->device_buffer_ptr, args->element_type, args->dims,
+        args->num_dims, args->layout, args->stream,
+        args->on_delete_callback, args->on_delete_callback_arg,
+        reinterpret_cast<BufferInstance**>(&args->buffer)));
   };
 }
 
@@ -1772,8 +2335,7 @@ void EventInstance::BindApi(PJRT_Api* api) {
   };
   api->PJRT_Event_Await = +[](PJRT_Event_Await_Args* args) -> PJRT_Error* {
     IREE_TRACE_SCOPE_NAMED("PJRT_Event_Await");
-    return MakeError(
-        iree_make_status(IREE_STATUS_UNIMPLEMENTED, "PJRT_Event_Await"));
+    return MakeError(EventInstance::Unwrap(args->event)->Await());
   };
   api->PJRT_Event_OnReady = +[](PJRT_Event_OnReady_Args* args) -> PJRT_Error* {
     IREE_TRACE_SCOPE_NAMED("PJRT_Event_OnReady");
@@ -1784,12 +2346,20 @@ void EventInstance::BindApi(PJRT_Api* api) {
 
 ErrorInstance* EventInstance::error() {
   std::lock_guard<std::mutex> guard(lock_);
-  if (!iree_status_is_ok(status_)) return new ErrorInstance(status_);
+  if (!iree_status_is_ok(status_)) {
+    return new ErrorInstance(iree_status_clone(status_));
+  }
   return nullptr;
 }
 bool EventInstance::is_ready() {
   std::lock_guard<std::mutex> guard(lock_);
   return is_ready_;
+}
+
+iree_status_t EventInstance::Await() {
+  std::unique_lock<std::mutex> lock(lock_);
+  ready_condition_.wait(lock, [this] { return is_ready_; });
+  return iree_status_clone(status_);
 }
 
 iree_status_t EventInstance::OnReady(PJRT_Event_OnReadyCallback callback,
@@ -1829,6 +2399,7 @@ void EventInstance::SignalReady(iree_status_t status) {
     status_ = status;
     local_status = status_;
   }
+  ready_condition_.notify_all();
 
   // Trigger callbacks outside of the lock.
   // Note that the callback may destroy the event - so must only operate on
@@ -1870,6 +2441,17 @@ void ExecutableImage::BindApi(PJRT_Api* api) {
         ExecutableImage::Unwrap(args->executable)->binary->GetDataSize();
     return nullptr;
   };
+  api->PJRT_Executable_Fingerprint =
+      +[](PJRT_Executable_Fingerprint_Args* args) -> PJRT_Error* {
+    auto* executable = ExecutableImage::Unwrap(args->executable);
+    if (executable->fingerprint_.empty()) {
+      executable->fingerprint_ =
+          FingerprintCompilerOutput(*executable->binary);
+    }
+    args->executable_fingerprint = executable->fingerprint_.data();
+    args->executable_fingerprint_size = executable->fingerprint_.size();
+    return nullptr;
+  };
   api->PJRT_Executable_NumOutputs =
       +[](PJRT_Executable_NumOutputs_Args* args) -> PJRT_Error* {
     IREE_TRACE_SCOPE_NAMED("PJRT_Executable_NumOutputs");
@@ -1892,18 +2474,37 @@ void ExecutableImage::BindApi(PJRT_Api* api) {
   };
   api->PJRT_Executable_Serialize =
       +[](PJRT_Executable_Serialize_Args* args) -> PJRT_Error* {
-    return MakeError(iree_make_status(IREE_STATUS_UNIMPLEMENTED,
-                                      "PJRT_Executable_Serialize"));
+    auto* executable = ExecutableImage::Unwrap(
+        const_cast<PJRT_Executable*>(args->executable));
+    auto* storage = new SerializedExecutableStorage(*executable->binary);
+    args->serialized_bytes = storage->bytes.data();
+    args->serialized_bytes_size = storage->bytes.size();
+    args->serialized_executable =
+        reinterpret_cast<PJRT_SerializedExecutable*>(storage);
+    args->serialized_executable_deleter =
+        +[](PJRT_SerializedExecutable* serialized_executable) {
+      delete reinterpret_cast<SerializedExecutableStorage*>(
+          serialized_executable);
+    };
+    return nullptr;
   };
   api->PJRT_Executable_DeserializeAndLoad =
       +[](PJRT_Executable_DeserializeAndLoad_Args* args) -> PJRT_Error* {
-    return MakeError(iree_make_status(IREE_STATUS_UNIMPLEMENTED,
-                                      "PJRT_Executable_DeserializeAndLoad"));
-  };
-  api->PJRT_Executable_Serialize =
-      +[](PJRT_Executable_Serialize_Args* args) -> PJRT_Error* {
-    return MakeError(iree_make_status(IREE_STATUS_UNIMPLEMENTED,
-                                      "PJRT_Executable_Serialize"));
+    if (!args->serialized_executable ||
+        args->serialized_executable_size == 0) {
+      return MakeError(iree_make_status(
+          IREE_STATUS_INVALID_ARGUMENT, "serialized executable is empty"));
+    }
+    auto* client = ClientInstance::Unwrap(args->client);
+    auto output = std::make_unique<InMemoryCompilerOutput>(
+        args->serialized_executable, args->serialized_executable_size);
+    auto executable = std::make_unique<LoadedExecutableInstance>(
+        *client, new ExecutableImage(std::move(output), /*code=*/""),
+        client->addressable_devices());
+    iree_status_t status = executable->LoadAll();
+    if (!iree_status_is_ok(status)) return MakeError(status);
+    args->loaded_executable = *executable.release();
+    return nullptr;
   };
   api->PJRT_Executable_OptimizedProgram =
       +[](PJRT_Executable_OptimizedProgram_Args* args) -> PJRT_Error* {
@@ -1928,23 +2529,49 @@ void ExecutableImage::BindApi(PJRT_Api* api) {
   };
   api->PJRT_Executable_GetCostAnalysis =
       +[](PJRT_Executable_GetCostAnalysis_Args* args) -> PJRT_Error* {
-    return MakeError(iree_make_status(IREE_STATUS_UNIMPLEMENTED,
-                                      "PJRT_Executable_GetCostAnalysis"));
+    auto* executable = ExecutableImage::Unwrap(args->executable);
+    args->num_properties = executable->cost_properties.size();
+    args->properties = executable->cost_properties.data();
+    return nullptr;
+  };
+  api->PJRT_Executable_GetCompiledMemoryStats =
+      +[](PJRT_Executable_GetCompiledMemoryStats_Args* args) -> PJRT_Error* {
+    auto* executable = ExecutableImage::Unwrap(args->executable);
+    args->generated_code_size_in_bytes =
+        static_cast<int64_t>(executable->binary->GetDataSize());
+    args->argument_size_in_bytes = executable->argument_size_in_bytes;
+    args->output_size_in_bytes = executable->output_size_in_bytes;
+    args->alias_size_in_bytes = executable->alias_size_in_bytes;
+    args->temp_size_in_bytes = 0;
+    args->host_generated_code_size_in_bytes = 0;
+    args->host_argument_size_in_bytes = 0;
+    args->host_output_size_in_bytes = 0;
+    args->host_alias_size_in_bytes = 0;
+    args->host_temp_size_in_bytes = 0;
+    return nullptr;
   };
   api->PJRT_Executable_OutputElementTypes =
       +[](PJRT_Executable_OutputElementTypes_Args* args) -> PJRT_Error* {
-    return MakeError(iree_make_status(IREE_STATUS_UNIMPLEMENTED,
-                                      "PJRT_Executable_OutputElementTypes"));
+    auto* executable = ExecutableImage::Unwrap(args->executable);
+    args->output_types = executable->output_types.data();
+    args->num_output_types = executable->output_types.size();
+    return nullptr;
   };
   api->PJRT_Executable_OutputDimensions =
       +[](PJRT_Executable_OutputDimensions_Args* args) -> PJRT_Error* {
-    return MakeError(iree_make_status(IREE_STATUS_UNIMPLEMENTED,
-                                      "PJRT_Executable_OutputDimensions"));
+    auto* executable = ExecutableImage::Unwrap(args->executable);
+    args->num_outputs = executable->output_dim_sizes.size();
+    args->dims = executable->output_dims.data();
+    args->dim_sizes = executable->output_dim_sizes.data();
+    return nullptr;
   };
   api->PJRT_Executable_OutputMemoryKinds =
       +[](PJRT_Executable_OutputMemoryKinds_Args* args) -> PJRT_Error* {
-    return MakeError(iree_make_status(IREE_STATUS_UNIMPLEMENTED,
-                                      "PJRT_Executable_OutputMemoryKinds"));
+    auto* executable = ExecutableImage::Unwrap(args->executable);
+    args->num_outputs = executable->output_memory_kinds.size();
+    args->memory_kinds = executable->output_memory_kinds.data();
+    args->memory_kind_sizes = executable->output_memory_kind_sizes.data();
+    return nullptr;
   };
 }
 
@@ -1967,14 +2594,15 @@ void LoadedExecutableInstance::BindApi(PJRT_Api* api) {
   api->PJRT_LoadedExecutable_Delete =
       +[](PJRT_LoadedExecutable_Delete_Args* args) -> PJRT_Error* {
     IREE_TRACE_SCOPE_NAMED("PJRT_LoadedExecutable_Delete");
-    return MakeError(iree_make_status(IREE_STATUS_UNIMPLEMENTED,
-                                      "PJRT_LoadedExecutable_Delete"));
+    return MakeError(
+        LoadedExecutableInstance::Unwrap(args->executable)->Delete());
   };
   api->PJRT_LoadedExecutable_IsDeleted =
       +[](PJRT_LoadedExecutable_IsDeleted_Args* args) -> PJRT_Error* {
     IREE_TRACE_SCOPE_NAMED("PJRT_LoadedExecutable_IsDeleted");
-    return MakeError(iree_make_status(IREE_STATUS_UNIMPLEMENTED,
-                                      "PJRT_LoadedExecutable_IsDeleted"));
+    args->is_deleted =
+        LoadedExecutableInstance::Unwrap(args->executable)->is_deleted();
+    return nullptr;
   };
   api->PJRT_LoadedExecutable_Execute =
       +[](PJRT_LoadedExecutable_Execute_Args* args) -> PJRT_Error* {
@@ -2001,10 +2629,26 @@ void LoadedExecutableInstance::BindApi(PJRT_Api* api) {
     args->executable = *image;
     return nullptr;
   };
+  api->PJRT_LoadedExecutable_Fingerprint =
+      +[](PJRT_LoadedExecutable_Fingerprint_Args* args) -> PJRT_Error* {
+    auto* loaded = LoadedExecutableInstance::Unwrap(args->executable);
+    if (loaded->image_->fingerprint_.empty()) {
+      loaded->image_->fingerprint_ =
+          FingerprintCompilerOutput(*loaded->image_->binary);
+    }
+    args->executable_fingerprint = loaded->image_->fingerprint_.data();
+    args->executable_fingerprint_size =
+        loaded->image_->fingerprint_.size();
+    return nullptr;
+  };
 }
 
 iree_status_t LoadedExecutableInstance::LoadAll() {
   IREE_TRACE_SCOPE();
+  if (is_deleted()) {
+    return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
+                            "loaded executable has been deleted");
+  }
   if (!resident_executables_.empty()) return iree_ok_status();
 
   std::vector<ResidentExecutable> new_list;
@@ -2036,6 +2680,94 @@ iree_status_t LoadedExecutableInstance::LoadAll() {
         iree_vm_function_signature(&loaded.main_function);
     IREE_RETURN_IF_ERROR(iree_vm_function_call_count_arguments_and_results(
         &sig, &loaded.arg_count, &loaded.result_count));
+
+    // The compiler records source-level input/output aliases in a compact
+    // reflection attribute. PJRT uses this to retire donated input wrappers;
+    // the physical result allocation is allowed to differ from the input.
+    loaded.output_aliases.assign(loaded.result_count, -1);
+    iree_string_view_t aliases = iree_vm_function_lookup_attr_by_name(
+        &loaded.main_function, IREE_SV("iree.abi.output_aliases"));
+    while (!iree_string_view_is_empty(aliases)) {
+      iree_string_view_t pair;
+      iree_string_view_t remaining;
+      iree_string_view_split(aliases, ',', &pair, &remaining);
+      aliases = remaining;
+
+      iree_string_view_t result_text;
+      iree_string_view_t argument_text;
+      if (iree_string_view_split(pair, ':', &result_text, &argument_text) < 0) {
+        return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                                "malformed iree.abi.output_aliases metadata");
+      }
+      int64_t result_index = -1;
+      int64_t argument_index = -1;
+      if (!iree_string_view_atoi_int64(result_text, &result_index) ||
+          !iree_string_view_atoi_int64(argument_text, &argument_index) ||
+          result_index < 0 ||
+          result_index >= static_cast<int64_t>(loaded.result_count) ||
+          argument_index < 0 ||
+          argument_index >= static_cast<int64_t>(loaded.arg_count)) {
+        return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                                "invalid iree.abi.output_aliases metadata");
+      }
+      loaded.output_aliases[result_index] = argument_index;
+    }
+
+    if (!image_->metadata_initialized) {
+      image_->arg_count = loaded.arg_count;
+      image_->result_count = loaded.result_count;
+      image_->argument_size_in_bytes = 0;
+      image_->output_size_in_bytes = 0;
+      image_->alias_size_in_bytes = 0;
+
+      iree_string_view_t declaration_attr = iree_vm_function_lookup_attr_by_name(
+          &loaded.main_function, IREE_SV("iree.abi.declaration"));
+      std::string_view declaration(declaration_attr.data,
+                                   declaration_attr.size);
+      auto arguments = FunctionValueList(declaration, /*results=*/false);
+      if (arguments) {
+        for (std::string_view argument : SplitFunctionValues(*arguments)) {
+          auto metadata = ParseTensorMetadata(argument);
+          if (metadata) {
+            image_->argument_size_in_bytes += metadata->size_in_bytes;
+          }
+        }
+      }
+      std::vector<int64_t> result_sizes;
+      auto results = FunctionValueList(declaration, /*results=*/true);
+      if (results) {
+        for (std::string_view result : SplitFunctionValues(*results)) {
+          auto metadata = ParseTensorMetadata(result);
+          if (!metadata) continue;
+          image_->output_types.push_back(metadata->element_type);
+          image_->output_dim_sizes.push_back(metadata->dims.size());
+          image_->output_dims.insert(image_->output_dims.end(),
+                                     metadata->dims.begin(),
+                                     metadata->dims.end());
+          image_->output_memory_kinds.push_back(kDeviceMemoryKind.data());
+          image_->output_memory_kind_sizes.push_back(kDeviceMemoryKind.size());
+          image_->output_size_in_bytes += metadata->size_in_bytes;
+          result_sizes.push_back(metadata->size_in_bytes);
+        }
+      }
+      for (size_t i = 0; i < loaded.output_aliases.size() &&
+                         i < result_sizes.size(); ++i) {
+        if (loaded.output_aliases[i] >= 0) {
+          image_->alias_size_in_bytes += result_sizes[i];
+        }
+      }
+      image_->cost_properties = {
+          MakeInt64Property("generated_code_size_in_bytes",
+                            static_cast<int64_t>(image_->binary->GetDataSize())),
+          MakeInt64Property("argument_size_in_bytes",
+                            image_->argument_size_in_bytes),
+          MakeInt64Property("output_size_in_bytes",
+                            image_->output_size_in_bytes),
+          MakeInt64Property("alias_size_in_bytes",
+                            image_->alias_size_in_bytes),
+      };
+      image_->metadata_initialized = true;
+    }
 
     // Defer to the client to populate the stack of modules.
     std::vector<iree::vm::ref<iree_vm_module_t>> modules;
@@ -2078,20 +2810,42 @@ iree_status_t LoadedExecutableInstance::GetArgResultCount(
 
 iree_status_t LoadedExecutableInstance::BatchExecute(
     PJRT_LoadedExecutable_Execute_Args* args) {
-  // Early exit for unsupported features and illegal input.
-  if (args->execute_device) {
-    return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
-                            "executing with a specific device not supported");
+  if (is_deleted()) {
+    return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
+                            "loaded executable has been deleted");
   }
-  if (args->num_devices != addressable_devices_.size()) {
+  // Make sure loaded before resolving a requested device.
+  IREE_RETURN_IF_ERROR(LoadAll());
+
+  std::vector<ResidentExecutable*> selected_executables;
+  if (args->execute_device) {
+    if (args->num_devices != 1) {
+      return iree_make_status(
+          IREE_STATUS_INVALID_ARGUMENT,
+          "specific-device execution requires exactly one device");
+    }
+    auto* requested_device = DeviceInstance::Unwrap(args->execute_device);
+    for (auto& resident : resident_executables_) {
+      if (resident.device_instance == requested_device) {
+        selected_executables.push_back(&resident);
+        break;
+      }
+    }
+    if (selected_executables.empty()) {
+      return iree_make_status(
+          IREE_STATUS_INVALID_ARGUMENT,
+          "requested device is not addressable by this executable");
+    }
+  } else if (args->num_devices != addressable_devices_.size()) {
     return iree_make_status(
         IREE_STATUS_INVALID_ARGUMENT,
         "incorrect number of devices to execute on (%d vs %d)",
         (int)args->num_devices, (int)addressable_devices_.size());
+  } else {
+    for (auto& resident : resident_executables_) {
+      selected_executables.push_back(&resident);
+    }
   }
-
-  // Make sure loaded.
-  IREE_RETURN_IF_ERROR(LoadAll());
 
   // Timeline setup. There are two timelines that we synchronize to:
   // the main execution timeline, which preserves as-called ordering to
@@ -2100,7 +2854,6 @@ iree_status_t LoadedExecutableInstance::BatchExecute(
 
   // Initialize invocations.
   auto allocator = client_.host_allocator();
-  auto& resident_executables_ecs = resident_executables_;
   struct Invocation {
     ResidentExecutable* res_exe;
     iree::vm::ref<iree_vm_list_t> inputs;
@@ -2112,7 +2865,7 @@ iree_status_t LoadedExecutableInstance::BatchExecute(
   invs.resize(args->num_devices);
   for (size_t dev_index = 0; dev_index < args->num_devices; ++dev_index) {
     auto& inv = invs[dev_index];
-    inv.res_exe = &resident_executables_ecs[dev_index];
+    inv.res_exe = selected_executables[dev_index];
 
     // Wait fence initial value.
     // We allocate it to be able to hold two semaphores (main timeline and
@@ -2204,12 +2957,54 @@ iree_status_t LoadedExecutableInstance::BatchExecute(
   if (!iree_status_is_ok(status)) return status;
   for (size_t dev_index = 0; dev_index < args->num_devices; ++dev_index) {
     auto& inv = invs[dev_index];
+    std::vector<BufferInstance*> donated_buffers;
     for (size_t i = 0; i < inv.res_exe->result_count; ++i) {
       iree::vm::ref<iree_hal_buffer_view_t> ret_buffer_view =
           retain_ref((iree_hal_buffer_view_t*)iree_vm_list_get_ref_deref(
               inv.outputs.get(), i, iree_hal_buffer_view_type()));
       // This should not be possible so just hard-assert.
       IREE_ASSERT_ARGUMENT(ret_buffer_view);
+
+      // JAX represents donation by compiling an input/output alias and then
+      // omitting that input from non_donatable_input_indices at execution.
+      // The compiler reflects that alias independently of physical allocation
+      // reuse, which is optional and cannot be inferred from opaque pointers.
+      auto is_non_donatable = [&](size_t arg_index) {
+        if (!args->options) return false;
+        for (size_t j = 0;
+             j < args->options->num_non_donatable_input_indices; ++j) {
+          if (args->options->non_donatable_input_indices[j] ==
+              static_cast<int64_t>(arg_index)) {
+            return true;
+          }
+        }
+        return false;
+      };
+      int64_t alias_arg_index = inv.res_exe->output_aliases[i];
+      if (alias_arg_index >= 0) {
+        size_t arg_index = static_cast<size_t>(alias_arg_index);
+        auto* input_buffer =
+            BufferInstance::Unwrap(args->argument_lists[dev_index][arg_index]);
+        if (!is_non_donatable(arg_index)) {
+          // If the same PJRT buffer occurs at a non-donatable argument index,
+          // preserve it regardless of which occurrence supplied the alias.
+          bool preserve_input = false;
+          for (size_t other_index = 0; other_index < args->num_args;
+               ++other_index) {
+            preserve_input |=
+                is_non_donatable(other_index) &&
+                BufferInstance::Unwrap(
+                    args->argument_lists[dev_index][other_index]) ==
+                    input_buffer;
+          }
+          if (!preserve_input &&
+              std::find(donated_buffers.begin(), donated_buffers.end(),
+                        input_buffer) == donated_buffers.end()) {
+            donated_buffers.push_back(input_buffer);
+          }
+        }
+      }
+
       auto result_buffer = std::make_unique<BufferInstance>(
           *inv.res_exe->device_instance, std::move(ret_buffer_view));
       IREE_RETURN_IF_ERROR(result_buffer->AdvanceReadyFence(
@@ -2219,6 +3014,10 @@ iree_status_t LoadedExecutableInstance::BatchExecute(
       args->output_lists[dev_index][i] = *(result_buffer.release());
     }
 
+    for (auto* donated_buffer : donated_buffers) {
+      IREE_RETURN_IF_ERROR(donated_buffer->Delete());
+    }
+
     if (args->device_complete_events) {
       args->device_complete_events[dev_index] =
           *(new EventInstance(retain_ref(inv.signal_fence)));
@@ -2226,6 +3025,12 @@ iree_status_t LoadedExecutableInstance::BatchExecute(
   }
 
   return status;
+}
+
+iree_status_t LoadedExecutableInstance::Delete() {
+  if (is_deleted_.exchange(true)) return iree_ok_status();
+  resident_executables_.clear();
+  return iree_ok_status();
 }
 
 static void BindUndefineds(PJRT_Api* api) {
@@ -2264,6 +3069,18 @@ void BindMonomorphicApi(PJRT_Api* api) {
   };
   api->PJRT_Plugin_Initialize =
       +[](PJRT_Plugin_Initialize_Args* args) -> PJRT_Error* { return nullptr; };
+  api->PJRT_ExecuteContext_Create =
+      +[](PJRT_ExecuteContext_Create_Args* args) -> PJRT_Error* {
+    // The base IREE plugin has no execute-context payloads yet, but returning
+    // a distinct opaque token lets callers use the standard lifecycle.
+    args->context = reinterpret_cast<PJRT_ExecuteContext*>(new uint8_t(0));
+    return nullptr;
+  };
+  api->PJRT_ExecuteContext_Destroy =
+      +[](PJRT_ExecuteContext_Destroy_Args* args) -> PJRT_Error* {
+    delete reinterpret_cast<uint8_t*>(args->context);
+    return nullptr;
+  };
 
   // Bind by object types.
   BufferInstance::BindApi(api);
