@@ -33,15 +33,10 @@ _PREVIEW_FEATURE_GATES = (
     "IREE_METAL_MSL4_VIT_FFN_REDUCTION",
     "IREE_METAL_MSL4_VIT_FFN_RECONSTRUCT_EPILOGUE",
     "IREE_METAL_MSL4_VIT_GELU_SAVED_COMPACT",
-    "IREE_METAL_MSL4_VIT_RAW_PAD_MATMUL",
     "IREE_METAL_MSL4_VIT_STATIC_SLICES",
     "IREE_METAL_NATIVE_EXP",
     "IREE_METAL_SCATTER_WINDOW_WORKGROUPS",
     "IREE_METAL_SPLIT_RESOURCE_ONLY",
-    "IREE_METAL_VIT_DEAD_ATTN_PAD_FILL",
-    "IREE_METAL_VIT_DEAD_ATTN_SCRATCH_PAD_FILL",
-    "IREE_METAL_VIT_DEAD_QKV_PAD_FILL",
-    "IREE_METAL_VIT_DEAD_ROW_PAD_FILL",
     "IREE_METAL_VIT_FFN18_DIRECT_COOP",
     "IREE_METAL_VIT_FORWARD_LARGE_FFN_COPY",
     "IREE_METAL_VIT_FORWARD_LARGE_FFN_TRANSPOSE",
@@ -49,6 +44,20 @@ _PREVIEW_FEATURE_GATES = (
     "IREE_METAL_VIT_FUSED_GELU_OUTPUT",
     "IREE_METAL_VIT_POSITIONAL_SCATTER",
     "IREE_METAL_VIT_SIMDGROUP_TRANSPOSE",
+)
+# These exact-graph padding rewrites were validated against the JAX 0.6.1 ViT
+# lowering used by Preview 4. JAX 0.11.1 produces a different backward graph;
+# enabling the cluster there can silently corrupt unsampled gradients. Keep the
+# compiler experiments available for explicit developer opt-in, but never turn
+# them on from the current-JAX release profile.
+_LEGACY_VIT_PADDING_GATES = frozenset(
+    {
+        "IREE_METAL_MSL4_VIT_RAW_PAD_MATMUL",
+        "IREE_METAL_VIT_DEAD_ATTN_PAD_FILL",
+        "IREE_METAL_VIT_DEAD_ATTN_SCRATCH_PAD_FILL",
+        "IREE_METAL_VIT_DEAD_QKV_PAD_FILL",
+        "IREE_METAL_VIT_DEAD_ROW_PAD_FILL",
+    }
 )
 _PREVIEW_PARAMETER_DEFAULTS = {
     # Two stages improved every-model HF10 geometric mean while three stages

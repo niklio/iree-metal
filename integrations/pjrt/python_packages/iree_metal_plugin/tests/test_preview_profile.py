@@ -152,7 +152,6 @@ class PreviewProfileTest(unittest.TestCase):
                 "IREE_METAL_MSL4_VIT_FFN_REDUCTION",
                 "IREE_METAL_MSL4_VIT_FFN_RECONSTRUCT_EPILOGUE",
                 "IREE_METAL_MSL4_VIT_GELU_SAVED_COMPACT",
-                "IREE_METAL_MSL4_VIT_RAW_PAD_MATMUL",
                 "IREE_METAL_VIT_FFN18_DIRECT_COOP",
                 "IREE_METAL_VIT_POSITIONAL_SCATTER",
                 "IREE_METAL_VIT_SIMDGROUP_TRANSPOSE",
@@ -187,12 +186,22 @@ class PreviewProfileTest(unittest.TestCase):
             iree_metal._PREVIEW_PARAMETER_DEFAULTS,
         )
 
+    def test_preview_excludes_legacy_vit_padding_gates(self):
+        self.assertTrue(iree_metal._LEGACY_VIT_PADDING_GATES)
+        self.assertTrue(
+            iree_metal._LEGACY_VIT_PADDING_GATES.isdisjoint(
+                iree_metal._PREVIEW_FEATURE_GATES
+            )
+        )
+
     def test_preview_is_the_default(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             profile, options = iree_metal._configure_preview_profile()
             self.assertEqual(profile, iree_metal.PREVIEW_PROFILE)
             for name in iree_metal._PREVIEW_FEATURE_GATES:
                 self.assertEqual(os.environ[name], "1")
+            for name in iree_metal._LEGACY_VIT_PADDING_GATES:
+                self.assertNotIn(name, os.environ)
             self.assertEqual(os.environ["IREE_METAL_ATTN_PREFETCH_STAGES"], "2")
             self.assertIn("--iree-metal-compile-to-metallib=false", options)
             self.assertIn("--iree-dispatch-creation-fuse-multi-use=true", options)

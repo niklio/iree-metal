@@ -170,6 +170,21 @@ for wheel in wheels:
                     raise SystemExit(
                         f"plugin is missing packaged preview default: {fragment}"
                     )
+            legacy_vit_padding_gates = (
+                "IREE_METAL_MSL4_VIT_RAW_PAD_MATMUL",
+                "IREE_METAL_VIT_DEAD_ATTN_PAD_FILL",
+                "IREE_METAL_VIT_DEAD_ATTN_SCRATCH_PAD_FILL",
+                "IREE_METAL_VIT_DEAD_QKV_PAD_FILL",
+                "IREE_METAL_VIT_DEAD_ROW_PAD_FILL",
+            )
+            feature_gate_block = plugin_module.split(
+                "_PREVIEW_FEATURE_GATES = (", 1
+            )[1].split(")", 1)[0]
+            for gate in legacy_vit_padding_gates:
+                if f'"{gate}"' in feature_gate_block:
+                    raise SystemExit(
+                        f"unsafe current-JAX ViT gate is enabled by default: {gate}"
+                    )
 
 if seen != {"compiler", "plugin"}:
     raise SystemExit(f"incomplete wheel set: {seen}")
