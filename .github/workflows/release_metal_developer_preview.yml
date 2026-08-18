@@ -47,6 +47,13 @@ jobs:
           brew install ccache
           ccache --max-size "${CCACHE_MAXSIZE}"
 
+      - name: Install Python build and test dependencies
+        run: |
+          python3 -m pip install \
+            --disable-pip-version-check \
+            --require-hashes \
+            -r build_tools/iree_metal/requirements-build-macos-arm64-py312.txt
+
       - uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
         with:
           path: ~/Library/Caches/ccache
