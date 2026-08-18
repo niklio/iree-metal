@@ -160,6 +160,7 @@ for wheel in wheels:
                 '"IREE_METAL_MSL4_VIT_FFN_COMPACT_EPILOGUE"',
                 '"IREE_METAL_MSL4_VIT_GELU_SAVED_COMPACT"',
                 '"IREE_METAL_MSL4_VIT_PROJECTION_TILE": "128x32"',
+                '"IREE_METAL_SCATTER_SMALL_OUTPUT_WINDOW_TILE": "32"',
                 '"--iree-metal-compile-to-metallib=false"',
                 '"--iree-dispatch-creation-fuse-multi-use=true"',
                 '"--iree-dispatch-creation-enable-aggressive-fusion=true"',

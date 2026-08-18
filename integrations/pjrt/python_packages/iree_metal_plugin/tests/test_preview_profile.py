@@ -185,6 +185,12 @@ class PreviewProfileTest(unittest.TestCase):
             "IREE_METAL_SCATTER_WINDOW_TILE",
             iree_metal._PREVIEW_PARAMETER_DEFAULTS,
         )
+        self.assertEqual(
+            iree_metal._PREVIEW_PARAMETER_DEFAULTS[
+                "IREE_METAL_SCATTER_SMALL_OUTPUT_WINDOW_TILE"
+            ],
+            "32",
+        )
 
     def test_preview_excludes_legacy_vit_padding_gates(self):
         self.assertTrue(iree_metal._LEGACY_VIT_PADDING_GATES)
@@ -203,6 +209,9 @@ class PreviewProfileTest(unittest.TestCase):
             for name in iree_metal._LEGACY_VIT_PADDING_GATES:
                 self.assertNotIn(name, os.environ)
             self.assertEqual(os.environ["IREE_METAL_ATTN_PREFETCH_STAGES"], "2")
+            self.assertEqual(
+                os.environ["IREE_METAL_SCATTER_SMALL_OUTPUT_WINDOW_TILE"], "32"
+            )
             self.assertIn("--iree-metal-compile-to-metallib=false", options)
             self.assertIn("--iree-dispatch-creation-fuse-multi-use=true", options)
             self.assertIn(

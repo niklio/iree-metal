@@ -1543,12 +1543,20 @@ static LogicalResult setScatterOpConfig(IREE::GPU::TargetAttr target,
       // Preserve power-of-two thread tiles for subgroup distribution.
       windowTile = llvm::bit_floor(static_cast<uint64_t>(windowTile));
     }
-    // Experimental resource probe: the current Apple lowering promotes the
-    // index table but reads the tiled update columns directly from device
-    // memory. Permit an explicit window tile so final MSL resource accounting
-    // can validate wider tiles independently of the conservative tensor-level
-    // estimate above.
-    if (const char *value = getenv("IREE_METAL_SCATTER_WINDOW_TILE")) {
+    // Small-output embedding scatters in the model suite benefit from a full
+    // subgroup window. Do not apply that preview default to large output
+    // domains: the 50,257-row decoder-training scatter promotes enough of its
+    // [4096, 32] update tile to request 540 KiB of workgroup memory. Those
+    // large-vocabulary cases retain the resource-derived window above.
+    const char *value = getenv("IREE_METAL_SCATTER_WINDOW_TILE");
+    ArrayRef<int64_t> outputShape = op.getOutputType().getShape();
+    bool hasSmallStaticOutputDomain =
+        !outputShape.empty() && !ShapedType::isDynamic(outputShape.front()) &&
+        outputShape.front() <= 4096;
+    if (!value && hasSmallStaticOutputDomain) {
+      value = getenv("IREE_METAL_SCATTER_SMALL_OUTPUT_WINDOW_TILE");
+    }
+    if (value) {
       char *end = nullptr;
       long parsed = std::strtol(value, &end, 10);
       if (end != value && *end == '\0' && parsed > 0) {
