@@ -37,6 +37,9 @@ _PREVIEW_FEATURE_GATES = (
     "IREE_METAL_NATIVE_EXP",
     "IREE_METAL_SCATTER_WINDOW_WORKGROUPS",
     "IREE_METAL_SPLIT_RESOURCE_ONLY",
+    "IREE_METAL_VIT_DEAD_ATTN_PAD_FILL",
+    "IREE_METAL_VIT_DEAD_ATTN_SCRATCH_PAD_FILL",
+    "IREE_METAL_VIT_DEAD_QKV_PAD_FILL",
     "IREE_METAL_VIT_FFN18_DIRECT_COOP",
     "IREE_METAL_VIT_FORWARD_LARGE_FFN_COPY",
     "IREE_METAL_VIT_FORWARD_LARGE_FFN_TRANSPOSE",
@@ -47,15 +50,14 @@ _PREVIEW_FEATURE_GATES = (
 )
 # These exact-graph padding rewrites were validated against the JAX 0.6.1 ViT
 # lowering used by Preview 4. JAX 0.11.1 produces a different backward graph;
-# enabling the cluster there can silently corrupt unsampled gradients. Keep the
-# compiler experiments available for explicit developer opt-in, but never turn
-# them on from the current-JAX release profile.
+# the raw-pad matmul and dead-row-fill rewrites can silently corrupt unsampled
+# gradients there. Keep those two experiments available for explicit developer
+# opt-in, but never turn them on from the current-JAX release profile. The
+# attention-border, attention-scratch, and QKV fill eliminations above have
+# separately passed the current-JAX full-gradient and sustained replay checks.
 _LEGACY_VIT_PADDING_GATES = frozenset(
     {
         "IREE_METAL_MSL4_VIT_RAW_PAD_MATMUL",
-        "IREE_METAL_VIT_DEAD_ATTN_PAD_FILL",
-        "IREE_METAL_VIT_DEAD_ATTN_SCRATCH_PAD_FILL",
-        "IREE_METAL_VIT_DEAD_QKV_PAD_FILL",
         "IREE_METAL_VIT_DEAD_ROW_PAD_FILL",
     }
 )
@@ -73,9 +75,9 @@ _PREVIEW_PARAMETER_DEFAULTS = {
     "IREE_METAL_ATTN_PV_MN_TILE_SEED": "4",
     "IREE_METAL_ATTN_PV_K_TILE_SEED": "1",
     "IREE_METAL_VIT_POSITIONAL_SCATTER_WIDTH": "8",
-    # Use a full subgroup for small-domain scatter windows. The compiler keeps
-    # large-vocabulary scatters resource-derived so the 32 KiB Metal
-    # threadgroup-memory invariant still holds.
+    # Use a full subgroup for small-output scatters and bounded static BF16
+    # embedding gradients. Large/dynamic BF16 batches and large-output F32
+    # scatters remain resource-derived so the 32 KiB Metal invariant holds.
     "IREE_METAL_SCATTER_SMALL_OUTPUT_WINDOW_TILE": "32",
     # Amortize the remaining ViT gradient-layout kernel.
     "IREE_METAL_VIT_TRANSPOSE_HEAD_TILE": "2",

@@ -1543,17 +1543,24 @@ static LogicalResult setScatterOpConfig(IREE::GPU::TargetAttr target,
       // Preserve power-of-two thread tiles for subgroup distribution.
       windowTile = llvm::bit_floor(static_cast<uint64_t>(windowTile));
     }
-    // Small-output embedding scatters in the model suite benefit from a full
-    // subgroup window. Do not apply that preview default to large output
-    // domains: the 50,257-row decoder-training scatter promotes enough of its
-    // [4096, 32] update tile to request 540 KiB of workgroup memory. Those
-    // large-vocabulary cases retain the resource-derived window above.
+    // Small-output scatters and bounded BF16 embedding gradients benefit from
+    // a full subgroup window. The latter is limited to a fully static 4,096
+    // element batch, matching the largest sustained model configuration that
+    // survives final Metal resource accounting. Do not extend the BF16 rule
+    // to F32: the 50,257-row decoder-training scatter promotes its [4096, 32]
+    // F32 update tile and requests 540 KiB of workgroup memory. Larger or
+    // dynamic BF16 batches and large-output F32 cases retain the
+    // resource-derived window above.
     const char *value = getenv("IREE_METAL_SCATTER_WINDOW_TILE");
     ArrayRef<int64_t> outputShape = op.getOriginalType().getShape();
     bool hasSmallStaticOutputDomain =
         !outputShape.empty() && !ShapedType::isDynamic(outputShape.front()) &&
         outputShape.front() <= 4096;
-    if (!value && hasSmallStaticOutputDomain) {
+    bool hasBoundedStaticBF16Batch =
+        !hasDynamicBatch && batchElements <= 4096 &&
+        op.getUpdateType().getElementType().isBF16();
+    if (!value &&
+        (hasSmallStaticOutputDomain || hasBoundedStaticBF16Batch)) {
       value = getenv("IREE_METAL_SCATTER_SMALL_OUTPUT_WINDOW_TILE");
     }
     if (value) {

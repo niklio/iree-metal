@@ -161,6 +161,9 @@ for wheel in wheels:
                 '"IREE_METAL_MSL4_VIT_GELU_SAVED_COMPACT"',
                 '"IREE_METAL_MSL4_VIT_PROJECTION_TILE": "128x32"',
                 '"IREE_METAL_SCATTER_SMALL_OUTPUT_WINDOW_TILE": "32"',
+                '"IREE_METAL_VIT_DEAD_ATTN_PAD_FILL"',
+                '"IREE_METAL_VIT_DEAD_ATTN_SCRATCH_PAD_FILL"',
+                '"IREE_METAL_VIT_DEAD_QKV_PAD_FILL"',
                 '"--iree-metal-compile-to-metallib=false"',
                 '"--iree-dispatch-creation-fuse-multi-use=true"',
                 '"--iree-dispatch-creation-enable-aggressive-fusion=true"',
@@ -173,9 +176,6 @@ for wheel in wheels:
                     )
             legacy_vit_padding_gates = (
                 "IREE_METAL_MSL4_VIT_RAW_PAD_MATMUL",
-                "IREE_METAL_VIT_DEAD_ATTN_PAD_FILL",
-                "IREE_METAL_VIT_DEAD_ATTN_SCRATCH_PAD_FILL",
-                "IREE_METAL_VIT_DEAD_QKV_PAD_FILL",
                 "IREE_METAL_VIT_DEAD_ROW_PAD_FILL",
             )
             feature_gate_block = plugin_module.split(

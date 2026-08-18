@@ -152,6 +152,9 @@ class PreviewProfileTest(unittest.TestCase):
                 "IREE_METAL_MSL4_VIT_FFN_REDUCTION",
                 "IREE_METAL_MSL4_VIT_FFN_RECONSTRUCT_EPILOGUE",
                 "IREE_METAL_MSL4_VIT_GELU_SAVED_COMPACT",
+                "IREE_METAL_VIT_DEAD_ATTN_PAD_FILL",
+                "IREE_METAL_VIT_DEAD_ATTN_SCRATCH_PAD_FILL",
+                "IREE_METAL_VIT_DEAD_QKV_PAD_FILL",
                 "IREE_METAL_VIT_FFN18_DIRECT_COOP",
                 "IREE_METAL_VIT_POSITIONAL_SCATTER",
                 "IREE_METAL_VIT_SIMDGROUP_TRANSPOSE",
@@ -193,7 +196,13 @@ class PreviewProfileTest(unittest.TestCase):
         )
 
     def test_preview_excludes_legacy_vit_padding_gates(self):
-        self.assertTrue(iree_metal._LEGACY_VIT_PADDING_GATES)
+        self.assertEqual(
+            iree_metal._LEGACY_VIT_PADDING_GATES,
+            {
+                "IREE_METAL_MSL4_VIT_RAW_PAD_MATMUL",
+                "IREE_METAL_VIT_DEAD_ROW_PAD_FILL",
+            },
+        )
         self.assertTrue(
             iree_metal._LEGACY_VIT_PADDING_GATES.isdisjoint(
                 iree_metal._PREVIEW_FEATURE_GATES
