@@ -1,0 +1,11 @@
+{
+  "name": "iree-metal-sourcey-docs",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "node scripts/prepare-build.mjs && doxygen Doxyfile && sourcey build -o dist && node scripts/fix-sourcey-links.mjs"
+  },
+  "devDependencies": {
+    "sourcey": "3.6.5"
+  }
+}

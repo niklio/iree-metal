@@ -1,0 +1,385 @@
+{
+  "schema": "frantic.sourcey_delivery_evidence.v1",
+  "summary": "Maintainer-grade Sourcey reference for the iree-metal compiler, Metal HAL runtime, and PJRT bridge, pinned to a public Apache-2.0 source revision and deployed on the maintainer's established domain.",
+  "public_url": "https://nikliolios.com/iree-metal/sourcey-docs/",
+  "report_url": "https://nikliolios.com/iree-metal/sourcey-docs/evidence/report.md",
+  "repository": {
+    "url": "https://github.com/niklio/iree-metal",
+    "upstream": "https://github.com/iree-org/iree",
+    "pinned_commit": "35a8adbfbafd0958c14a1797d710a5cb9559fd9a",
+    "commit_url": "https://github.com/niklio/iree-metal/commit/35a8adbfbafd0958c14a1797d710a5cb9559fd9a",
+    "commit_authored_at": "2026-08-06T11:47:54-04:00",
+    "maintained_at": "2026-08-18T15:39:15Z",
+    "license": "Apache-2.0",
+    "license_url": "https://github.com/niklio/iree-metal/blob/35a8adbfbafd0958c14a1797d710a5cb9559fd9a/LICENSE",
+    "source_files_in_scope": 64
+  },
+  "hosting": {
+    "domain": "nikliolios.com",
+    "provider": "GitHub Pages",
+    "durable_project_path": "/iree-metal/sourcey-docs/",
+    "maintainer_context": "The parent portfolio already presents iree-metal as a maintained side project and links its public repository and PyPI package."
+  },
+  "adapter": {
+    "name": "Doxygen XML",
+    "language": "C/C++/Objective-C",
+    "sourcey_config_url": "https://nikliolios.com/iree-metal/sourcey-docs/evidence/source/sourcey.config.ts",
+    "doxygen_config_url": "https://nikliolios.com/iree-metal/sourcey-docs/evidence/source/Doxyfile",
+    "source_directories": [
+      "compiler/plugins/target/MetalSPIRV",
+      "runtime/src/iree/hal/drivers/metal",
+      "integrations/pjrt/src/iree_pjrt"
+    ]
+  },
+  "build": {
+    "runx_version_output": "runx-cli 0.9.0",
+    "sourcey_version": "3.6.5",
+    "doxygen_version": "1.18.0",
+    "command": "npm run build",
+    "expanded_command": "node scripts/prepare-build.mjs && doxygen Doxyfile && sourcey build -o dist && node scripts/fix-sourcey-links.mjs",
+    "package_json_url": "https://nikliolios.com/iree-metal/sourcey-docs/evidence/source/package.json",
+    "package_lock_url": "https://nikliolios.com/iree-metal/sourcey-docs/evidence/source/package-lock.json"
+  },
+  "receipt": {
+    "receipt_ref": "runx:receipt:sha256:92aac9e6694802bf4ef1f368c8fab6a673897e9978a3128b30e24c81d556ba6f",
+    "receipt_json_url": "https://nikliolios.com/iree-metal/sourcey-docs/evidence/runx-receipt.json",
+    "child_receipt_url": "https://nikliolios.com/iree-metal/sourcey-docs/evidence/runx-child-receipt.json",
+    "runner": "iree-metal-sourcey-validation/validate",
+    "signature_mode": "production",
+    "issuer_type": "ci"
+  },
+  "coverage": {
+    "sourcey_reported_pages": 63,
+    "html_entry_files": 64,
+    "api_entry_files": 60,
+    "total_generated_files": 133,
+    "search_records": 830,
+    "search_categories": {
+      "Enum Values": 5,
+      "Enums": 2,
+      "Functions": 222,
+      "Pages": 63,
+      "Sections": 439,
+      "Types": 1,
+      "Variables": 98
+    },
+    "page_list": [
+      {
+        "path": "api/iree-hal-cts.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-hal-cts.html"
+      },
+      {
+        "path": "api/iree-hal.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-hal.html"
+      },
+      {
+        "path": "api/iree-pjrt-044207261275173064033357022003351323210325015213.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-044207261275173064033357022003351323210325015213.html"
+      },
+      {
+        "path": "api/iree-pjrt-112136167023227231077267065160110313215126317254.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-112136167023227231077267065160110313215126317254.html"
+      },
+      {
+        "path": "api/iree-pjrt-113101273065004144106016212335126374242071156314.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-113101273065004144106016212335126374242071156314.html"
+      },
+      {
+        "path": "api/iree-pjrt-134260262264357143351231236025151024352002346125.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-134260262264357143351231236025151024352002346125.html"
+      },
+      {
+        "path": "api/iree-pjrt-171053275043171123015242043345231310372312341242.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-171053275043171123015242043345231310372312341242.html"
+      },
+      {
+        "path": "api/iree-pjrt-274330157337352160326204167026156112341161273214.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-274330157337352160326204167026156112341161273214.html"
+      },
+      {
+        "path": "api/iree-pjrt-343325324035202077300261257033026021045276233227.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-343325324035202077300261257033026021045276233227.html"
+      },
+      {
+        "path": "api/iree-pjrt-354223277321047165227022004147122107052244162371.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-354223277321047165227022004147122107052244162371.html"
+      },
+      {
+        "path": "api/iree-pjrt-AbstractCompiler.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-AbstractCompiler.html"
+      },
+      {
+        "path": "api/iree-pjrt-ApiMemoryLayout.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-ApiMemoryLayout.html"
+      },
+      {
+        "path": "api/iree-pjrt-ArtifactDumper-Transaction.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-ArtifactDumper-Transaction.html"
+      },
+      {
+        "path": "api/iree-pjrt-ArtifactDumper.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-ArtifactDumper.html"
+      },
+      {
+        "path": "api/iree-pjrt-BufferInstance.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-BufferInstance.html"
+      },
+      {
+        "path": "api/iree-pjrt-ClientInstance.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-ClientInstance.html"
+      },
+      {
+        "path": "api/iree-pjrt-CompilerJob.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-CompilerJob.html"
+      },
+      {
+        "path": "api/iree-pjrt-CompilerOutput.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-CompilerOutput.html"
+      },
+      {
+        "path": "api/iree-pjrt-ConfigVars.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-ConfigVars.html"
+      },
+      {
+        "path": "api/iree-pjrt-cpu-CPUClientInstance.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-cpu-CPUClientInstance.html"
+      },
+      {
+        "path": "api/iree-pjrt-cpu.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-cpu.html"
+      },
+      {
+        "path": "api/iree-pjrt-cuda-CUDAClientInstance.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-cuda-CUDAClientInstance.html"
+      },
+      {
+        "path": "api/iree-pjrt-cuda.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-cuda.html"
+      },
+      {
+        "path": "api/iree-pjrt-DeviceDescription.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-DeviceDescription.html"
+      },
+      {
+        "path": "api/iree-pjrt-DeviceInstance.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-DeviceInstance.html"
+      },
+      {
+        "path": "api/iree-pjrt-DylibPlatform.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-DylibPlatform.html"
+      },
+      {
+        "path": "api/iree-pjrt-ErrorInstance.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-ErrorInstance.html"
+      },
+      {
+        "path": "api/iree-pjrt-EventInstance.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-EventInstance.html"
+      },
+      {
+        "path": "api/iree-pjrt-ExecutableImage.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-ExecutableImage.html"
+      },
+      {
+        "path": "api/iree-pjrt-FilesArtifactDumper-FilesTransaction.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-FilesArtifactDumper-FilesTransaction.html"
+      },
+      {
+        "path": "api/iree-pjrt-FilesArtifactDumper.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-FilesArtifactDumper.html"
+      },
+      {
+        "path": "api/iree-pjrt-IreeApi-224354152345034112076165164056245310276110134301.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-IreeApi-224354152345034112076165164056245310276110134301.html"
+      },
+      {
+        "path": "api/iree-pjrt-IreeApi.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-IreeApi.html"
+      },
+      {
+        "path": "api/iree-pjrt-IREECompiler.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-IREECompiler.html"
+      },
+      {
+        "path": "api/iree-pjrt-LoadedExecutableInstance.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-LoadedExecutableInstance.html"
+      },
+      {
+        "path": "api/iree-pjrt-Logger.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-Logger.html"
+      },
+      {
+        "path": "api/iree-pjrt-MemoryInstance.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-MemoryInstance.html"
+      },
+      {
+        "path": "api/iree-pjrt-metal-MetalClientInstance.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-metal-MetalClientInstance.html"
+      },
+      {
+        "path": "api/iree-pjrt-metal.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-metal.html"
+      },
+      {
+        "path": "api/iree-pjrt-OpenXLAPartitioner.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-OpenXLAPartitioner.html"
+      },
+      {
+        "path": "api/iree-pjrt-PJRTApiConverter-044254262200234372066015132062043320047251234332.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-PJRTApiConverter-044254262200234372066015132062043320047251234332.html"
+      },
+      {
+        "path": "api/iree-pjrt-PJRTApiConverter.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-PJRTApiConverter.html"
+      },
+      {
+        "path": "api/iree-pjrt-Platform.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-Platform.html"
+      },
+      {
+        "path": "api/iree-pjrt-ResidentExecutable.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-ResidentExecutable.html"
+      },
+      {
+        "path": "api/iree-pjrt-rocm-ROCMClientInstance.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-rocm-ROCMClientInstance.html"
+      },
+      {
+        "path": "api/iree-pjrt-rocm.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-rocm.html"
+      },
+      {
+        "path": "api/iree-pjrt-vulkan-VulkanClientInstance.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-vulkan-VulkanClientInstance.html"
+      },
+      {
+        "path": "api/iree-pjrt-vulkan.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt-vulkan.html"
+      },
+      {
+        "path": "api/iree-pjrt.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree-pjrt.html"
+      },
+      {
+        "path": "api/iree.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/iree.html"
+      },
+      {
+        "path": "api/mlir-iree_compiler-364142152246223267044354002123013212017266010224.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/mlir-iree_compiler-364142152246223267044354002123013212017266010224.html"
+      },
+      {
+        "path": "api/mlir-iree_compiler-IREE-HAL-250130146340200266336343204111131237033101255156.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/mlir-iree_compiler-IREE-HAL-250130146340200266336343204111131237033101255156.html"
+      },
+      {
+        "path": "api/mlir-iree_compiler-IREE-HAL-detail.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/mlir-iree_compiler-IREE-HAL-detail.html"
+      },
+      {
+        "path": "api/mlir-iree_compiler-IREE-HAL.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/mlir-iree_compiler-IREE-HAL.html"
+      },
+      {
+        "path": "api/mlir-iree_compiler-IREE.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/mlir-iree_compiler-IREE.html"
+      },
+      {
+        "path": "api/mlir-iree_compiler-MetalShader-ThreadGroupSize.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/mlir-iree_compiler-MetalShader-ThreadGroupSize.html"
+      },
+      {
+        "path": "api/mlir-iree_compiler-MetalShader.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/mlir-iree_compiler-MetalShader.html"
+      },
+      {
+        "path": "api/mlir-iree_compiler.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/mlir-iree_compiler.html"
+      },
+      {
+        "path": "api/mlir.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api/mlir.html"
+      },
+      {
+        "path": "api.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/api.html"
+      },
+      {
+        "path": "architecture.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/architecture.html"
+      },
+      {
+        "path": "building.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/building.html"
+      },
+      {
+        "path": "index.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/index.html"
+      },
+      {
+        "path": "introduction.html",
+        "url": "https://nikliolios.com/iree-metal/sourcey-docs/introduction.html"
+      }
+    ]
+  },
+  "validation": {
+    "status": "verified",
+    "checked_local_references": 8626,
+    "broken_local_targets": 0,
+    "stale_api_index_links": 0,
+    "largest_html_bytes": 132860,
+    "output_sha256": "bf18dece95a3ed46f422dab60d7361213720fd93f6baec36b8a917a4baabedb8"
+  },
+  "observations": [
+    {
+      "check": "public_repo",
+      "result": "pass",
+      "evidence": "Public niklio/iree-metal repository, derived from the third-party IREE project."
+    },
+    {
+      "check": "pinned_revision",
+      "result": "pass",
+      "evidence": "35a8adbfbafd0958c14a1797d710a5cb9559fd9a"
+    },
+    {
+      "check": "permissive_license",
+      "result": "pass",
+      "evidence": "Apache-2.0 LICENSE at the pinned revision."
+    },
+    {
+      "check": "maintenance",
+      "result": "pass",
+      "evidence": "Repository activity observed 2026-08-18."
+    },
+    {
+      "check": "nontrivial_surface",
+      "result": "pass",
+      "evidence": "64 in-scope source files and 328 indexed API member/type records."
+    },
+    {
+      "check": "adapter",
+      "result": "pass",
+      "evidence": "Sourcey Doxygen adapter over generated XML."
+    },
+    {
+      "check": "navigable_site",
+      "result": "pass",
+      "evidence": "63 documented pages with static navigation, search, source links, llms.txt, and sitemap.xml."
+    },
+    {
+      "check": "governed_validation",
+      "result": "pass",
+      "evidence": "runx:receipt:sha256:92aac9e6694802bf4ef1f368c8fab6a673897e9978a3128b30e24c81d556ba6f; 8,626 local references checked with zero missing targets."
+    },
+    {
+      "check": "durable_hosting",
+      "result": "pass",
+      "evidence": "Project path on the maintainer's established custom domain backed by GitHub Pages."
+    },
+    {
+      "check": "maintainer_report",
+      "result": "pass",
+      "evidence": "https://nikliolios.com/iree-metal/sourcey-docs/evidence/report.md"
+    }
+  ]
+}
